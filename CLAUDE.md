@@ -47,9 +47,13 @@ The controller mode reads an **Adafruit seesaw mini gamepad** (I2C address `0x50
 - `NessoDisplay` / `LGFX_Sprite` — display rendering; sprite used for battery and controller modes for efficiency
 - `WiFiEvent` callback runs on a FreeRTOS task for async WiFi state handling
 
+### Battery Percentage Calculation
+
+Battery percentage is calculated from voltage using `voltageToPercent()` — a piecewise linear LiPo discharge curve (3.0V→0%, 4.2V→100%). The raw `battery.getChargeLevel()` from the library is **not used for display or logic** because it is unreliable: tested at 3.89V it reported 98% while the voltage-based curve correctly returned ~63%. The library value is kept in `chargeLevel` and shown as a tiny `lib:XX%` debug label on the battery screen for comparison.
+
 ### Battery Charging Logic
 
-Charging is enabled when external power is detected (`VIN_DETECT`). It is disabled at ≥80% or ≥99% charge. Voltage color thresholds: green >3.7V, orange 3.3–3.7V, red <3.3V.
+Charging is enabled when external power is detected (`VIN_DETECT`). Voltage color thresholds: green >3.7V, orange 3.3–3.7V, red <3.3V.
 
 ### Network Configuration (hardcoded)
 
