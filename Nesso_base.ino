@@ -150,7 +150,8 @@ int        lastMinute = -1;  // clock updates once per minute
 NessoBattery battery;
 
 float batteryVoltage = 0.0;
-float chargeLevel    = 0.0;
+float chargeLevel    = 0.0;  // raw library value — debug only
+float voltagePercent = 0.0;  // percentage derived from voltage curve
 char  uptimeString[12];         // "HH:MM:SS"
 bool  ledStatus       = false;
 bool  batteryCharging = false;
@@ -959,6 +960,7 @@ void setup() {
   // Initial battery read so the header icon is filled from the start
   chargeLevel    = battery.getChargeLevel();
   batteryVoltage = battery.getVoltage();
+  voltagePercent = voltageToPercent(batteryVoltage);
   chargeStatus   = battery.getChargeStatus();
   // VIN_DETECT monitors USB-C VBUS presence (the Nesso N1 has no separate VIN pin;
   // USB-C is the only external power input).  AW32001 charge status is kept as a
@@ -1037,7 +1039,7 @@ void loop() {
   }
 
   {
-    bool lowBat      = (chargeLevel > 0 && chargeLevel <= 20);
+    bool lowBat      = (voltagePercent > 0 && voltagePercent <= 20);
     bool anyScanning = (wifiScanning || btScanning || loraListening);
     if (lowBat) {
       if (msNow - lastLEDflipTime > 250) {
@@ -1063,6 +1065,7 @@ void loop() {
     batteryCheckTime = msNow;
     chargeLevel      = battery.getChargeLevel();
     batteryVoltage   = battery.getVoltage();
+    voltagePercent   = voltageToPercent(batteryVoltage);
     batteryCheck();
 
     unsigned long s = millis() / 1000;
@@ -1177,12 +1180,12 @@ void drawBatteryIcon() {
 
   display.fillRect(bx - 2, 0, 29, 22, BG_COLOR);
 
-  uint16_t fillColor = (chargeLevel > 50) ? COLOR_GREEN  :
-                       (chargeLevel > 20) ? COLOR_ORANGE : COLOR_RED;
+  uint16_t fillColor = (voltagePercent > 50) ? COLOR_GREEN  :
+                       (voltagePercent > 20) ? COLOR_ORANGE : COLOR_RED;
 
   display.drawRect(bx, by, 22, 10, COLOR_GRAY);
   display.fillRect(bx + 22, by + 3, 3, 4, COLOR_GRAY);
-  int fillW = max(0, (int)(18.0f * chargeLevel / 100.0f));
+  int fillW = max(0, (int)(18.0f * voltagePercent / 100.0f));
   if (fillW > 0)
     display.fillRect(bx + 2, by + 2, fillW, 6, fillColor);
 }
@@ -2820,9 +2823,9 @@ void renderBattery() {
                        (batteryVoltage >= 3.3f)   ? COLOR_ORANGE :
                                                     COLOR_RED;
   // Bar fill color
-  uint16_t barColor  = (chargeLevel > 50)  ? COLOR_GREEN  :
-                       (chargeLevel > 20)  ? COLOR_ORANGE :
-                                             COLOR_RED;
+  uint16_t barColor  = (voltagePercent > 50)  ? COLOR_GREEN  :
+                       (voltagePercent > 20)  ? COLOR_ORANGE :
+                                               COLOR_RED;
 
   // Charge status string
   const char* statusStr;
@@ -2854,7 +2857,7 @@ void renderBattery() {
 
     // Battery bar graphic
     int barX = 8, barY = 38, barW = sw - 32, barH = 22;
-    int fillW = max(0, (int)((float)(barW - 4) * chargeLevel / 100.0f));
+    int fillW = max(0, (int)((float)(barW - 4) * voltagePercent / 100.0f));
     statusSprite.drawRect(barX, barY, barW, barH, COLOR_GRAY);
     if (fillW > 0)
       statusSprite.fillRect(barX + 2, barY + 2, fillW, barH - 4, barColor);
@@ -2863,7 +2866,7 @@ void renderBattery() {
 
     // Row 3: percentage (left) + charge status (right)
     char pStr[6];
-    sprintf(pStr, "%d%%", (int)chargeLevel);
+    sprintf(pStr, "%d%%", (int)voltagePercent);
     statusSprite.setTextSize(3);
     statusSprite.setTextColor(COLOR_WHITE);
     statusSprite.setTextDatum(TL_DATUM);
@@ -2883,6 +2886,14 @@ void renderBattery() {
     statusSprite.setTextDatum(TR_DATUM);
     statusSprite.drawString(uptimeString, sw - 8, 100);
 
+    // Debug: raw library chargeLevel (tiny, bottom-right)
+    char clStr[12];
+    sprintf(clStr, "lib:%d%%", (int)chargeLevel);
+    statusSprite.setTextSize(1);
+    statusSprite.setTextColor(COLOR_GRAY);
+    statusSprite.setTextDatum(BR_DATUM);
+    statusSprite.drawString(clStr, sw - 2, sh - 2);
+
   } else {
     // ── Portrait layout (e.g. 135 × 218 sprite) ───────────────────
     // Row 1: label centred
@@ -2900,7 +2911,7 @@ void renderBattery() {
 
     // Battery bar
     int barX = 8, barY = 82, barW = sw - 28, barH = 22;
-    int fillW = max(0, (int)((float)(barW - 4) * chargeLevel / 100.0f));
+    int fillW = max(0, (int)((float)(barW - 4) * voltagePercent / 100.0f));
     statusSprite.drawRect(barX, barY, barW, barH, COLOR_GRAY);
     if (fillW > 0)
       statusSprite.fillRect(barX + 2, barY + 2, fillW, barH - 4, barColor);
@@ -2908,7 +2919,7 @@ void renderBattery() {
 
     // Percentage + status
     char pStr[6];
-    sprintf(pStr, "%d%%", (int)chargeLevel);
+    sprintf(pStr, "%d%%", (int)voltagePercent);
     statusSprite.setTextSize(2);
     statusSprite.setTextColor(COLOR_WHITE);
     statusSprite.setTextDatum(TL_DATUM);
@@ -2926,6 +2937,14 @@ void renderBattery() {
     statusSprite.setTextColor(COLOR_TEAL);
     statusSprite.setTextDatum(TR_DATUM);
     statusSprite.drawString(uptimeString, sw - 8, 148);
+
+    // Debug: raw library chargeLevel (tiny, bottom-right)
+    char clStr[12];
+    sprintf(clStr, "lib:%d%%", (int)chargeLevel);
+    statusSprite.setTextSize(1);
+    statusSprite.setTextColor(COLOR_GRAY);
+    statusSprite.setTextDatum(BR_DATUM);
+    statusSprite.drawString(clStr, sw - 2, sh - 2);
   }
 }
 
@@ -5937,6 +5956,22 @@ void renderIR() {
 // Battery management
 // ================================================================
 
+// Piecewise linear LiPo discharge curve: voltage → percentage
+float voltageToPercent(float v) {
+  static const float vt[] = {3.00f, 3.30f, 3.50f, 3.60f, 3.70f, 3.80f, 3.90f, 4.00f, 4.10f, 4.20f};
+  static const float pt[] = {  0.0f,  5.0f, 10.0f, 20.0f, 35.0f, 50.0f, 65.0f, 80.0f, 90.0f,100.0f};
+  const int N = 10;
+  if (v <= vt[0])     return 0.0f;
+  if (v >= vt[N - 1]) return 100.0f;
+  for (int i = 0; i < N - 1; i++) {
+    if (v < vt[i + 1]) {
+      float t = (v - vt[i]) / (vt[i + 1] - vt[i]);
+      return pt[i] + t * (pt[i + 1] - pt[i]);
+    }
+  }
+  return 100.0f;
+}
+
 void batteryCheck() {
   // Read AW32001 status first — it is the authoritative source for charge state.
   // VIN_DETECT monitors USB-C VBUS (the Nesso N1 has no separate VIN pin).
@@ -5972,7 +6007,7 @@ void batteryCheck() {
   // Low battery protection: turn off display and halt when critically low
   if (!onExternalPower && lowBatIdx < 2) {
     uint8_t thresh = LOW_BAT_THRESHOLDS[lowBatIdx];
-    if (chargeLevel > 0.5f && chargeLevel < (float)thresh) {
+    if (voltagePercent > 0.5f && voltagePercent < (float)thresh) {
       serialWritelnAll("[POWER] Critical battery — display off. Connect USB to resume.");
       digitalWrite(LCD_BACKLIGHT, LOW);
       displayOff = true;
