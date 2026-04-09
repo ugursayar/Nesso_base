@@ -70,14 +70,6 @@ int dropLengths[NUM_COLUMNS];
 // ── Shared non-blocking buzzer sequencer ────────────────────────
 struct BuzzNote { uint16_t freq; uint16_t ms; };
 
-static const BuzzNote MATRIX_MELODY[] = {
-  // Nokia Gran Vals — the iconic Matrix phone ringtone
-  {659,200},{0,30}, {587,200},{0,30}, {370,400},{0,60}, {415,400},{0,80},
-  {554,200},{0,30}, {494,200},{0,30}, {294,400},{0,60}, {330,400},{0,80},
-  {494,200},{0,30}, {440,200},{0,30}, {277,400},{0,60}, {330,400},{0,80},
-  {440,800},{0,400},
-};
-static const int MATRIX_MELODY_LEN = (int)(sizeof(MATRIX_MELODY)/sizeof(MATRIX_MELODY[0]));
 
 static const BuzzNote VADER_MELODY[] = {
   // Imperial March — A minor, ~BPM 104
@@ -1756,7 +1748,6 @@ void onTap(int16_t sx, int16_t sy) {
   } else if (currentFunction == FUNCTION_MEDIA) {
     const BuzzNote* mel  = nullptr; int len = 0;
     switch (mediaSubScreen) {
-      case 0: mel=MATRIX_MELODY; len=MATRIX_MELODY_LEN; break;
       case 1: mel=VADER_MELODY;  len=VADER_MELODY_LEN;  vaderNeedsRedraw=true;  break;
       case 2: mel=OBIWAN_MELODY; len=OBIWAN_MELODY_LEN; obiwanNeedsRedraw=true; break;
     }
@@ -2514,7 +2505,6 @@ void serialHandleMusic(const char* arg) {
     const BuzzNote* mel = nullptr; int len = 0;
     if (currentFunction==FUNCTION_MEDIA) {
       switch(mediaSubScreen) {
-        case 0: mel=MATRIX_MELODY; len=MATRIX_MELODY_LEN; break;
         case 1: mel=VADER_MELODY;  len=VADER_MELODY_LEN;  break;
         case 2: mel=OBIWAN_MELODY; len=OBIWAN_MELODY_LEN; break;
       }
