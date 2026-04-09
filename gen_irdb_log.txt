@@ -1,0 +1,8 @@
+Fetching brand list...
+Total brands: 646
+  OK: ADLER/TV [NEC1] 2,-1.csv
+  OK: Adcom/AV Rcvr [NEC2] 26,-1.csv
+  OK: Aiwa/AV Rcvr [Sony12] 16,-1.csv
+  OK: Arcam/AV Rcvr [RC5] 16,-1.csv
+
+New entries: 4
