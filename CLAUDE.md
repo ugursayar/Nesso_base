@@ -42,6 +42,8 @@ The controller mode auto-detects one of two supported joysticks at boot and tran
 | Adafruit seesaw mini gamepad | `0x50` | First | A/B/X/Y/SEL/STA |
 | M5 Joystick HAT | `0x38` | Fallback | Stick click |
 
+> **⚠ M5 HAT address conflict:** The Nesso N1's built-in **FT6336U capacitive touch controller** also uses `0x38`. The M5 HAT cannot be used on the `Wire` bus (G6/G7 stick-bus) without an address collision. I2C scan confirmed: `0x38`=FT6336U, `0x43/0x44`=PI4IOE5V6408 I/O expanders, `0x49`=unknown internal, `0x55`=BQ27220 battery gauge, `0x68`=BMI270 IMU.
+
 - Physical Y axis (push forward/back) → synchronized forward/reverse (both motors same power)
 - Physical X axis (push left/right) → differential steering (motors opposite → rotation)
 - Zero point is calibrated on first read for both joystick types
