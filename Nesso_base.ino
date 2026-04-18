@@ -27,6 +27,14 @@
 #include "esp_sleep.h"
 #include <IRremoteESP8266.h>
 #include <IRsend.h>
+#include "Audio.h"
+
+// ── M5 Speaker 2 HAT — I2S pin mapping ──────────────────────────
+// These match the M5StickC Plus / M5Speaker2 HAT default wiring.
+// Adjust if you've connected the HAT differently on your Nesso N1.
+#define SPK2_BCLK   7   // Bit clock  (Hat-Bus BCLK → Nesso G7)
+#define SPK2_LRC    6   // Left/Right clock (Hat-Bus LRCLK → Nesso G6)
+#define SPK2_DOUT   2   // Data out  (Hat-Bus DATA  → Nesso G2)
 
 // ----------------------------------------------------------------
 // Display
@@ -484,215 +492,41 @@ int  lastMediaSubScreen = -1;
 
 // ----------------------------------------------------------------
 // IR Remote
-// IR LED must be wired to IR_SEND_PIN (adjust for your hardware).
-// On Nesso N1 the Grove connector exposes free GPIOs — pin 2 is a
-// safe default; change if your IR LED is on a different pin.
 // ----------------------------------------------------------------
 
 #define IR_SEND_PIN IR_TX_PIN   // GPIO 9 — built-in IR blaster on Nesso N1
-
-enum IRDBProto : uint8_t {
-  IRDB_SAMSUNG, IRDB_NEC, IRDB_SONY, IRDB_RC5, IRDB_LG, IRDB_JVC, IRDB_SHARP, IRDB_RC6
-};
-
-struct IRDev {
-  const char*  brand;
-  const char*  type;   // device category: "TV", "Soundbar", "AV Rcvr", "Projector"
-  const char*  name;   // specific variant/model family
-  IRDBProto    proto;
-  uint8_t      nbits;
-  uint16_t     addr;   // Sharp: IR address; others: 0
-  uint32_t     power, volUp, volDown, mute, chUp, chDown;
-  // Extended navigation (0 = button not available for this device)
-  uint32_t     input;   // source/input switching
-  uint32_t     menu;    // menu / home / guide
-  uint32_t     ok;      // OK / enter / select
-  uint32_t     navUp, navDown, navLeft, navRight;
-  uint32_t     back;    // back / return / exit
-};
-
-// Code encoding notes:
-//   NEC1/NEC2 32-bit: bitrev8(device)<<24 | bitrev8(subdev)<<16 | bitrev8(cmd)<<8 | bitrev8(~cmd)
-//   Sony SIRC:  (device<<7)|command  (stored as n-bit value, sendSony handles bit order)
-//   RC5 12-bit: (device<<6)|command
-//   Sharp:      addr + command passed separately to sendSharp(addr, cmd, nbits)
-static const IRDev IRDB[] = {
-  // ═══ TVs — (power,volUp,volDown,mute,chUp,chDown, input,menu,ok,navUp,navDown,navLeft,navRight,back)
-  // ── ADLER (NEC1 d=2) ──────────────────────────────────────────────
-  {"ADLER",    "TV","2/-1",        IRDB_NEC,   32,0, 0x40BF50AF,0x40BF8A75,0x40BF58A7,0x40BFE01F,0,0,
-   0,0,0,0,0,0,0,0},
-  // ── Arcelik (NEC, Turkish brand) ─────────────────────────────────
-  {"Arcelik",  "TV","standard",    IRDB_NEC,   32,0, 0x9B6748B7,0x9B6740BF,0x9B67C03F,0x9B670CF3,0x9B6700FF,0x9B67807F,
-   0,0,0,0,0,0,0,0},
-  // ── Beko (NEC, same family as Arcelik) ───────────────────────────
-  {"Beko",     "TV","standard",    IRDB_NEC,   32,0, 0x9B6748B7,0x9B6740BF,0x9B67C03F,0x9B670CF3,0x9B6700FF,0x9B67807F,
-   0,0,0,0,0,0,0,0},
-  // ── Coby (NEC d=0,s=127) ──────────────────────────────────────────
-  {"Coby",     "TV","0/127",       IRDB_NEC,   32,0, 0x00FE50AF,0x00FE7887,0x00FEFA05,0x00FE32CD,0x00FEF807,0x00FE3AC5,
-   0,0,0,0,0,0,0,0},
-  // ── Emerson (NEC1 d=0) ────────────────────────────────────────────
-  {"Emerson",  "TV","standard",    IRDB_NEC,   32,0, 0x00FFF807,0x00FFC837,0x00FFF00F,0x00FFE817,0x00FFD02F,0x00FFE01F,
-   0,0,0,0,0,0,0,0},
-  // ── Fast (RC5 d=28) ───────────────────────────────────────────────
-  {"Fast",     "TV","28/-1",       IRDB_RC5,   12,0, 0x070C,0x0742,0x0741,0x070D,0,0x075F,
-   0,0,0,0,0,0,0,0},
-  // ── Fisher (NEC1 d=56, same as Sanyo) ────────────────────────────
-  {"Fisher",   "TV","56/-1",       IRDB_NEC,   32,0, 0x1CE348B7,0x1CE3708F,0x1CE3F00F,0x1CE318E7,0x1CE350AF,0x1CE3D02F,
-   0,0,0,0,0,0,0,0},
-  // ── Grundig (RC5 d=0, same system as Philips) ────────────────────
-  {"Grundig",  "TV","RC5",         IRDB_RC5,   12,0, 0x000C,0x0010,0x0011,0x000D,0x0020,0x0021,
-   0x0038,0x002E,0,0x001C,0x001D,0x002C,0x002B,0x000F},
-  // ── Haier ─────────────────────────────────────────────────────────
-  {"Haier",    "TV","standard",    IRDB_NEC,   32,0, 0x60DF0CF3,0x60DF40BF,0x60DFC03F,0x60DF48B7,0x60DF00FF,0x60DF807F,
-   0,0,0,0,0,0,0,0},
-  // ── Hisense ───────────────────────────────────────────────────────
-  {"Hisense",  "TV","standard",    IRDB_NEC,   32,0, 0x00FF38C7,0x00FF40BF,0x00FFC03F,0x00FF906F,0x00FF00FF,0x00FF807F,
-   0,0,0,0,0,0,0,0},
-  // ── Hitachi (NEC1 d=80) ───────────────────────────────────────────
-  {"Hitachi",  "TV","standard",    IRDB_NEC,   32,0, 0x0AF5E817,0x0AF548B7,0x0AF5A857,0x0AF5D02F,0x0AF59867,0x0AF518E7,
-   0,0,0,0,0,0,0,0},
-  // ── Insignia (NEC d=134,s=5) ──────────────────────────────────────
-  {"Insignia", "TV","134/5",       IRDB_NEC,   32,0, 0x61A0F00F,0,0x61A0B04F,0x61A0708F,0x61A050AF,0x61A0D02F,
-   0,0,0,0,0,0,0,0},
-  // ── JVC (JVC 16-bit protocol) ─────────────────────────────────────
-  {"JVC",      "TV","standard",    IRDB_JVC,   16,0, 0xC5E8,0xC508,0xC588,0xC518,0xC538,0xC5B8,
-   0,0,0,0,0,0,0,0},
-  // ── LG ────────────────────────────────────────────────────────────
-  {"LG",       "TV","OLED/NanoCell",IRDB_NEC,  32,0, 0x20DF10EF,0x20DF40BF,0x20DFC03F,0x20DF906F,0x20DF00FF,0x20DF807F,
-   0x20DF19E6,0x20DFC23D,0x20DF22DD,0x20DF02FD,0x20DF827D,0x20DFE01F,0x20DF609F,0x20DFDA25},
-  // ── Loewe (RC5 d=0) ───────────────────────────────────────────────
-  {"Loewe",    "TV","RC5",         IRDB_RC5,   12,0, 0x000C,0x0010,0x0011,0x000D,0x0020,0x0021,
-   0,0,0,0,0,0,0,0},
-  // ── LXI (NEC1 d=4, Sears house brand) ────────────────────────────
-  {"LXI",      "TV","4/-1",        IRDB_NEC,   32,0, 0x20DF10EF,0x20DF40BF,0x20DFC03F,0x20DF906F,0x20DF00FF,0x20DF807F,
-   0,0,0,0,0,0,0,0},
-  // ── Magnavox (RC5 d=0) ────────────────────────────────────────────
-  {"Magnavox", "TV","RC5",         IRDB_RC5,   12,0, 0x000C,0x0010,0x0011,0x000D,0x0020,0x0021,
-   0,0,0,0,0,0,0,0},
-  // ── Memorex (NEC1 d=4) ────────────────────────────────────────────
-  {"Memorex",  "TV","4/-1",        IRDB_NEC,   32,0, 0x20DF10EF,0x20DF40BF,0x20DFC03F,0x20DF906F,0x20DF00FF,0x20DF807F,
-   0,0,0,0,0,0,0,0},
-  // ── Mitsubishi (Sharp proto d=1) ──────────────────────────────────
-  {"Mitsubishi","TV","Sharp IR",   IRDB_SHARP, 15,1, 22,20,21,23,17,18,
-   0,0,0,0,0,0,0,0},
-  // ── Panasonic (NEC Kaseikyo TX series) ───────────────────────────
-  {"Panasonic","TV","TX series",   IRDB_NEC,   32,0, 0x40040100,0x40040200,0x40041200,0x40040900,0x40040800,0x40041800,
-   0,0,0,0,0,0,0,0},
-  // ── Philips (RC5 d=0, nav from Philips/TV/0,-1.csv) ──────────────
-  {"Philips",  "TV","RC5",         IRDB_RC5,   12,0, 0x000C,0x0010,0x0011,0x000D,0x0020,0x0021,
-   0x0038,0x002E,0,0x001C,0x001D,0x002C,0x002B,0x000F},
-  // ── Proton (NEC1 d=4) ─────────────────────────────────────────────
-  {"Proton",   "TV","4/-1",        IRDB_NEC,   32,0, 0x20DF10EF,0x20DF40BF,0x20DFC03F,0x20DF906F,0x20DF00FF,0x20DF807F,
-   0,0,0,0,0,0,0,0},
-  // ── Samsung ───────────────────────────────────────────────────────
-  {"Samsung",  "TV","Smart/QLED",  IRDB_SAMSUNG,32,0, 0xE0E040BF,0xE0E0E01F,0xE0E0D02F,0xE0E0F00F,0xE0E048B7,0xE0E008F7,
-   0xE0E0807F,0xE0E058A7,0xE0E016E9,0xE0E006F9,0xE0E08679,0xE0E0A659,0xE0E046B9,0xE0E01AE5},
-  // ── Sanyo (NEC1 d=56) ─────────────────────────────────────────────
-  {"Sanyo",    "TV","standard",    IRDB_NEC,   32,0, 0x1CE348B7,0x1CE3708F,0x1CE3F00F,0x1CE318E7,0x1CE350AF,0x1CE3D02F,
-   0,0,0,0,0,0,0,0},
-  // ── Sharp (Sharp proto d=1, Aquos series) ────────────────────────
-  {"Sharp",    "TV","Aquos",       IRDB_SHARP, 15,1, 0x45,0x07,0x0B,0x6B,0xC5,0xC1,
-   0,0,0,0,0,0,0,0},
-  // ── Sony SIRC-12 (d=1, nav codes from Sony/TV/1,-1.csv) ──────────
-  {"Sony",     "TV","SIRC-12",     IRDB_SONY,  12,0, 0x95,0x92,0x93,0x94,0x90,0x91,
-   0x00A4,0x00E0,0x008B,0x00F4,0x00F5,0x00B4,0x00B3,0x00E3},
-  // ── Sony Bravia SIRC-15 (same device address, 15-bit frame) ──────
-  {"Sony",     "TV","Bravia/SIRC-15",IRDB_SONY,15,0, 0x95,0x92,0x93,0x94,0x90,0x91,
-   0x00A4,0x00E0,0x008B,0x00F4,0x00F5,0x00B4,0x00B3,0x00E3},
-  // ── TCL ───────────────────────────────────────────────────────────
-  {"TCL",      "TV","P/C series",  IRDB_NEC,   32,0, 0xE31EB14E,0xE31EA15E,0xE31E619E,0xE31EE11E,0xE31EC13E,0xE31E41BE,
-   0,0,0,0,0,0,0,0},
-  // ── Toshiba (NEC1 d=64, input/menu/ok from irdb 64,-1.csv) ───────
-  {"Toshiba",  "TV","standard",    IRDB_NEC,   32,0, 0x02FD48B7,0x02FD58A7,0x02FD7887,0x02FD08F7,0x02FDD827,0x02FDF807,
-   0x02FDF00F,0x02FD01FE,0x02FDE817,0,0,0,0,0x02FD1AE5},
-  // ── Vestel (NEC, Turkish market) ─────────────────────────────────
-  {"Vestel",   "TV","NEC variant", IRDB_NEC,   32,0, 0x56AB0CF3,0x56AB40BF,0x56ABC03F,0x56AB48B7,0x56AB00FF,0x56AB807F,
-   0,0,0,0,0,0,0,0},
-  // ── Vivax (NEC1 d=2) ──────────────────────────────────────────────
-  {"Vivax",    "TV","2/-1",        IRDB_NEC,   32,0, 0x40BF50AF,0x40BF8A75,0x40BF58A7,0x40BFE01F,0,0,
-   0,0,0,0,0,0,0,0},
-  // ═══ AV Receivers
-  // ── Adcom ─────────────────────────────────────────────────────────
-  {"Adcom",    "AV Rcvr","26/-1",       IRDB_NEC,32,0, 0x58A701FE,0x58A7AB54,0x58A78B74,0x58A741BE,0,0x58A7E31C,
-   0,0,0,0,0,0,0,0},
-  // ── Aiwa Receiver (Sony SIRC-12 d=22) ────────────────────────────
-  {"Aiwa",     "AV Rcvr","16/-1",       IRDB_SONY,12,0, 0x0815,0x0812,0x0813,0x0814,0,0,
-   0,0,0,0,0,0,0,0},
-  // ── Arcam (RC5 d=16) ──────────────────────────────────────────────
-  {"Arcam",    "AV Rcvr","16/-1",       IRDB_RC5,12,0, 0x040C,0x0410,0x0411,0x0477,0x0438,0,
-   0,0,0,0,0,0,0,0},
-  // ── BnK Components ────────────────────────────────────────────────
-  {"BnK Comp", "AV Rcvr","27/78",       IRDB_NEC,32,0, 0xD872807F,0xD87224DB,0xD872C43B,0xD872C03F,0xD87218E7,0xD872E817,
-   0,0,0,0,0,0,0,0},
-  // ── Cambridge Audio ───────────────────────────────────────────────
-  {"Cambridge","AV Rcvr","192/192",     IRDB_NEC,32,0, 0x030330CF,0x0303C03F,0x0303F807,0,0,0x0303B04F,
-   0,0,0,0,0,0,0,0},
-  // ── Carver ────────────────────────────────────────────────────────
-  {"Carver",   "AV Rcvr","135/123",     IRDB_NEC,32,0, 0xE1DE02FD,0xE1DE42BD,0xE1DEC23D,0xE1DEDA25,0,0,
-   0,0,0,0,0,0,0,0},
-  // ── Cary Audio Design (RC5 d=19) ─────────────────────────────────
-  {"Cary Audio","AV Rcvr","19/-1",      IRDB_RC5,12,0, 0x04CC,0x04D0,0x04D1,0x04F9,0,0,
-   0,0,0,0,0,0,0,0},
-  // ── Denon ─────────────────────────────────────────────────────────
-  {"Denon",    "AV Rcvr","AVR series",  IRDB_NEC,32,0, 0x4BB640BF,0x4BB658A7,0x4BB6D827,0x4BB6A05F,0x4BB6E21D,0x4BB6629D,
-   0,0,0,0,0,0,0,0},
-  // ── Harman Kardon ─────────────────────────────────────────────────
-  {"Harman Kar","AV Rcvr","128/112",    IRDB_NEC,32,0, 0x010E03FC,0x010EE31C,0x010E13EC,0x010E837C,0x010EBD42,0x010E7D82,
-   0,0,0,0,0,0,0,0},
-  // ── Integra (same as Onkyo TX) ────────────────────────────────────
-  {"Integra",  "AV Rcvr","210/109",     IRDB_NEC,32,0, 0x4BB620DF,0x4BB640BF,0x4BB6C03F,0x4BB633CC,0x4BB600FF,0x4BB6807F,
-   0,0,0,0,0,0,0,0},
-  // ── Kenwood ───────────────────────────────────────────────────────
-  {"Kenwood",  "AV Rcvr","184/-1",      IRDB_NEC,32,0, 0x1DE2B946,0x1DE2D926,0x1DE259A6,0x1DE239C6,0x1DE29966,0x1DE231CE,
-   0,0,0,0,0,0,0,0},
-  // ── Kinergetics Research (RC5) ────────────────────────────────────
-  {"Kinergetic","AV Rcvr","0/-1",       IRDB_RC5,12,0, 0,0x000C,0x000B,0x0003,0x0007,0x0008,
-   0,0,0,0,0,0,0,0},
-  // ── Lexicon ───────────────────────────────────────────────────────
-  {"Lexicon",  "AV Rcvr","130/11",      IRDB_NEC,32,0, 0x41D059A6,0x41D0E817,0x41D06897,0x41D0A857,0,0,
-   0,0,0,0,0,0,0,0},
-  // ── Marantz ───────────────────────────────────────────────────────
-  {"Marantz",  "AV Rcvr","SR/PM series",IRDB_RC5,12,0, 0x040C,0x0410,0x0411,0x040D,0x0420,0x0421,
-   0,0,0,0,0,0,0,0},
-  // ── Myryad (RC5 d=16) ─────────────────────────────────────────────
-  {"Myryad",   "AV Rcvr","16/-1",       IRDB_RC5,12,0, 0x040C,0x0410,0x0411,0x040D,0,0,
-   0,0,0,0,0,0,0,0},
-  // ── NAD ───────────────────────────────────────────────────────────
-  {"NAD",      "AV Rcvr","135/124",     IRDB_NEC,32,0, 0xE13E01FE,0xE13E11EE,0xE13E31CE,0xE13E29D6,0,0,
-   0,0,0,0,0,0,0,0},
-  // ── Nakamichi ─────────────────────────────────────────────────────
-  {"Nakamichi","AV Rcvr","130/93",      IRDB_NEC,32,0, 0x41BA20DF,0x41BAA05F,0x41BA08F7,0x41BA30CF,0x41BA3AC5,0x41BABA45,
-   0,0,0,0,0,0,0,0},
-  // ── Onkyo ─────────────────────────────────────────────────────────
-  {"Onkyo",    "AV Rcvr","TX-NR series",IRDB_NEC,32,0, 0x4BB620DF,0x4BB640BF,0x4BB6C03F,0x4BB6A05F,0x4BB600FF,0x4BB6807F,
-   0,0,0,0,0,0,0,0},
-  // ── Onkyo Integra ─────────────────────────────────────────────────
-  {"Onkyo Intg","AV Rcvr","210/109",    IRDB_NEC,32,0, 0x4BB620DF,0x4BB640BF,0x4BB6C03F,0x4BB6A05F,0x4BB600FF,0x4BB6807F,
-   0,0,0,0,0,0,0,0},
-  // ── Parasound ─────────────────────────────────────────────────────
-  {"Parasound","AV Rcvr","3/240",       IRDB_NEC,32,0, 0xC00F51AE,0xC00F43BC,0xC00FC33C,0xC00F936C,0xC00FD32C,0,
-   0,0,0,0,0,0,0,0},
-  // ── Pioneer ───────────────────────────────────────────────────────
-  {"Pioneer",  "AV Rcvr","VSX series",  IRDB_NEC,32,0, 0xA55AE21D,0xA55A18E7,0xA55A9867,0xA55A48B7,0xA55A58A7,0xA55AD827,
-   0,0,0,0,0,0,0,0},
-  // ── Yamaha ────────────────────────────────────────────────────────
-  {"Yamaha",   "AV Rcvr","RX-V/RX-A",  IRDB_NEC,32,0, 0x1EE1F00F,0x1EE17887,0x1EE1F807,0x1EE139C6,0x1EE1D827,0x1EE138C7,
-   0,0,0,0,0,0,0,0},
-  // ═══ Soundbars
-  // ── Bose ──────────────────────────────────────────────────────────
-  {"Bose",     "Soundbar","Wave/Solo",  IRDB_NEC,32,0, 0x5DD232CD,0x5DD2C03F,0x5DD240BF,0x5DD2807F,0x5DD29867,0x5DD218E7,
-   0,0,0,0,0,0,0,0},
-  // ═══ Projectors
-  // ── Digital Projection ────────────────────────────────────────────
-  {"DigiProj", "Projector","32/-1",     IRDB_NEC,32,0, 0x04FB00FF,0x04FB609F,0x04FB50AF,0x04FB708F,0,0,
-   0,0,0,0,0,0,0,0},
-  // ── Epson ─────────────────────────────────────────────────────────
-  {"Epson",    "Projector","131/85",    IRDB_NEC,32,0, 0xC1AA09F6,0xC1AA19E6,0xC1AA9966,0xC1AAC936,0,0,
-   0,0,0,0,0,0,0,0},
-};
-static const int IRDB_COUNT = sizeof(IRDB) / sizeof(IRDB[0]);
+#include "irdb.h"
 
 IRsend irsend(IR_SEND_PIN);
+
+// ----------------------------------------------------------------
+// Radio (M5 Speaker 2 HAT — MAX98357A / I2S)
+// ----------------------------------------------------------------
+
+struct RadioStation { const char* name; const char* url; };
+static const RadioStation RADIO_STATIONS[] = {
+  {"BBC Radio 2",   "http://stream.live.vc.bbcmedia.co.uk/bbc_radio_two"},
+  {"Classic FM",    "http://media-ice.musicradio.com/ClassicFMMP3"},
+  {"SomaFM Groove", "http://somafm.com/groovesalad256.pls"},
+  {"Iskatel",       "http://iskatel.hostingradio.ru:8015/iskatel-320.aac"},
+  {"WDR 1Live",     "http://www.wdr.de/wdrlive/media/einslive.m3u"},
+  {"Classical 102", "http://tuner.classical102.com/listen.pls"},
+  {"Dein Webradio", "http://s1.knixx.fm:5347/dein_webradio_vbr.opus"},
+};
+static const int RADIO_STATION_COUNT = 7;
+
+Audio radioAudio;
+bool  speakerHatEnabled     = false;  // true = Speaker HAT physically attached; toggle via device settings
+bool  webRadioEnabled  = false;  // true = web radio streaming allowed; requires speakerHatEnabled
+bool  radioPlaying     = false;  // audio.connecttohost() has been called
+bool  radioPinoutSet   = false;  // setPinout() has been called once; don't repeat on reconnect
+int   radioStationIdx  = 0;      // index into RADIO_STATIONS[]
+int   radioVolume      = 15;     // 0..21
+char  radioStation[48]  = "";    // filled by audio_showstation() callback
+char  radioTrack[64]    = "";    // filled by audio_showstreamtitle() callback
+char  radioCustomUrl[128] = "";  // non-empty → play this URL instead of the preset
+bool  radioNeedsRedraw  = true;
+uint32_t radioRedrawMs  = 0;    // drives 500 ms periodic redraw animation
 
 // ── IR UI state ───────────────────────────────────────────────────
 enum IRLevel : uint8_t { IR_LEVEL_BRAND=0, IR_LEVEL_TYPE=1, IR_LEVEL_DEVICE=2, IR_LEVEL_REMOTE=3 };
@@ -722,9 +556,10 @@ enum MainFunctions {
   FUNCTION_IR         = 5,   // IR remote — after LoRa
   FUNCTION_MEDIA      = 6,   // matrix + vader + obiwan merged; sub-screen via swipe up/down
   FUNCTION_BATTERY    = 7,   // moved to end; long-press opens device settings
+  FUNCTION_RADIO      = 8,   // M5 Speaker 2 HAT — internet radio
 } currentFunction;
 
-const int  mainFunctionCount = 8;
+const int  mainFunctionCount = 9;
 int        lastFunction;
 
 // ── Button press detection ───────────────────────────────────────
@@ -877,6 +712,12 @@ void renderBatterySettings();
 void handleBatterySettingsTap(int16_t sx, int16_t sy);
 void applyDeviceSettings();
 void btInitStack();   // defined later with BT helpers
+void initRadio();
+void renderRadio();
+void renderRadioSettings();
+void applyRadioSettings();
+void radioConnect();
+void radioStop();
 
 void loadSettings() {
   Preferences p;
@@ -901,6 +742,10 @@ void loadSettings() {
   sleepTimeoutIdx = p.getUChar("sleepTO",  0);
   lowBatIdx       = p.getUChar("lowBat",   0);
   uiClickEnabled  = p.getBool ("uiClick",  true);
+  speakerHatEnabled = p.getBool("spkHatEn", false);
+  webRadioEnabled   = p.getBool("radioEn",  false);
+  radioStationIdx = p.getUChar("radioStn", 0);
+  radioVolume     = p.getUChar("radioVol", 15);
   p.end();
 }
 
@@ -926,6 +771,10 @@ void saveSettings() {
   p.putUChar("sleepTO", (uint8_t)sleepTimeoutIdx);
   p.putUChar("lowBat",  (uint8_t)lowBatIdx);
   p.putBool ("uiClick", uiClickEnabled);
+  p.putBool("spkHatEn", speakerHatEnabled);
+  p.putBool("radioEn",  webRadioEnabled);
+  p.putUChar("radioStn", (uint8_t)radioStationIdx);
+  p.putUChar("radioVol", (uint8_t)radioVolume);
   p.end();
 }
 
@@ -1014,6 +863,43 @@ void setup() {
   currentFunction = FUNCTION_MAIN;
   lastFunction    = -1;
 
+  // Register ESP32-audioI2S v3.x callback (v3 uses a single msg_t dispatch, not per-event globals)
+  // NOTE: audio_info_callback runs in the audio background task context.
+  // Must NOT call serialWritelnAll() — its BLE notify blocks on a FreeRTOS
+  // semaphore that can be held by the main/BLE task, causing a deadlock.
+  // Use Serial.printf() directly (thread-safe on ESP32) for logging only.
+  Audio::audio_info_callback = [](Audio::msg_t i) {
+    if (!i.msg || !i.msg[0]) return;
+    switch (i.e) {
+      case Audio::evt_name:
+        strncpy(radioStation, i.msg, sizeof(radioStation) - 1);
+        radioStation[sizeof(radioStation) - 1] = '\0';
+        radioNeedsRedraw = true;
+        Serial.printf("[RADIO] Station: %s\r\n", i.msg);
+        break;
+      case Audio::evt_streamtitle:
+        strncpy(radioTrack, i.msg, sizeof(radioTrack) - 1);
+        radioTrack[sizeof(radioTrack) - 1] = '\0';
+        radioNeedsRedraw = true;
+        Serial.printf("[RADIO] Track: %s\r\n", i.msg);
+        break;
+      case Audio::evt_bitrate:
+        Serial.printf("[RADIO] Bitrate: %s\r\n", i.msg);
+        break;
+      case Audio::evt_eof:
+        radioPlaying     = false;
+        radioNeedsRedraw = true;
+        Serial.println("[RADIO] Stream ended.");
+        break;
+      case Audio::evt_info:
+      case Audio::evt_log:
+        Serial.printf("[RADIO] %s\r\n", i.msg);
+        break;
+      default:
+        break;
+    }
+  };
+
   debugln("N#1 initialized.");
   serialPrintHelp();
   // BLE stack init is deferred — happens silently ~2 s after first clock render.
@@ -1074,10 +960,33 @@ void loop() {
     updateOrientation();
   }
 
+  // Detect when the library stops the stream internally (error, EOF, redirect
+  // failure, I2S fault, etc.) so our radioPlaying flag stays in sync.
+  if (radioPlaying && !radioAudio.isRunning()) {
+    radioPlaying     = false;
+    radioNeedsRedraw = true;
+    char _rbuf[64];
+    snprintf(_rbuf, sizeof(_rbuf), "[RADIO] Stream stopped. heap=%lu", (unsigned long)ESP.getFreeHeap());
+    serialWritelnAll(_rbuf);
+  }
+
+  // Periodic redraw for the radio screen animation (500 ms).
+  if (currentFunction == FUNCTION_RADIO && msNow - radioRedrawMs > 500) {
+    radioRedrawMs    = msNow;
+    radioNeedsRedraw = true;
+  }
+
+  // Call audio.loop() BEFORE render so it gets first crack at CPU each iteration.
+  if (radioPlaying) radioAudio.loop();
+
   serialCheckInput();
   btProcessPendingEvents();
   checkPowerManagement(msNow);
   renderFunction();
+
+  // Second audio.loop() call AFTER the display SPI push so buffer draining
+  // is not delayed a full iteration while rendering.
+  if (radioPlaying) radioAudio.loop();
 
   // Deferred BLE init: silently start the stack ~2 s after boot if enabled.
   // This runs once — after the clock has already rendered at least one frame.
@@ -1312,7 +1221,7 @@ extern bool obiwanNeedsRedraw;
 // Forward declarations for IR remote helpers
 void initIR();
 void renderIR();
-void irSendFunc(int devIdx, uint32_t code);
+void irSendButton(int devIdx, IRButton btn);
 void serialHandleIR(const char* arg);
 
 // Forward declarations for WiFi scan helpers
@@ -1385,7 +1294,7 @@ void handleBTSettingsTap(int16_t sx, int16_t sy) {
   bool isLandscape = sw > sh;
   int  sprite_y    = sy - SPRITE_Y;
 
-  static const int ITEM_COUNT = 6;  // 5 items + RESET (was 4 — bug fix)
+  static const int ITEM_COUNT = 6;  // 5 items + RESET
   int divY     = isLandscape ? 22 : 26;
   int startY   = divY + 4;
   int rowH     = isLandscape ? 20 : 32;
@@ -1502,7 +1411,7 @@ void onTap(int16_t sx, int16_t sy) {
       int totalBrands = 0;
       for (int i = 0; i < IRDB_COUNT; i++) {
         bool dup = false;
-        for (int j = 0; j < i; j++) if (!strcmp(IRDB[j].brand, IRDB[i].brand)) { dup=true; break; }
+        for (int j = 0; j < i; j++) if (!strcmp(irBrand(IRDB[j]), irBrand(IRDB[i]))) { dup=true; break; }
         if (!dup) totalBrands++;
       }
       int listArea = sh - listTop - (irSelectedMask ? 22 : 4);
@@ -1523,8 +1432,8 @@ void onTap(int16_t sx, int16_t sy) {
           int c = 0;
           for (int k = 0; k < IRDB_COUNT; k++) {
             bool dup = false;
-            for (int j = 0; j < k; j++) if (!strcmp(IRDB[j].brand, IRDB[k].brand)) { dup=true; break; }
-            if (!dup) { if (c == n) { strncpy(irSelBrand, IRDB[k].brand, 31); break; } c++; }
+            for (int j = 0; j < k; j++) if (!strcmp(irBrand(IRDB[j]), irBrand(IRDB[k]))) { dup=true; break; }
+            if (!dup) { if (c == n) { strncpy(irSelBrand, irBrand(IRDB[k]), 31); break; } c++; }
           }
           irLevel = IR_LEVEL_TYPE; irTypeOff = 0; return;
         }
@@ -1538,10 +1447,10 @@ void onTap(int16_t sx, int16_t sy) {
       if (sprite_y < titleH) { irLevel = IR_LEVEL_BRAND; return; }
       int typeCount = 0;
       for (int i = 0; i < IRDB_COUNT; i++) {
-        if (strcmp(IRDB[i].brand, irSelBrand)) continue;
+        if (strcmp(irBrand(IRDB[i]), irSelBrand)) continue;
         bool dup = false;
         for (int j = 0; j < i; j++)
-          if (!strcmp(IRDB[j].brand,irSelBrand) && !strcmp(IRDB[j].type,IRDB[i].type)) { dup=true; break; }
+          if (!strcmp(irBrand(IRDB[j]),irSelBrand) && !strcmp(irType(IRDB[j]),irType(IRDB[i]))) { dup=true; break; }
         if (!dup) typeCount++;
       }
       int visRows = max(1, (sh - listTop - 4) / rowH);
@@ -1553,11 +1462,11 @@ void onTap(int16_t sx, int16_t sy) {
           // Find Nth unique type for brand
           int c = 0;
           for (int k = 0; k < IRDB_COUNT; k++) {
-            if (strcmp(IRDB[k].brand, irSelBrand)) continue;
+            if (strcmp(irBrand(IRDB[k]), irSelBrand)) continue;
             bool dup = false;
             for (int j = 0; j < k; j++)
-              if (!strcmp(IRDB[j].brand,irSelBrand) && !strcmp(IRDB[j].type,IRDB[k].type)) { dup=true; break; }
-            if (!dup) { if (c == n) { strncpy(irSelType, IRDB[k].type, 31); break; } c++; }
+              if (!strcmp(irBrand(IRDB[j]),irSelBrand) && !strcmp(irType(IRDB[j]),irType(IRDB[k]))) { dup=true; break; }
+            if (!dup) { if (c == n) { strncpy(irSelType, irType(IRDB[k]), 31); break; } c++; }
           }
           irLevel = IR_LEVEL_DEVICE; irDevOff = 0; return;
         }
@@ -1570,7 +1479,7 @@ void onTap(int16_t sx, int16_t sy) {
       if (sprite_y < titleH) { irLevel = IR_LEVEL_TYPE; return; }  // tap title = back
       int devCount = 0;
       for (int i = 0; i < IRDB_COUNT; i++)
-        if (!strcmp(IRDB[i].brand,irSelBrand) && !strcmp(IRDB[i].type,irSelType)) devCount++;
+        if (!strcmp(irBrand(IRDB[i]),irSelBrand) && !strcmp(irType(IRDB[i]),irSelType)) devCount++;
       // "Use Remote" button
       int selCount = 0;
       for (int i = 0; i < IRDB_COUNT; i++) if (irSelectedMask & (1ULL<<i)) selCount++;
@@ -1587,13 +1496,13 @@ void onTap(int16_t sx, int16_t sy) {
         if (sprite_y >= rowY && sprite_y < rowY + rowH) {
           int c = 0, devIdx = -1;
           for (int k = 0; k < IRDB_COUNT; k++) {
-            if (!strcmp(IRDB[k].brand,irSelBrand) && !strcmp(IRDB[k].type,irSelType)) {
+            if (!strcmp(irBrand(IRDB[k]),irSelBrand) && !strcmp(irType(IRDB[k]),irSelType)) {
               if (c == n) { devIdx = k; break; } c++;
             }
           }
           // TEST button on right edge — fire power without toggling selection
           if (sx > sw - 30) {
-            if (devIdx >= 0) irSendFunc(devIdx, IRDB[devIdx].power);
+            if (devIdx >= 0) irSendButton(devIdx, IR_BTN_POWER);
             return;
           }
           if (devIdx >= 0) { irSelectedMask ^= (1ULL << devIdx); saveSettings(); }
@@ -1611,37 +1520,37 @@ void onTap(int16_t sx, int16_t sy) {
         }
       }
       if (selIdx < 0) return;
-      const IRDev& d = IRDB[selIdx];
+      const IREntry& e = IRDB[selIdx];
       int titleH = isLand ? 22 : 28;
       int tapY   = sprite_y - titleH;
       if (tapY < 0) { irLevel = IR_LEVEL_DEVICE; return; }
       int pad    = 3;
       int areaH  = sh - titleH - 2*pad;
-      bool hasNav = (d.navUp != 0);
-      bool hasExt = (d.input || d.menu || d.ok || d.back || hasNav);
+      bool hasNav = irHasNav(e);
+      bool hasExt = irHasExt(e);
       int  tapInArea = tapY - pad;
-      uint32_t code  = 0;
+      IRButton btn = IR_BTN_NONE;
 
       if (!hasNav && !hasExt) {
         // Layout A: 4 rows
         int rH  = areaH / 4;
         int row = tapInArea / rH;
         bool lft = (sx < sw / 2);
-        if      (row == 0) code = d.power;
-        else if (row == 1) code = lft ? d.volUp   : d.chUp;
-        else if (row == 2) code = lft ? d.volDown : d.chDown;
-        else if (row == 3) code = d.input ? (lft ? d.mute : d.input) : d.mute;
+        if      (row == 0) btn = IR_BTN_POWER;
+        else if (row == 1) btn = lft ? IR_BTN_VOL_UP : IR_BTN_CH_UP;
+        else if (row == 2) btn = lft ? IR_BTN_VOL_DN : IR_BTN_CH_DN;
+        else if (row == 3) btn = (irButtonAvailable(e,IR_BTN_INPUT) && !lft) ? IR_BTN_INPUT : IR_BTN_MUTE;
 
       } else if (!hasNav) {
         // Layout B: 5 rows
         int rH  = areaH / 5;
         int row = tapInArea / rH;
         bool lft = (sx < sw / 2);
-        if      (row == 0) code = d.power;
-        else if (row == 1) code = lft ? d.volUp   : d.chUp;
-        else if (row == 2) code = lft ? d.volDown : d.chDown;
-        else if (row == 3) code = lft ? d.mute    : d.input;
-        else if (row == 4) code = lft ? d.menu    : (d.ok ? d.ok : d.back);
+        if      (row == 0) btn = IR_BTN_POWER;
+        else if (row == 1) btn = lft ? IR_BTN_VOL_UP : IR_BTN_CH_UP;
+        else if (row == 2) btn = lft ? IR_BTN_VOL_DN : IR_BTN_CH_DN;
+        else if (row == 3) btn = lft ? IR_BTN_MUTE   : IR_BTN_INPUT;
+        else if (row == 4) btn = lft ? IR_BTN_MENU   : (irButtonAvailable(e,IR_BTN_OK) ? IR_BTN_OK : IR_BTN_BACK);
 
       } else {
         // Layout C: 5 rows; rows 1-3 = 3 columns; row 4 = 4 mini-buttons
@@ -1649,34 +1558,34 @@ void onTap(int16_t sx, int16_t sy) {
         int row = tapInArea / rH;
         int cW  = (sw - pad*4) / 3;
         int col = (sx < pad + cW) ? 0 : (sx < 2*pad + 2*cW) ? 1 : 2;
-        if      (row == 0) code = d.power;
+        if      (row == 0) btn = IR_BTN_POWER;
         else if (row == 1) {
-          if      (col == 0) code = d.volUp;
-          else if (col == 1) code = d.navUp;
-          else               code = d.chUp;
+          if      (col == 0) btn = IR_BTN_VOL_UP;
+          else if (col == 1) btn = IR_BTN_NAV_UP;
+          else               btn = IR_BTN_CH_UP;
         } else if (row == 2) {
-          if      (col == 0) code = d.navLeft;
-          else if (col == 1) code = d.ok;
-          else               code = d.navRight;
+          if      (col == 0) btn = IR_BTN_NAV_L;
+          else if (col == 1) btn = IR_BTN_OK;
+          else               btn = IR_BTN_NAV_R;
         } else if (row == 3) {
-          if      (col == 0) code = d.volDown;
-          else if (col == 1) code = d.navDown;
-          else               code = d.chDown;
+          if      (col == 0) btn = IR_BTN_VOL_DN;
+          else if (col == 1) btn = IR_BTN_NAV_DN;
+          else               btn = IR_BTN_CH_DN;
         } else if (row == 4) {
           // 4 mini-buttons: MUTE / INPUT / MENU / BACK
           int q       = (sw - pad*5) / 4;
           int quarter = max(0, min(3, (sx - pad) / (q + pad)));
-          if      (quarter == 0) code = d.mute;
-          else if (quarter == 1) code = d.input;
-          else if (quarter == 2) code = d.menu;
-          else                   code = d.back;
+          if      (quarter == 0) btn = IR_BTN_MUTE;
+          else if (quarter == 1) btn = IR_BTN_INPUT;
+          else if (quarter == 2) btn = IR_BTN_MENU;
+          else                   btn = IR_BTN_BACK;
         }
       }
-      if (code) {
+      if (btn != IR_BTN_NONE && irButtonAvailable(e, btn)) {
         irFlashX  = sx;
         irFlashY  = sprite_y;
         irFlashMs = millis();
-        irSendFunc(selIdx, code);
+        irSendButton(selIdx, btn);
       }
     }
   } else if (currentFunction == FUNCTION_WIFI && navState == NAV_NORMAL) {
@@ -1752,6 +1661,19 @@ void onTap(int16_t sx, int16_t sy) {
       case 2: mel=OBIWAN_MELODY; len=OBIWAN_MELODY_LEN; obiwanNeedsRedraw=true; break;
     }
     if (buzzerPlaying) stopBuzzer(); else if (mel) startBuzzer(mel, len);
+  } else if (currentFunction == FUNCTION_RADIO && navState == NAV_NORMAL) {
+    if (!speakerHatEnabled || !webRadioEnabled || !WiFi.isConnected()) return;
+    int sprite_y = sy - SPRITE_Y;
+    int sh = statusSprite.height();
+    int btnH = 22;
+    int btnY = sh - btnH - 2;
+    if (sprite_y >= btnY && sprite_y < btnY + btnH) {
+      if (radioPlaying) {
+        radioStop();
+      } else {
+        radioConnect();
+      }
+    }
   }
 }
 
@@ -1792,7 +1714,7 @@ void onSwipe(int16_t dx, int16_t dy) {
         int totalBrands = 0;
         for (int i = 0; i < IRDB_COUNT; i++) {
           bool dup = false;
-          for (int j = 0; j < i; j++) if (!strcmp(IRDB[j].brand, IRDB[i].brand)) { dup=true; break; }
+          for (int j = 0; j < i; j++) if (!strcmp(irBrand(IRDB[j]), irBrand(IRDB[i]))) { dup=true; break; }
           if (!dup) totalBrands++;
         }
         if (dy < 0) irBrandOff = min(irBrandOff + 1, totalBrands - 1);
@@ -1800,10 +1722,10 @@ void onSwipe(int16_t dx, int16_t dy) {
       } else if (irLevel == IR_LEVEL_TYPE) {
         int typeCount = 0;
         for (int i = 0; i < IRDB_COUNT; i++) {
-          if (strcmp(IRDB[i].brand, irSelBrand)) continue;
+          if (strcmp(irBrand(IRDB[i]), irSelBrand)) continue;
           bool dup = false;
           for (int j = 0; j < i; j++)
-            if (!strcmp(IRDB[j].brand,irSelBrand) && !strcmp(IRDB[j].type,IRDB[i].type)) { dup=true; break; }
+            if (!strcmp(irBrand(IRDB[j]),irSelBrand) && !strcmp(irType(IRDB[j]),irType(IRDB[i]))) { dup=true; break; }
           if (!dup) typeCount++;
         }
         if (dy < 0) irTypeOff = min(irTypeOff + 1, typeCount - 1);
@@ -1811,7 +1733,7 @@ void onSwipe(int16_t dx, int16_t dy) {
       } else if (irLevel == IR_LEVEL_DEVICE) {
         int devCount = 0;
         for (int i = 0; i < IRDB_COUNT; i++)
-          if (!strcmp(IRDB[i].brand,irSelBrand) && !strcmp(IRDB[i].type,irSelType)) devCount++;
+          if (!strcmp(irBrand(IRDB[i]),irSelBrand) && !strcmp(irType(IRDB[i]),irSelType)) devCount++;
         if (dy < 0) irDevOff = min(irDevOff + 1, devCount - 1);
         else        irDevOff = max(irDevOff - 1, 0);
       } else if (irLevel == IR_LEVEL_REMOTE) {
@@ -1882,7 +1804,7 @@ void onKey1Short() {
     if ((currentFunction == FUNCTION_WIFI    && settingsCursor == 2) ||
         (currentFunction == FUNCTION_LORA    && settingsCursor == 4) ||
         (currentFunction == FUNCTION_BT      && settingsCursor == 5) ||
-        (currentFunction == FUNCTION_BATTERY && settingsCursor == 4)) {
+        (currentFunction == FUNCTION_BATTERY && settingsCursor == 6)) {
       navState = NAV_RESET;
       resetFeedbackMs = 0; resetFeedbackBtn = -1;
       return;
@@ -1913,6 +1835,15 @@ void onKey1Short() {
         case 1: sleepTimeoutIdx = (sleepTimeoutIdx + 1) % POWER_TIMEOUT_COUNT; break;
         case 2: lowBatIdx       = (lowBatIdx       + 1) % LOW_BAT_COUNT;       break;
         case 3: uiClickEnabled  = !uiClickEnabled;                              break;
+        case 4: speakerHatEnabled    = !speakerHatEnabled;
+                if (!speakerHatEnabled) webRadioEnabled = false;                   break;
+        case 5: if (speakerHatEnabled) webRadioEnabled = !webRadioEnabled;         break;
+      }
+    } else if (currentFunction == FUNCTION_RADIO) {
+      switch (settingsCursor) {
+        case 0: radioStationIdx = (radioStationIdx + 1) % RADIO_STATION_COUNT;           break;
+        case 1: radioVolume     = (radioVolume < 21) ? radioVolume + 1 : 0;
+                if (radioPlaying) radioAudio.setVolume(radioVolume);                      break;
       }
     }
   }
@@ -1934,7 +1865,9 @@ void onKey2Short() {
     else if (currentFunction == FUNCTION_BT)
       settingsCursor = (settingsCursor + 1) % 6;  // 5 items + RESET
     else if (currentFunction == FUNCTION_BATTERY)
-      settingsCursor = (settingsCursor + 1) % 5;  // 4 items + RESET
+      settingsCursor = (settingsCursor + 1) % 7;  // 6 items + RESET
+    else if (currentFunction == FUNCTION_RADIO)
+      settingsCursor = (settingsCursor + 1) % 2;  // 2 items: station, volume
   }
 }
 
@@ -1942,8 +1875,9 @@ void onKey2Short() {
 void onKey1Long() {
   uiClick(500, 35);
   if (navState == NAV_NORMAL) {
-    if (currentFunction == FUNCTION_LORA || currentFunction == FUNCTION_BT ||
-        currentFunction == FUNCTION_WIFI  || currentFunction == FUNCTION_BATTERY) {
+    if (currentFunction == FUNCTION_LORA    || currentFunction == FUNCTION_BT ||
+        currentFunction == FUNCTION_WIFI    || currentFunction == FUNCTION_BATTERY ||
+        currentFunction == FUNCTION_RADIO) {
       navState             = NAV_SETTINGS;
       settingsCursor       = 0;
       settingsScrollOffset = 0;
@@ -1954,6 +1888,7 @@ void onKey1Long() {
     else if (currentFunction == FUNCTION_LORA) applyLoraSettings();
     else if (currentFunction == FUNCTION_BT) applyBTSettings();
     else if (currentFunction == FUNCTION_BATTERY) applyDeviceSettings();
+    else if (currentFunction == FUNCTION_RADIO) applyRadioSettings();
     navState = NAV_NORMAL;
     // No lastFunction = -1 here: the sprite-based screens redraw every frame
     // without needing a full display.fillScreen() call, so clearing lastFunction
@@ -2023,10 +1958,12 @@ void serialPrintFunctionHelp(int fn) {
       break;
     case FUNCTION_BATTERY:
       snprintf(buf, sizeof(buf),
-        "[BATTERY] dim:%s  sleep:%s  lowbat:%s | battery | long-press=device settings",
+        "[BATTERY] dim:%s  sleep:%s  lowbat:%s  hat:%s  web:%s | battery | long-press=device settings",
         DIM_TIMEOUT_LABELS[dimTimeoutIdx],
         SLEEP_TIMEOUT_LABELS[sleepTimeoutIdx],
-        LOW_BAT_LABELS[lowBatIdx]);
+        LOW_BAT_LABELS[lowBatIdx],
+        speakerHatEnabled    ? "ON" : "off",
+        webRadioEnabled ? "ON" : "off");
       serialWritelnAll(buf);
       break;
     case FUNCTION_CONTROLLER:
@@ -2076,6 +2013,15 @@ void serialPrintFunctionHelp(int fn) {
       serialWritelnAll(buf);
       serialWritelnAll("  lora list | lora send <text> | lora preset 0-3 | lora reply on|off | lora dedup on|off");
       break;
+    case FUNCTION_RADIO:
+      snprintf(buf, sizeof(buf),
+        "[RADIO] hat:%s  web:%s  station:%d/%s  vol:%d  playing:%s | radio station <N> | radio vol <0-21> | radio play|stop",
+        speakerHatEnabled    ? "ON" : "off",
+        webRadioEnabled ? "ON" : "off",
+        radioStationIdx + 1, RADIO_STATIONS[radioStationIdx].name,
+        radioVolume, radioPlaying ? "ON" : "off");
+      serialWritelnAll(buf);
+      break;
     case FUNCTION_MEDIA: {
       static const char* subName[] = {"MATRIX","VADER","OBI-WAN"};
       snprintf(buf, sizeof(buf), "[MEDIA:%s] music:%s  swipe up/down=change | music on|off",
@@ -2092,7 +2038,7 @@ void serialPrintHelp() {
   serialWritelnAll("========= NESSO N1 SERIAL =========");
   serialWritelnAll("Navigation:");
   serialWritelnAll("  next | prev           next/prev screen");
-  serialWritelnAll("  goto <screen>         main|controller|bt|wifi|lora|ir|media|battery");
+  serialWritelnAll("  goto <screen>         main|controller|bt|wifi|lora|ir|media|battery|radio");
   serialWritelnAll("  status                current state summary");
   serialWritelnAll("Information:");
   serialWritelnAll("  clock                 time and date (NTP UTC+3)");
@@ -2127,6 +2073,14 @@ void serialPrintHelp() {
   serialWritelnAll("  ir select <N>         add device N to active remote set");
   serialWritelnAll("  ir deselect <N>       remove device N from active set");
   serialWritelnAll("  ir pin                show built-in IR blaster pin info");
+  serialWritelnAll("Radio (M5 Speaker 2 HAT):");
+  serialWritelnAll("  radio hat on|off       enable/disable HAT (persisted)");
+  serialWritelnAll("  radio play|stop        start / stop playback");
+  serialWritelnAll("  radio station <N>      switch to preset station N (1-7)");
+  serialWritelnAll("  radio url <url>        play a custom stream URL");
+  serialWritelnAll("  radio vol <0-21>       set volume");
+  serialWritelnAll("  radio list             list all preset stations with URLs");
+  serialWritelnAll("  radio status           show current radio state");
   serialWritelnAll("Music (matrix / vader / obiwan screens):");
   serialWritelnAll("  music on|off");
   serialWritelnAll("IMU / Orientation:");
@@ -2198,7 +2152,8 @@ void serialPrintController() {
 void serialGoto(const char* name) {
   static const struct { const char* n; int f; } map[] = {
     {"main",0},{"controller",1},{"bt",2},{"wifi",3},
-    {"lora",4},{"ir",5},{"media",6},{"matrix",6},{"vader",6},{"obiwan",6},{"battery",7}
+    {"lora",4},{"ir",5},{"media",6},{"matrix",6},{"vader",6},{"obiwan",6},
+    {"battery",7},{"radio",8}
   };
   for (auto& e : map) {
     if (strcasecmp(name, e.n) == 0) {
@@ -2208,7 +2163,7 @@ void serialGoto(const char* name) {
       return;
     }
   }
-  serialWritelnAll("Unknown screen. Use: main|controller|bt|wifi|lora|ir|media|battery");
+  serialWritelnAll("Unknown screen. Use: main|controller|bt|wifi|lora|ir|media|battery|radio");
 }
 
 void serialHandleBT(const char* arg) {
@@ -2318,7 +2273,7 @@ void serialHandleIR(const char* arg) {
     for (int i = 0; i < IRDB_COUNT; i++) {
       bool sel = (irSelectedMask & (1ULL << i)) != 0;
       snprintf(buf, sizeof(buf), "%2d: [%c] %-10s %-8s %s",
-        i, sel ? 'X' : ' ', IRDB[i].brand, IRDB[i].type, IRDB[i].name);
+        i, sel ? 'X' : ' ', irBrand(IRDB[i]), irType(IRDB[i]), irName(IRDB[i]));
       serialWritelnAll(buf);
     }
   } else if (cmdIs(arg,"select")) {
@@ -2326,7 +2281,7 @@ void serialHandleIR(const char* arg) {
     if (idx < 0 || idx >= IRDB_COUNT) { serialWritelnAll("Invalid index."); return; }
     irSelectedMask |= (1ULL << idx);
     saveSettings();
-    char buf[56]; snprintf(buf,sizeof(buf),"Selected: %s %s %s",IRDB[idx].brand,IRDB[idx].type,IRDB[idx].name);
+    char buf[56]; snprintf(buf,sizeof(buf),"Selected: %s %s %s",irBrand(IRDB[idx]),irType(IRDB[idx]),irName(IRDB[idx]));
     serialWritelnAll(buf);
   } else if (cmdIs(arg,"deselect")) {
     int idx = atoi(cmdArg(arg,"deselect"));
@@ -2343,17 +2298,18 @@ void serialHandleIR(const char* arg) {
       serialWritelnAll("Usage: ir send <N> power|volup|voldn|mute|chup|chdn");
       return;
     }
-    uint32_t code = 0;
-    if      (strcasecmp(rest,"power")==0) code = IRDB[idx].power;
-    else if (strcasecmp(rest,"volup")==0) code = IRDB[idx].volUp;
-    else if (strcasecmp(rest,"voldn")==0) code = IRDB[idx].volDown;
-    else if (strcasecmp(rest,"mute") ==0) code = IRDB[idx].mute;
-    else if (strcasecmp(rest,"chup") ==0) code = IRDB[idx].chUp;
-    else if (strcasecmp(rest,"chdn") ==0) code = IRDB[idx].chDown;
+    IRButton btn = IR_BTN_NONE;
+    if      (strcasecmp(rest,"power")==0) btn = IR_BTN_POWER;
+    else if (strcasecmp(rest,"volup")==0) btn = IR_BTN_VOL_UP;
+    else if (strcasecmp(rest,"voldn")==0) btn = IR_BTN_VOL_DN;
+    else if (strcasecmp(rest,"mute") ==0) btn = IR_BTN_MUTE;
+    else if (strcasecmp(rest,"chup") ==0) btn = IR_BTN_CH_UP;
+    else if (strcasecmp(rest,"chdn") ==0) btn = IR_BTN_CH_DN;
     else { serialWritelnAll("Unknown function. Use: power|volup|voldn|mute|chup|chdn"); return; }
-    irSendFunc(idx, code);
-    char buf[56]; snprintf(buf,sizeof(buf),"Sent %s -> %s %s %s (0x%08X)",
-      rest,IRDB[idx].brand,IRDB[idx].type,IRDB[idx].name,(unsigned)code);
+    if (!irButtonAvailable(IRDB[idx], btn)) { serialWritelnAll("Button not available on this device."); return; }
+    irSendButton(idx, btn);
+    char buf[56]; snprintf(buf,sizeof(buf),"Sent %s -> %s %s %s",
+      rest,irBrand(IRDB[idx]),irType(IRDB[idx]),irName(IRDB[idx]));
     serialWritelnAll(buf);
   } else if (cmdIs(arg,"pin")) {
     char buf[48]; snprintf(buf,sizeof(buf),"IR blaster: built-in GPIO %d (IR_TX_PIN).", IR_SEND_PIN);
@@ -2500,6 +2456,120 @@ void serialHandleLora(const char* arg) {
   }
 }
 
+void serialHandleRadio(const char* arg) {
+  char buf[160];
+  if (!*arg) {
+    serialWritelnAll("radio hat on|off | radio web on|off | radio play|stop | radio station <1-5> | radio vol <0-21>");
+    serialWritelnAll("radio list | radio url <url> | radio status");
+    return;
+  }
+  if (cmdIs(arg,"hat")) {
+    const char* v = cmdArg(arg,"hat");
+    if      (strcasecmp(v,"on") ==0) { speakerHatEnabled = true; }
+    else if (strcasecmp(v,"off")==0) { speakerHatEnabled = false; webRadioEnabled = false; radioStop(); }
+    else { serialWritelnAll("Usage: radio hat on|off"); return; }
+    saveSettings();
+    if (speakerHatEnabled && webRadioEnabled && WiFi.isConnected() && !radioPlaying) radioConnect();
+    snprintf(buf, sizeof(buf), "Speaker HAT: %s", speakerHatEnabled ? "ON" : "OFF");
+    serialWritelnAll(buf);
+    radioNeedsRedraw = true;
+  } else if (cmdIs(arg,"web")) {
+    const char* v = cmdArg(arg,"web");
+    if      (strcasecmp(v,"on") ==0) { if (!speakerHatEnabled) { serialWritelnAll("Enable Speaker HAT first."); return; } webRadioEnabled = true; }
+    else if (strcasecmp(v,"off")==0) { webRadioEnabled = false; radioStop(); }
+    else { serialWritelnAll("Usage: radio web on|off"); return; }
+    saveSettings();
+    if (speakerHatEnabled && webRadioEnabled && WiFi.isConnected() && !radioPlaying) radioConnect();
+    snprintf(buf, sizeof(buf), "Web Radio: %s", webRadioEnabled ? "ON" : "OFF");
+    serialWritelnAll(buf);
+    radioNeedsRedraw = true;
+  } else if (cmdIs(arg,"play")) {
+    if (!speakerHatEnabled) { serialWritelnAll("Speaker HAT disabled. Use: radio hat on"); return; }
+    if (!webRadioEnabled) { serialWritelnAll("Web Radio disabled. Use: radio web on"); return; }
+    if (!WiFi.isConnected()) { serialWritelnAll("WiFi not connected."); return; }
+    radioStop();
+    radioConnect();
+  } else if (cmdIs(arg,"stop")) {
+    radioStop();
+    serialWritelnAll("Radio stopped.");
+  } else if (cmdIs(arg,"station")) {
+    int idx = atoi(cmdArg(arg,"station")) - 1;
+    if (idx < 0 || idx >= RADIO_STATION_COUNT) {
+      snprintf(buf, sizeof(buf), "Station must be 1..%d", RADIO_STATION_COUNT);
+      serialWritelnAll(buf); return;
+    }
+    radioStationIdx = idx;
+    radioCustomUrl[0] = '\0';   // clear any custom URL when switching to preset
+    saveSettings();
+    if (speakerHatEnabled && webRadioEnabled && WiFi.isConnected()) { radioStop(); radioConnect(); }
+    snprintf(buf, sizeof(buf), "Station: %d / %s", radioStationIdx + 1, RADIO_STATIONS[radioStationIdx].name);
+    serialWritelnAll(buf);
+    radioNeedsRedraw = true;
+  } else if (cmdIs(arg,"vol")) {
+    int v = atoi(cmdArg(arg,"vol"));
+    radioVolume = constrain(v, 0, 21);
+    if (radioPlaying) radioAudio.setVolume(radioVolume);
+    saveSettings();
+    snprintf(buf, sizeof(buf), "Volume: %d", radioVolume);
+    serialWritelnAll(buf);
+    radioNeedsRedraw = true;
+  } else if (cmdIs(arg,"list")) {
+    serialWritelnAll("--- Preset Stations ---");
+    for (int i = 0; i < RADIO_STATION_COUNT; i++) {
+      snprintf(buf, sizeof(buf), "  %d: %s", i + 1, RADIO_STATIONS[i].name);
+      serialWritelnAll(buf);
+      snprintf(buf, sizeof(buf), "     %s", RADIO_STATIONS[i].url);
+      serialWritelnAll(buf);
+    }
+    if (radioCustomUrl[0] != '\0') {
+      serialWritelnAll("  [custom]:");
+      snprintf(buf, sizeof(buf), "     %s", radioCustomUrl);
+      serialWritelnAll(buf);
+    }
+  } else if (cmdIs(arg,"url")) {
+    const char* url = cmdArg(arg,"url");
+    if (!*url) { serialWritelnAll("Usage: radio url <url>"); return; }
+    strncpy(radioCustomUrl, url, sizeof(radioCustomUrl) - 1);
+    radioCustomUrl[sizeof(radioCustomUrl) - 1] = '\0';
+    snprintf(buf, sizeof(buf), "[RADIO] Custom URL set: %s", radioCustomUrl);
+    serialWritelnAll(buf);
+    if (speakerHatEnabled && webRadioEnabled && WiFi.isConnected()) {
+      radioStop();
+      radioConnect();
+    }
+    radioNeedsRedraw = true;
+  } else if (cmdIs(arg,"status")) {
+    snprintf(buf, sizeof(buf), "Speaker HAT : %s", speakerHatEnabled    ? "ON" : "OFF");
+    serialWritelnAll(buf);
+    snprintf(buf, sizeof(buf), "Web Radio   : %s", webRadioEnabled ? "ON" : "OFF");
+    serialWritelnAll(buf);
+    snprintf(buf, sizeof(buf), "WiFi        : %s", WiFi.isConnected() ? "connected" : "disconnected");
+    serialWritelnAll(buf);
+    snprintf(buf, sizeof(buf), "Playing     : %s", radioPlaying ? "yes" : "no");
+    serialWritelnAll(buf);
+    snprintf(buf, sizeof(buf), "Volume      : %d", radioVolume);
+    serialWritelnAll(buf);
+    if (radioCustomUrl[0] != '\0') {
+      snprintf(buf, sizeof(buf), "URL (custom): %s", radioCustomUrl);
+    } else {
+      snprintf(buf, sizeof(buf), "Station     : %d / %s  (%s)",
+        radioStationIdx + 1, RADIO_STATIONS[radioStationIdx].name,
+        RADIO_STATIONS[radioStationIdx].url);
+    }
+    serialWritelnAll(buf);
+    if (radioStation[0]) {
+      snprintf(buf, sizeof(buf), "Stream name : %s", radioStation);
+      serialWritelnAll(buf);
+    }
+    if (radioTrack[0]) {
+      snprintf(buf, sizeof(buf), "Track       : %s", radioTrack);
+      serialWritelnAll(buf);
+    }
+  } else {
+    serialWritelnAll("Unknown radio subcommand. Type: radio");
+  }
+}
+
 void serialHandleMusic(const char* arg) {
   if (strcasecmp(arg,"on")==0) {
     const BuzzNote* mel = nullptr; int len = 0;
@@ -2547,6 +2617,7 @@ void serialHandleCommand(const char* raw) {
   else if (cmdIs(raw,"wifi"))  serialHandleWiFi(cmdArg(raw,"wifi"));
   else if (cmdIs(raw,"ir"))    serialHandleIR(cmdArg(raw,"ir"));
   else if (cmdIs(raw,"lora"))  serialHandleLora(cmdArg(raw,"lora"));
+  else if (cmdIs(raw,"radio")) serialHandleRadio(cmdArg(raw,"radio"));
   else if (cmdIs(raw,"music")) serialHandleMusic(cmdArg(raw,"music"));
   else if (cmdIs(raw,"imu"))   serialHandleImu(cmdArg(raw,"imu"));
   else {
@@ -2601,6 +2672,8 @@ void renderFunction() {
   }
   if (lastFunction == (int)FUNCTION_MEDIA && currentFunction != FUNCTION_MEDIA)
     stopBuzzer();
+  if (lastFunction == (int)FUNCTION_RADIO && currentFunction != FUNCTION_RADIO)
+    radioStop();
 
   // Send contextual help over serial when the screen changes
   static int serialLastScreen = -1;
@@ -2666,6 +2739,12 @@ void renderFunction() {
       if (lastFunction != (int)FUNCTION_LORA) initLora();
       loraCheckPacket();
       renderLora();
+      statusSprite.pushSprite(0, SPRITE_Y);
+      break;
+
+    case FUNCTION_RADIO:
+      if (lastFunction != (int)FUNCTION_RADIO) initRadio();
+      renderRadio();
       statusSprite.pushSprite(0, SPRITE_Y);
       break;
   }
@@ -4911,6 +4990,12 @@ void applyDeviceSettings() {
   displayDimmed  = false;
   displayOff     = false;
   digitalWrite(LCD_BACKLIGHT, HIGH);
+  // Stop audio if Speaker HAT or Web Radio was disabled; connect if both are now on and on the radio screen
+  if (!speakerHatEnabled || !webRadioEnabled) {
+    radioStop();
+  } else if (currentFunction == FUNCTION_RADIO && WiFi.isConnected() && !radioPlaying) {
+    radioConnect();
+  }
 }
 
 void renderBatterySettings() {
@@ -4921,14 +5006,16 @@ void renderBatterySettings() {
   statusSprite.fillSprite(COLOR_BLACK);
   statusSprite.setFont(&fonts::Font0);
 
-  static const int ITEM_COUNT = 5;
-  const char* labels[ITEM_COUNT] = {"DIM TIMEOUT", "SLEEP TIMEOUT", "LOW BAT SLEEP", "UI CLICKS", "RESET"};
+  static const int ITEM_COUNT = 7;
+  const char* labels[ITEM_COUNT] = {"DIM TIMEOUT", "SLEEP TIMEOUT", "LOW BAT SLEEP", "UI CLICKS", "SPEAKER HAT", "WEB RADIO", "RESET"};
   char values[ITEM_COUNT][16];
   snprintf(values[0], 16, "%s", DIM_TIMEOUT_LABELS[dimTimeoutIdx]);
   snprintf(values[1], 16, "%s", SLEEP_TIMEOUT_LABELS[sleepTimeoutIdx]);
   snprintf(values[2], 16, "%s", LOW_BAT_LABELS[lowBatIdx]);
-  snprintf(values[3], 16, "%s", uiClickEnabled ? "ON" : "OFF");
-  snprintf(values[4], 16, "%s", "\x10");  // right-arrow glyph
+  snprintf(values[3], 16, "%s", uiClickEnabled  ? "ON" : "OFF");
+  snprintf(values[4], 16, "%s", speakerHatEnabled    ? "ON" : "OFF");
+  snprintf(values[5], 16, "%s", !speakerHatEnabled   ? "N/A" : (webRadioEnabled ? "ON" : "OFF"));
+  snprintf(values[6], 16, "%s", "\x10");  // right-arrow glyph
 
   int titleY = isLandscape ? 4 : 6;
   int divY   = isLandscape ? 22 : 26;
@@ -4968,24 +5055,31 @@ void renderBatterySettings() {
     int idx     = i + settingsScrollOffset;
     if (idx >= ITEM_COUNT) break;
     int y       = startY + i * rowH;
-    bool sel    = (idx == settingsCursor);
+    bool sel     = (idx == settingsCursor);
     bool isReset = (idx == ITEM_COUNT - 1);
-    int textY   = y + (rowH - 8) / 2;
+    bool dimmed  = (idx == 5 && !speakerHatEnabled); // WEB RADIO greyed when Speaker HAT is off
+    int textY    = y + (rowH - 8) / 2;
 
     if (isReset && sel)
       statusSprite.fillRect(4, y, sw - 8, rowH - 2, display.color565(60, 15, 15));
-    else if (sel)
+    else if (sel && !dimmed)
       statusSprite.fillRect(4, y, sw - 8, rowH - 2, display.color565(20, 30, 50));
 
     statusSprite.setTextDatum(TL_DATUM);
     statusSprite.setTextSize(1);
-    statusSprite.setTextColor(sel ? (isReset ? display.color565(255,80,80) : display.color565(0,140,255))
-                                  : display.color565(60, 60, 60));
-    statusSprite.drawString(sel ? ">" : " ", 6, textY);
-    statusSprite.setTextColor(sel ? COLOR_WHITE : (isReset ? display.color565(100,40,40) : COLOR_GRAY));
+    uint32_t arrowCol = dimmed ? display.color565(40,40,40)
+                               : (sel ? (isReset ? display.color565(255,80,80) : display.color565(0,140,255))
+                                      : display.color565(60, 60, 60));
+    statusSprite.setTextColor(arrowCol);
+    statusSprite.drawString(sel && !dimmed ? ">" : " ", 6, textY);
+    uint32_t labelCol = dimmed ? display.color565(40,40,40)
+                               : (sel ? COLOR_WHITE : (isReset ? display.color565(100,40,40) : COLOR_GRAY));
+    statusSprite.setTextColor(labelCol);
     statusSprite.drawString(labels[idx], 18, textY);
     statusSprite.setTextDatum(TR_DATUM);
-    statusSprite.setTextColor(sel ? (isReset ? display.color565(255,80,80) : COLOR_ORANGE) : COLOR_GRAY);
+    uint32_t valueCol = dimmed ? display.color565(40,40,40)
+                               : (sel ? (isReset ? display.color565(255,80,80) : COLOR_ORANGE) : COLOR_GRAY);
+    statusSprite.setTextColor(valueCol);
     statusSprite.drawString(values[idx], sw - 8, textY);
   }
 
@@ -4998,7 +5092,7 @@ void handleBatterySettingsTap(int16_t sx, int16_t sy) {
   bool isLandscape = sw > sh;
   int  sprite_y    = sy - SPRITE_Y;
 
-  static const int ITEM_COUNT = 5;  // 4 items + RESET
+  static const int ITEM_COUNT = 7;  // 6 items + RESET
   int divY     = isLandscape ? 22 : 26;
   int startY   = divY + 4;
   int rowH     = isLandscape ? 20 : 32;
@@ -5499,20 +5593,29 @@ void handleBatteryResetTap(int16_t sx, int16_t sy) {
 // FUNCTION_IR — IR Remote Control
 // ================================================================
 
-// Send an IR code using the correct protocol for device devIdx
-void irSendFunc(int devIdx, uint32_t code) {
-  if (devIdx < 0 || devIdx >= IRDB_COUNT || code == 0) return;
+// Send IR button for device devIdx using the correct protocol
+void irSendButton(int devIdx, IRButton btn) {
+  if (devIdx < 0 || devIdx >= IRDB_COUNT || btn == IR_BTN_NONE) return;
+  const IREntry& e = IRDB[devIdx];
+  if (!irButtonAvailable(e, btn)) return;
   irTxMs = millis();  // record send time for TX indicator
-  const IRDev& d = IRDB[devIdx];
-  switch (d.proto) {
-    case IRDB_SAMSUNG: irsend.sendSAMSUNG(code, d.nbits);         break;
-    case IRDB_NEC:     irsend.sendNEC(code, d.nbits);             break;
-    case IRDB_SONY:    irsend.sendSony(code, d.nbits);            break;
-    case IRDB_RC5:     irsend.sendRC5(code, d.nbits);             break;
-    case IRDB_LG:      irsend.sendLG(code, d.nbits);              break;
-    case IRDB_JVC:     irsend.sendJVC(code, d.nbits, 0);          break;
-    case IRDB_SHARP:   irsend.sendSharp(d.addr, code, d.nbits);   break;
-    case IRDB_RC6:     irsend.sendRC6(code, d.nbits);             break;
+  if (e.isRaw) {
+    const IRRawSignal* sig = irGetRaw(e, btn);
+    irsend.sendRaw(sig->data, sig->len, sig->freq);
+  } else {
+    uint32_t code = irGetCode(e, btn);
+    const IRDev& d = *e.dev;
+    switch (d.proto) {
+      case IRDB_SAMSUNG: irsend.sendSAMSUNG(code, d.nbits);         break;
+      case IRDB_NEC:     irsend.sendNEC(code, d.nbits);             break;
+      case IRDB_SONY:    irsend.sendSony(code, d.nbits);            break;
+      case IRDB_RC5:     irsend.sendRC5(code, d.nbits);             break;
+      case IRDB_LG:      irsend.sendLG(code, d.nbits);              break;
+      case IRDB_JVC:     irsend.sendJVC(code, d.nbits, 0);          break;
+      case IRDB_SHARP:   irsend.sendSharp(d.addr, code, d.nbits);   break;
+      case IRDB_RC6:     irsend.sendRC6(code, d.nbits);             break;
+      default: break;
+    }
   }
 }
 
@@ -5563,7 +5666,7 @@ static void renderIRBrandList() {
   int totalBrands = 0;
   for (int i = 0; i < IRDB_COUNT; i++) {
     bool dup = false;
-    for (int j = 0; j < i; j++) if (!strcmp(IRDB[j].brand, IRDB[i].brand)) { dup=true; break; }
+    for (int j = 0; j < i; j++) if (!strcmp(irBrand(IRDB[j]), irBrand(IRDB[i]))) { dup=true; break; }
     if (!dup) totalBrands++;
   }
 
@@ -5600,7 +5703,7 @@ static void renderIRBrandList() {
   int c = 0;
   for (int i = 0; i < IRDB_COUNT; i++) {
     bool dup = false;
-    for (int j = 0; j < i; j++) if (!strcmp(IRDB[j].brand, IRDB[i].brand)) { dup=true; break; }
+    for (int j = 0; j < i; j++) if (!strcmp(irBrand(IRDB[j]), irBrand(IRDB[i]))) { dup=true; break; }
     if (dup) continue;
     int n = c++;
     if (n < irBrandOff || n >= irBrandOff + visRows) continue;
@@ -5609,13 +5712,13 @@ static void renderIRBrandList() {
     // Count selections for this brand
     int selForBrand = 0;
     for (int k = 0; k < IRDB_COUNT; k++)
-      if (!strcmp(IRDB[k].brand, IRDB[i].brand) && (irSelectedMask & (1ULL<<k))) selForBrand++;
+      if (!strcmp(irBrand(IRDB[k]), irBrand(IRDB[i])) && (irSelectedMask & (1ULL<<k))) selForBrand++;
     bool hasSel = (selForBrand > 0);
     if (hasSel) statusSprite.fillRect(2, rowY, sw-4, rowH-1, display.color565(25,12,0));
     statusSprite.setTextDatum(TL_DATUM);
     statusSprite.setTextSize(1);
     statusSprite.setTextColor(hasSel ? COLOR_WHITE : display.color565(180,100,20));
-    statusSprite.drawString(IRDB[i].brand, 8, textY);
+    statusSprite.drawString(irBrand(IRDB[i]), 8, textY);
     statusSprite.setTextDatum(TR_DATUM);
     if (hasSel) {
       char badge[8]; snprintf(badge, sizeof(badge), "[%d]", selForBrand);
@@ -5643,10 +5746,10 @@ static void renderIRTypeList() {
   // Count unique types
   int typeCount = 0;
   for (int i = 0; i < IRDB_COUNT; i++) {
-    if (strcmp(IRDB[i].brand, irSelBrand)) continue;
+    if (strcmp(irBrand(IRDB[i]), irSelBrand)) continue;
     bool dup = false;
     for (int j = 0; j < i; j++)
-      if (!strcmp(IRDB[j].brand,irSelBrand) && !strcmp(IRDB[j].type,IRDB[i].type)) { dup=true; break; }
+      if (!strcmp(irBrand(IRDB[j]),irSelBrand) && !strcmp(irType(IRDB[j]),irType(IRDB[i]))) { dup=true; break; }
     if (!dup) typeCount++;
   }
 
@@ -5665,10 +5768,10 @@ static void renderIRTypeList() {
 
   int c = 0;
   for (int i = 0; i < IRDB_COUNT; i++) {
-    if (strcmp(IRDB[i].brand, irSelBrand)) continue;
+    if (strcmp(irBrand(IRDB[i]), irSelBrand)) continue;
     bool dup = false;
     for (int j = 0; j < i; j++)
-      if (!strcmp(IRDB[j].brand,irSelBrand) && !strcmp(IRDB[j].type,IRDB[i].type)) { dup=true; break; }
+      if (!strcmp(irBrand(IRDB[j]),irSelBrand) && !strcmp(irType(IRDB[j]),irType(IRDB[i]))) { dup=true; break; }
     if (dup) continue;
     int n = c++;
     if (n < irTypeOff || n >= irTypeOff + visRows) continue;
@@ -5677,7 +5780,7 @@ static void renderIRTypeList() {
     // Count devices of this type + selected count
     int devCount = 0, selCount = 0;
     for (int k = 0; k < IRDB_COUNT; k++) {
-      if (!strcmp(IRDB[k].brand,irSelBrand) && !strcmp(IRDB[k].type,IRDB[i].type)) {
+      if (!strcmp(irBrand(IRDB[k]),irSelBrand) && !strcmp(irType(IRDB[k]),irType(IRDB[i]))) {
         devCount++;
         if (irSelectedMask & (1ULL<<k)) selCount++;
       }
@@ -5687,7 +5790,7 @@ static void renderIRTypeList() {
     statusSprite.setTextDatum(TL_DATUM);
     statusSprite.setTextSize(2);
     statusSprite.setTextColor(hasSel ? COLOR_WHITE : display.color565(180,100,20));
-    statusSprite.drawString(IRDB[i].type, 10, textY);
+    statusSprite.drawString(irType(IRDB[i]), 10, textY);
     statusSprite.setTextDatum(TR_DATUM);
     statusSprite.setTextSize(1);
     char badge[16];
@@ -5713,7 +5816,7 @@ static void renderIRDeviceList() {
 
   int devCount = 0;
   for (int i = 0; i < IRDB_COUNT; i++)
-    if (!strcmp(IRDB[i].brand,irSelBrand) && !strcmp(IRDB[i].type,irSelType)) devCount++;
+    if (!strcmp(irBrand(IRDB[i]),irSelBrand) && !strcmp(irType(IRDB[i]),irSelType)) devCount++;
 
   int selCount = 0;
   for (int i = 0; i < IRDB_COUNT; i++) if (irSelectedMask & (1ULL<<i)) selCount++;
@@ -5743,10 +5846,9 @@ static void renderIRDeviceList() {
     statusSprite.fillRect(sw-3, barY,    2, barH,     display.color565(180,70,0));
   }
 
-  const char* protoName[] = {"SMSG","NEC","SONY","RC5","LG","JVC","SHRP","RC6"};
   int c = 0;
   for (int i = 0; i < IRDB_COUNT; i++) {
-    if (!strcmp(IRDB[i].brand,irSelBrand) && !strcmp(IRDB[i].type,irSelType)) {
+    if (!strcmp(irBrand(IRDB[i]),irSelBrand) && !strcmp(irType(IRDB[i]),irSelType)) {
       int n = c++;
       if (n < irDevOff || n >= irDevOff + visRows) continue;
       bool sel  = (irSelectedMask & (1ULL<<i)) != 0;
@@ -5764,7 +5866,7 @@ static void renderIRDeviceList() {
       statusSprite.setTextDatum(TL_DATUM);
       statusSprite.setTextSize(1);
       statusSprite.setTextColor(sel ? COLOR_WHITE : COLOR_GRAY);
-      statusSprite.drawString(IRDB[i].name, 18, textY);
+      statusSprite.drawString(irName(IRDB[i]), 18, textY);
       // TEST fire button (▶) on right — tap to send power without selecting
       uint16_t testCol = display.color565(60,80,30);
       statusSprite.fillRect(sw-28, rowY+2, 22, rowH-4, display.color565(15,20,5));
@@ -5815,7 +5917,7 @@ static void renderIRRemote() {
   }
   if (selIdx < 0) { irLevel = IR_LEVEL_BRAND; return; }
 
-  const IRDev& d = IRDB[selIdx];
+  const IREntry& e = IRDB[selIdx];
   int sw = statusSprite.width(), sh = statusSprite.height();
   bool isLand = sw > sh;
   statusSprite.fillSprite(COLOR_BLACK);
@@ -5825,7 +5927,7 @@ static void renderIRRemote() {
   int titleH = isLand ? 22 : 28;
   statusSprite.fillRect(0, 0, sw, titleH, display.color565(30,15,0));
   char title[32];
-  snprintf(title, sizeof(title), "%s %s", d.brand, d.type);
+  snprintf(title, sizeof(title), "%s %s", irBrand(e), irType(e));
   statusSprite.setTextDatum(TC_DATUM);
   statusSprite.setTextSize(2);
   statusSprite.setTextColor(display.color565(200,80,0));
@@ -5850,8 +5952,8 @@ static void renderIRRemote() {
   }
 
   // ── Determine layout ──────────────────────────────────────────
-  bool hasNav = (d.navUp != 0);
-  bool hasExt = (d.input || d.menu || d.ok || d.back || hasNav);
+  bool hasNav = irHasNav(e);
+  bool hasExt = irHasExt(e);
 
   int pad   = 3;
   int areaY = titleH + pad;
@@ -5871,7 +5973,7 @@ static void renderIRRemote() {
     irDrawBtn(pad,       areaY+2*rH,hW, rH-pad, "VOL -", display.color565(20,100,200));
     irDrawBtn(pad+hW+pad,areaY+2*rH,hW, rH-pad, "CH -",  display.color565(0,110,60));
     // MUTE / INPUT (half-half if input exists, else full)
-    if (d.input) {
+    if (irButtonAvailable(e, IR_BTN_INPUT)) {
       irDrawBtn(pad,       areaY+3*rH,hW, rH-pad, "MUTE",  display.color565(100,80,0));
       irDrawBtn(pad+hW+pad,areaY+3*rH,hW, rH-pad, "INPUT", display.color565(60,120,60));
     } else {
@@ -5888,11 +5990,11 @@ static void renderIRRemote() {
     irDrawBtn(pad,       areaY+2*rH, hW, rH-pad, "VOL -", display.color565(20,100,200));
     irDrawBtn(pad+hW+pad,areaY+2*rH, hW, rH-pad, "CH -",  display.color565(0,110,60));
     irDrawBtn(pad,       areaY+3*rH, hW, rH-pad, "MUTE",  display.color565(100,80,0));
-    irDrawBtn(pad+hW+pad,areaY+3*rH, hW, rH-pad, "INPUT", display.color565(60,120,60), d.input!=0);
+    irDrawBtn(pad+hW+pad,areaY+3*rH, hW, rH-pad, "INPUT", display.color565(60,120,60), irButtonAvailable(e,IR_BTN_INPUT));
     // ext row: MENU / OK (or BACK)
-    irDrawBtn(pad,       areaY+4*rH, hW, rH-pad, "MENU",  display.color565(80,80,150), d.menu!=0);
-    irDrawBtn(pad+hW+pad,areaY+4*rH, hW, rH-pad, d.ok?"OK":"BACK",
-              display.color565(150,100,0), (d.ok||d.back)!=0);
+    irDrawBtn(pad,       areaY+4*rH, hW, rH-pad, "MENU",  display.color565(80,80,150), irButtonAvailable(e,IR_BTN_MENU));
+    irDrawBtn(pad+hW+pad,areaY+4*rH, hW, rH-pad, irButtonAvailable(e,IR_BTN_OK)?"OK":"BACK",
+              display.color565(150,100,0), irButtonAvailable(e,IR_BTN_OK)||irButtonAvailable(e,IR_BTN_BACK));
 
   } else {
     // ── Layout C: full nav (5 rows, 3 cols + 4-button row) ───
@@ -5908,7 +6010,7 @@ static void renderIRRemote() {
     irDrawBtn(c3, areaY+rH,   cW, rH-pad, "CH +",  display.color565(0,110,60));
     // Row 2: ←LEFT | OK | RIGHT→
     irDrawBtn(c1, areaY+2*rH, cW, rH-pad, "LEFT",  display.color565(120,100,30));
-    irDrawBtn(c2, areaY+2*rH, cW, rH-pad, "OK",    display.color565(200,150,0), d.ok!=0);
+    irDrawBtn(c2, areaY+2*rH, cW, rH-pad, "OK",    display.color565(200,150,0), irButtonAvailable(e,IR_BTN_OK));
     irDrawBtn(c3, areaY+2*rH, cW, rH-pad, "RIGHT", display.color565(120,100,30));
     // Row 3: VOL- | ↓DOWN | CH-
     irDrawBtn(c1, areaY+3*rH, cW, rH-pad, "VOL -", display.color565(20,100,200));
@@ -5916,14 +6018,14 @@ static void renderIRRemote() {
     irDrawBtn(c3, areaY+3*rH, cW, rH-pad, "CH -",  display.color565(0,110,60));
     // Row 4: MUTE | INPUT | MENU | BACK (4 equal mini-buttons)
     int q = (areaW - pad*5) / 4;
-    struct { const char* lbl; uint32_t code; uint16_t col; } r4[4] = {
-      {"MUTE",  d.mute,  display.color565(100,80,0)},
-      {"INPUT", d.input, display.color565(60,120,60)},
-      {"MENU",  d.menu,  display.color565(80,80,150)},
-      {"BACK",  d.back,  display.color565(150,60,60)},
+    struct { const char* lbl; IRButton btn; uint16_t col; } r4[4] = {
+      {"MUTE",  IR_BTN_MUTE,  display.color565(100,80,0)},
+      {"INPUT", IR_BTN_INPUT, display.color565(60,120,60)},
+      {"MENU",  IR_BTN_MENU,  display.color565(80,80,150)},
+      {"BACK",  IR_BTN_BACK,  display.color565(150,60,60)},
     };
     for (int k = 0; k < 4; k++)
-      irDrawBtn(pad + k*(q+pad), areaY+4*rH, q, rH-pad, r4[k].lbl, r4[k].col, r4[k].code!=0);
+      irDrawBtn(pad + k*(q+pad), areaY+4*rH, q, rH-pad, r4[k].lbl, r4[k].col, irButtonAvailable(e,r4[k].btn));
   }
 
   // Hint
@@ -5960,6 +6062,340 @@ float voltageToPercent(float v) {
     }
   }
   return 100.0f;
+}
+
+// ================================================================
+// FUNCTION_RADIO — M5 Speaker 2 HAT (MAX98357A / I2S)
+//
+// The HAT has no I2C address — detection is not possible in software.
+// Enable it via the settings overlay (long-press KEY1 on this screen).
+// Setting is persisted in NVS so it survives reboots.
+// ================================================================
+
+// ── ESP32-audioI2S library callbacks (must be global, not in a class) ──
+
+void audio_showstation(const char* info) {
+  if (!info || !info[0]) return;
+  strncpy(radioStation, info, sizeof(radioStation) - 1);
+  radioStation[sizeof(radioStation) - 1] = '\0';
+  radioNeedsRedraw = true;
+  char buf[64]; snprintf(buf, sizeof(buf), "[RADIO] Station: %s", info);
+  serialWritelnAll(buf);
+}
+
+void audio_showstreamtitle(const char* info) {
+  if (!info || !info[0]) return;
+  strncpy(radioTrack, info, sizeof(radioTrack) - 1);
+  radioTrack[sizeof(radioTrack) - 1] = '\0';
+  radioNeedsRedraw = true;
+  char buf[80]; snprintf(buf, sizeof(buf), "[RADIO] Track: %s", info);
+  serialWritelnAll(buf);
+}
+
+void audio_info(const char* info) {
+  if (!info || !info[0]) return;
+  char buf[128]; snprintf(buf, sizeof(buf), "[RADIO] %s", info);
+  serialWritelnAll(buf);
+}
+
+void audio_bitrate(const char* info) {
+  if (!info || !info[0]) return;
+  char buf[48]; snprintf(buf, sizeof(buf), "[RADIO] Bitrate: %s", info);
+  serialWritelnAll(buf);
+}
+
+void audio_eof_mp3(const char* info) {
+  radioPlaying = false; radioNeedsRedraw = true;
+  serialWritelnAll("[RADIO] Stream ended.");
+  (void)info;
+}
+
+void audio_id3data(const char* info)    { (void)info; }
+void audio_commercial(const char* info) { (void)info; }
+void audio_icyurl(const char* info)     { (void)info; }
+void audio_lasthost(const char* info)   { (void)info; }
+void audio_eof_speech(const char* info) { (void)info; }
+
+// ── Radio helpers ─────────────────────────────────────────────────
+
+void radioConnect() {
+  if (!speakerHatEnabled)    { serialWritelnAll("[RADIO] HAT not enabled."); return; }
+  if (!webRadioEnabled) { serialWritelnAll("[RADIO] Web Radio disabled."); return; }
+  if (!WiFi.isConnected()) { serialWritelnAll("[RADIO] WiFi not connected."); return; }
+
+  radioAudio.stopSong();  // free previous allocations before re-initialising
+  radioPlaying     = false;
+  radioStation[0]  = '\0';
+  radioTrack[0]    = '\0';
+  radioNeedsRedraw = true;
+
+  const char* url = (radioCustomUrl[0] != '\0')
+                    ? radioCustomUrl
+                    : RADIO_STATIONS[radioStationIdx].url;
+
+  char buf[160];
+  snprintf(buf, sizeof(buf), "[RADIO] Connecting → %s  heap=%lu", url, (unsigned long)ESP.getFreeHeap());
+  serialWritelnAll(buf);
+  snprintf(buf, sizeof(buf), "[RADIO] I2S pins  BCLK=%d LRC=%d DOUT=%d  vol=%d",
+           SPK2_BCLK, SPK2_LRC, SPK2_DOUT, radioVolume);
+  serialWritelnAll(buf);
+
+  if (!radioPinoutSet) {
+    bool pinOk = radioAudio.setPinout(SPK2_BCLK, SPK2_LRC, SPK2_DOUT);
+    snprintf(buf, sizeof(buf), "[RADIO] setPinout → %s  heap=%lu", pinOk ? "OK" : "FAILED", (unsigned long)ESP.getFreeHeap());
+    serialWritelnAll(buf);
+    if (pinOk) radioPinoutSet = true;
+  }
+  radioAudio.setVolume(radioVolume);
+  bool ok = radioAudio.connecttohost(url);
+  radioPlaying = ok;
+
+  snprintf(buf, sizeof(buf), "[RADIO] connecttohost → %s", ok ? "OK" : "FAILED");
+  serialWritelnAll(buf);
+  if (!ok) radioNeedsRedraw = true;
+}
+
+void radioStop() {
+  if (radioPlaying) {
+    radioAudio.stopSong();
+    radioPlaying = false;
+  }
+}
+
+// ── Screen functions ──────────────────────────────────────────────
+
+void initRadio() {
+  display.fillScreen(COLOR_BLACK);
+  renderHeader();
+  radioNeedsRedraw = true;
+  if (speakerHatEnabled && webRadioEnabled && WiFi.isConnected() && !radioPlaying)
+    radioConnect();
+}
+
+void renderRadio() {
+  if (navState == NAV_SETTINGS) { renderRadioSettings(); return; }
+  if (!radioNeedsRedraw) return;
+  radioNeedsRedraw = false;
+
+  int sw = statusSprite.width();
+  int sh = statusSprite.height();
+  bool isLand = sw > sh;
+
+  statusSprite.fillSprite(COLOR_BLACK);
+  statusSprite.setFont(&fonts::Font0);
+  statusSprite.setTextDatum(TL_DATUM);
+
+  // ── Title bar ────────────────────────────────────────────────────
+  statusSprite.setTextSize(2);
+  statusSprite.setTextColor(COLOR_TEAL);
+  statusSprite.drawString("RADIO", 8, 8);
+
+  if (!speakerHatEnabled) {
+    // HAT not enabled — guide the user to battery/device settings
+    statusSprite.setTextSize(1);
+    statusSprite.setTextColor(COLOR_GRAY);
+    int y = isLand ? 30 : 38;
+    statusSprite.drawString("Speaker HAT disabled.", 8, y);
+    y += 18;
+    statusSprite.setTextColor(COLOR_ORANGE);
+    statusSprite.drawString("Enable in:", 8, y);
+    y += 14;
+    statusSprite.setTextColor(COLOR_WHITE);
+    statusSprite.drawString("Battery screen", 8, y);
+    y += 14;
+    statusSprite.drawString("> long-press KEY1", 8, y);
+    y += 14;
+    statusSprite.drawString("> SPEAKER HAT = ON", 8, y);
+    y += 18;
+    statusSprite.setTextColor(COLOR_GRAY);
+    statusSprite.drawString("or: radio hat on", 8, y);
+    return;
+  }
+
+  if (!webRadioEnabled) {
+    // HAT is on but Web Radio is off
+    statusSprite.setTextSize(1);
+    statusSprite.setTextColor(COLOR_GRAY);
+    int y = isLand ? 30 : 38;
+    statusSprite.drawString("Web Radio disabled.", 8, y);
+    y += 18;
+    statusSprite.setTextColor(COLOR_ORANGE);
+    statusSprite.drawString("Enable in:", 8, y);
+    y += 14;
+    statusSprite.setTextColor(COLOR_WHITE);
+    statusSprite.drawString("Battery screen", 8, y);
+    y += 14;
+    statusSprite.drawString("> long-press KEY1", 8, y);
+    y += 14;
+    statusSprite.drawString("> WEB RADIO = ON", 8, y);
+    y += 18;
+    statusSprite.setTextColor(COLOR_GRAY);
+    statusSprite.drawString("or: radio web on", 8, y);
+    return;
+  }
+
+  if (!WiFi.isConnected()) {
+    statusSprite.setTextSize(1);
+    statusSprite.setTextColor(COLOR_RED);
+    int y = isLand ? 34 : 40;
+    statusSprite.drawString("WiFi not connected.", 8, y);
+    y += 14;
+    statusSprite.setTextColor(COLOR_GRAY);
+    statusSprite.drawString("Connect to WiFi first.", 8, y);
+    return;
+  }
+
+  // ── Station / URL label ───────────────────────────────────────────
+  int y = isLand ? 30 : 36;
+  statusSprite.setTextSize(1);
+  statusSprite.setTextColor(COLOR_WHITE);
+
+  char stnLine[52];
+  if (radioCustomUrl[0] != '\0') {
+    snprintf(stnLine, sizeof(stnLine), "[custom] %.18s", radioCustomUrl);
+  } else {
+    snprintf(stnLine, sizeof(stnLine), "[%d/%d] %s",
+      radioStationIdx + 1, RADIO_STATION_COUNT,
+      RADIO_STATIONS[radioStationIdx].name);
+  }
+  statusSprite.drawString(stnLine, 8, y);
+  y += 14;
+
+  // Divider
+  statusSprite.drawFastHLine(8, y, sw - 16, COLOR_GRAY);
+  y += 6;
+
+  // ── Metadata from stream ──────────────────────────────────────────
+  if (radioPlaying) {
+    statusSprite.fillCircle(sw - 8, 10, 4, COLOR_GREEN);
+    if (radioStation[0]) {
+      statusSprite.setTextColor(COLOR_TEAL);
+      statusSprite.setTextSize(1);
+      char s1[21], s2[21];
+      int slen = strlen(radioStation);
+      if (slen <= 20) {
+        statusSprite.drawString(radioStation, 8, y);
+        y += 14;
+      } else {
+        strncpy(s1, radioStation,        20); s1[20] = '\0';
+        strncpy(s2, radioStation + 20,   20); s2[20] = '\0';
+        statusSprite.drawString(s1, 8, y); y += 13;
+        statusSprite.drawString(s2, 8, y); y += 14;
+      }
+    } else {
+      statusSprite.setTextColor(COLOR_ORANGE);
+      statusSprite.setTextSize(1);
+      statusSprite.drawString("Connecting...", 8, y);
+      y += 14;
+    }
+    if (radioTrack[0]) {
+      statusSprite.setTextColor(COLOR_WHITE);
+      statusSprite.setTextSize(1);
+      char t1[21], t2[21], t3[21];
+      int tlen = strlen(radioTrack);
+      if (tlen <= 20) {
+        statusSprite.drawString(radioTrack, 8, y);
+        y += 14;
+      } else if (tlen <= 40) {
+        strncpy(t1, radioTrack,      20); t1[20] = '\0';
+        strncpy(t2, radioTrack + 20, 20); t2[20] = '\0';
+        statusSprite.drawString(t1, 8, y); y += 13;
+        statusSprite.drawString(t2, 8, y); y += 14;
+      } else {
+        strncpy(t1, radioTrack,      20); t1[20] = '\0';
+        strncpy(t2, radioTrack + 20, 20); t2[20] = '\0';
+        strncpy(t3, radioTrack + 40, 20); t3[20] = '\0';
+        statusSprite.drawString(t1, 8, y); y += 13;
+        statusSprite.drawString(t2, 8, y); y += 13;
+        statusSprite.drawString(t3, 8, y); y += 14;
+      }
+    }
+  }
+
+  // ── Volume bar ────────────────────────────────────────────────────
+  int barY  = sh - (isLand ? 44 : 48);
+  int barW  = sw - 60;
+  int fillW = (int)((float)barW * radioVolume / 21.0f);
+  statusSprite.setTextColor(COLOR_GRAY);
+  statusSprite.setTextSize(1);
+  statusSprite.drawString("VOL", 8, barY - 1);
+  statusSprite.drawRect(36, barY, barW, 10, COLOR_GRAY);
+  if (fillW > 0)
+    statusSprite.fillRect(37, barY + 1, fillW, 8, COLOR_TEAL);
+  char vStr[5]; snprintf(vStr, sizeof(vStr), "%2d", radioVolume);
+  statusSprite.setTextColor(COLOR_WHITE);
+  statusSprite.drawString(vStr, sw - 22, barY - 1);
+
+  // ── Play / Stop button ────────────────────────────────────────────
+  int btnH = 22;
+  int btnY = sh - btnH - 2;
+  if (radioPlaying) {
+    statusSprite.fillRect(8, btnY, sw - 16, btnH, display.color565(160, 0, 0));
+    statusSprite.setTextDatum(MC_DATUM);
+    statusSprite.setTextColor(COLOR_WHITE);
+    statusSprite.setTextSize(1);
+    statusSprite.drawString("[ STOP ]", sw / 2, btnY + 7);
+  } else {
+    statusSprite.fillRect(8, btnY, sw - 16, btnH, display.color565(0, 120, 0));
+    statusSprite.setTextDatum(MC_DATUM);
+    statusSprite.setTextColor(COLOR_WHITE);
+    statusSprite.setTextSize(1);
+    statusSprite.drawString("[ PLAY ]", sw / 2, btnY + 7);
+  }
+  statusSprite.setTextDatum(TL_DATUM);
+}
+
+// Settings overlay: station and volume only.
+// Speaker HAT enable/disable lives in FUNCTION_BATTERY device settings.
+void renderRadioSettings() {
+  int sw = statusSprite.width();
+  int sh = statusSprite.height();
+
+  statusSprite.fillSprite(COLOR_BLACK);
+  statusSprite.setFont(&fonts::Font0);
+  statusSprite.setTextSize(1);
+
+  // Header
+  statusSprite.setTextColor(COLOR_TEAL);
+  statusSprite.setTextDatum(TL_DATUM);
+  statusSprite.drawString("RADIO SETTINGS", 8, 6);
+  statusSprite.drawFastHLine(8, 18, sw - 16, COLOR_TEAL);
+
+  // Items
+  static const char* labels[] = {"STATION", "VOLUME"};
+  char values[2][28];
+  snprintf(values[0], sizeof(values[0]), "%d: %.16s",
+    radioStationIdx + 1, RADIO_STATIONS[radioStationIdx].name);
+  snprintf(values[1], sizeof(values[1]), "%d", radioVolume);
+
+  for (int i = 0; i < 2; i++) {
+    int y = 24 + i * 18;
+    bool sel = (settingsCursor == i);
+    statusSprite.setTextColor(sel ? COLOR_BLACK : COLOR_GRAY);
+    if (sel) statusSprite.fillRect(4, y - 1, sw - 8, 14, COLOR_TEAL);
+    statusSprite.drawString(labels[i], 8, y);
+    statusSprite.setTextColor(sel ? COLOR_BLACK : COLOR_WHITE);
+    statusSprite.setTextDatum(TR_DATUM);
+    statusSprite.drawString(values[i], sw - 8, y);
+    statusSprite.setTextDatum(TL_DATUM);
+  }
+
+  // Hint: where to enable the HAT
+  statusSprite.setTextColor(display.color565(50, 50, 50));
+  statusSprite.drawString("Enable HAT: Battery > settings", 8, sh - 24);
+  statusSprite.setTextColor(COLOR_GRAY);
+  statusSprite.drawString("KEY1=apply  KEY2=cancel", 8, sh - 12);
+}
+
+void applyRadioSettings() {
+  saveSettings();
+  // Re-connect with new settings if HAT is enabled
+  radioStop();
+  radioStation[0] = '\0';
+  radioTrack[0]   = '\0';
+  if (speakerHatEnabled && webRadioEnabled && WiFi.isConnected())
+    radioConnect();
+  radioNeedsRedraw = true;
 }
 
 void batteryCheck() {
