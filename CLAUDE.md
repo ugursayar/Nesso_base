@@ -35,11 +35,53 @@ Navigation uses KEY1 (forward) and KEY2 (backward) with 500ms debounce. Modes ar
 
 ### Robot Control Protocol
 
-The controller mode reads an **Adafruit seesaw mini gamepad** (I2C address `0x50`) and transmits a `ControlCommand` struct (two `int16_t` values, range −255 to +255) via **UDP to 192.168.1.27:8889**.
+The controller mode auto-detects one of two supported joysticks at boot and transmits a `ControlCommand` struct (two `int16_t` values, range −255 to +255) via **UDP to 192.168.1.27:8889**.
 
-- Horizontal stick → synchronized forward/reverse (both motors same power)
-- Vertical stick → differential steering (motors opposite → rotation)
-- Joystick zero point is calibrated on first read
+| Joystick | I2C address | Detection order | Buttons |
+|---|---|---|---|
+| Adafruit seesaw mini gamepad | `0x50` | First | A/B/X/Y/SEL/STA |
+| M5 Joystick HAT | `0x38` | Fallback | Stick click |
+
+- Physical Y axis (push forward/back) → synchronized forward/reverse (both motors same power)
+- Physical X axis (push left/right) → differential steering (motors opposite → rotation)
+- Zero point is calibrated on first read for both joystick types
+- `activeJoystick` enum (`JOY_NONE`, `JOY_SEESAW`, `JOY_M5`) tracks which was found
+
+#### M5 Joystick HAT protocol (I2C `0x38`)
+
+- Register `0x02` (read 3 bytes): `int8_t x` (−127..127), `int8_t y` (−127..127), `uint8_t btn` (0=pressed, 1=released)
+- No explicit initialisation required; operates in normal mode by default
+- Calibration register `0x03` (write-only): `0x00`=normal, `0x01`=set centre, `0x02`=capture max range, `0x03`=save to flash + restore normal
+
+#### Hardware calibration flow
+
+Calibration is a 3-phase state machine (`M5CalState`) running every 100 ms in the controller loop:
+
+| Phase | Duration | Register write | Display overlay |
+|---|---|---|---|
+| `CAL_CENTER` | 2 s | `0x03 ← 0x01` | "RELEASE STICK — setting center point…" |
+| `CAL_MAX` | 5 s | `0x03 ← 0x02` | "ROTATE FULL CIRCLE" + progress bar |
+| `CAL_SAVING` | 0.5 s | `0x03 ← 0x03` | "SAVING…" |
+
+After saving, `calibrationComplete` is reset so the software zero-point re-calibrates on the next read.
+
+**Triggers:** serial command `joy cal` (from any screen) · hold stick button ≥ 1.5 s (controller screen only)
+#### Pin connection — Hat Joystick ↔ Arduino Nesso N1 (Stick-Bus)
+
+All connections are fixed (cannot be changed).
+
+| Hat-Bus | Nesso N1 Stick-Bus | Notes |
+|---|---|---|
+| I2C_SDA | G6 | Fixed connect |
+| I2C_SCL | G7 | Fixed connect |
+| GND | GND | Fixed connect |
+| — | 3V3 | NG / used by other peripherals |
+| — | BAT | NG / used by other peripherals |
+| — | 5V | NG / used by other peripherals |
+
+`Wire.begin()` uses the board defaults which map to G6/G7 — no custom pin assignment needed.
+
+- References: [M5Stack HAT Joystick docs](https://docs.m5stack.com/en/hat/hat-joystick) · [example sketch](https://github.com/m5stack/M5StickC/blob/master/examples/Hat/Joystick/Joystick.ino) · [M5StickC repo](https://github.com/m5stack/M5StickC)
 
 ### Key Hardware Abstractions
 

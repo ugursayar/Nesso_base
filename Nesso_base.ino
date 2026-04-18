@@ -205,7 +205,7 @@ unsigned long lastOrientationMs = 0;
 bool          imuDebugEnabled   = false;  // stream IMU readings to serial
 
 // ----------------------------------------------------------------
-// Gamepad (Adafruit seesaw mini)
+// Gamepad — Adafruit seesaw mini (0x50) or M5 Joystick HAT (0x38)
 // ----------------------------------------------------------------
 
 Adafruit_seesaw ss = Adafruit_seesaw(&Wire);
@@ -219,16 +219,30 @@ Adafruit_seesaw ss = Adafruit_seesaw(&Wire);
 #define JOY1_X        14
 #define JOY1_Y        15
 
+#define M5JOY_ADDR    0x38
+
 uint32_t button_mask = (1UL << BUTTON_X) | (1UL << BUTTON_Y) | (1UL << BUTTON_START) |
                        (1UL << BUTTON_A) | (1UL << BUTTON_B) | (1UL << BUTTON_SELECT);
 
+enum JoystickType { JOY_NONE, JOY_SEESAW, JOY_M5 };
+JoystickType activeJoystick = JOY_NONE;
+
+enum M5CalState { CAL_IDLE, CAL_CENTER, CAL_MAX, CAL_SAVING };
+M5CalState    m5CalState       = CAL_IDLE;
+unsigned long m5CalStartMs     = 0;
+bool          m5CalCmdSent     = false;
+
 int      zero_x = 0, zero_y = 0;
-bool     joystickAvailable   = false;  // set at boot by probing seesaw I2C address
+bool     joystickAvailable   = false;  // set at boot by probing I2C
 bool     controllerConnected = false;
 bool     calibrationComplete = false;
 int16_t  joyDisplayX = 0;       // -255..255, stored for the joystick visualization
 int16_t  joyDisplayY = 0;
 uint32_t gamepadButtons = 0xFFFFFFFF;  // all bits 1 = all released (active LOW)
+bool     m5JoyButton        = false;   // M5 HAT stick-click state
+int      controllerSubScreen       = 0;    // 0=normal, 1=settings
+bool     pendingControllerSettings = false; // open settings on next screen enter
+int8_t   m5RawX = 0, m5RawY = 0;           // raw reg-0x02 bytes for on-screen diagnostics
 
 struct ControlCommand {
   int leftMotor;   // -255 to 255
@@ -978,9 +992,20 @@ void setup() {
   if (touchReady) splashLog("> Touch: ready", COLOR_GREEN);
   else            splashLog("> Touch: not found", COLOR_GRAY);
 
-  joystickAvailable = ss.begin(0x50);
-  if (joystickAvailable) splashLog("> Joystick: found", COLOR_GREEN);
-  else                   splashLog("> Joystick: not found", COLOR_GRAY);
+  if (ss.begin(0x50)) {
+    activeJoystick    = JOY_SEESAW;
+    joystickAvailable = true;
+    splashLog("> Joystick: seesaw", COLOR_GREEN);
+  } else {
+    Wire.beginTransmission(M5JOY_ADDR);
+    if (Wire.endTransmission() == 0) {
+      activeJoystick    = JOY_M5;
+      joystickAvailable = true;
+      splashLog("> Joystick: M5 HAT", COLOR_GREEN);
+    } else {
+      splashLog("> Joystick: not found", COLOR_GRAY);
+    }
+  }
 
   splashLog("> WiFi: connecting...", COLOR_ORANGE);
   connectToWiFi();
@@ -2099,6 +2124,11 @@ void serialPrintHelp() {
   serialWritelnAll("  battery               voltage, level, charge status, uptime");
   serialWritelnAll("  controller            joystick position and last motor values");
   serialWritelnAll("  send <L> <R>          transmit motor command  (-255..255)");
+  serialWritelnAll("Joystick:");
+  serialWritelnAll("  joy info              type, X/Y, motor values");
+  serialWritelnAll("  joy raw               read raw I2C bytes from M5 HAT (diagnostic)");
+  serialWritelnAll("  joy cal               M5 HAT hardware calibration (3 phases)");
+  serialWritelnAll("  joy settings          open/close settings sub-screen");
   serialWritelnAll("WiFi:");
   serialWritelnAll("  wifi scan             start a network scan");
   serialWritelnAll("  wifi list             print scan results");
@@ -2187,9 +2217,11 @@ void serialPrintBattery() {
 }
 
 void serialPrintController() {
-  char buf[80];
-  snprintf(buf, sizeof(buf), "Joystick X=%d Y=%d  Motors L=%d R=%d  WiFi:%s",
-    (int)joyDisplayX, (int)joyDisplayY,
+  char buf[96];
+  const char* joyType = (activeJoystick == JOY_SEESAW) ? "seesaw" :
+                        (activeJoystick == JOY_M5)     ? "M5HAT"  : "none";
+  snprintf(buf, sizeof(buf), "Joystick(%s) X=%d Y=%d  Motors L=%d R=%d  WiFi:%s",
+    joyType, (int)joyDisplayX, (int)joyDisplayY,
     transmitCmd.leftMotor, transmitCmd.rightMotor,
     WiFi.isConnected() ? "ok" : "off");
   serialWritelnAll(buf);
@@ -2543,6 +2575,64 @@ void serialHandleCommand(const char* raw) {
     char buf[40]; snprintf(buf,sizeof(buf),"Sent: L=%d R=%d",L,R);
     serialWritelnAll(buf);
   }
+  else if (cmdIs(raw,"joy")) {
+    const char* arg = cmdArg(raw,"joy");
+    if (strcasecmp(arg,"cal")==0 || strcasecmp(arg,"calibrate")==0) {
+      if (activeJoystick != JOY_M5) { serialWritelnAll("M5 HAT not active"); return; }
+      if (m5CalState != CAL_IDLE)   { serialWritelnAll("Calibration already running"); return; }
+      startM5JoyCalibration();
+      serialWritelnAll("Calibration: release stick (2s) -> rotate full circle (5s) -> saving");
+    } else if (strcasecmp(arg,"settings")==0) {
+      if (currentFunction != FUNCTION_CONTROLLER) {
+        pendingControllerSettings = true;
+        currentFunction = FUNCTION_CONTROLLER;
+        serialWritelnAll("Navigating to controller + opening settings...");
+      } else {
+        controllerSubScreen = (controllerSubScreen == 0) ? 1 : 0;
+        serialWritelnAll(controllerSubScreen ? "Settings open" : "Settings closed");
+      }
+    } else if (strcasecmp(arg,"scan")==0) {
+      serialWritelnAll("I2C scan...");
+      int found = 0;
+      for (uint8_t addr = 1; addr < 127; addr++) {
+        Wire.beginTransmission(addr);
+        if (Wire.endTransmission() == 0) {
+          char buf[32];
+          snprintf(buf, sizeof(buf), "  0x%02X (%3d)", addr, addr);
+          serialWritelnAll(buf);
+          found++;
+        }
+      }
+      char buf2[32]; snprintf(buf2, sizeof(buf2), "%d device(s) found", found);
+      serialWritelnAll(buf2);
+    } else if (strcasecmp(arg,"raw")==0) {
+      if (activeJoystick != JOY_M5) { serialWritelnAll("M5 HAT not active"); return; }
+      Wire.beginTransmission(M5JOY_ADDR);
+      Wire.write(0x02);
+      Wire.endTransmission();
+      uint8_t n = Wire.requestFrom((uint8_t)M5JOY_ADDR, (uint8_t)3);
+      char buf[60];
+      if (n >= 3) {
+        int8_t rx = (int8_t)Wire.read();
+        int8_t ry = (int8_t)Wire.read();
+        uint8_t rb = Wire.read();
+        snprintf(buf, sizeof(buf), "M5 raw: X=%d Y=%d BTN=%d (n=%d)", rx, ry, rb, n);
+      } else {
+        snprintf(buf, sizeof(buf), "M5 I2C read failed: n=%d", n);
+      }
+      serialWritelnAll(buf);
+    } else if (strcasecmp(arg,"info")==0 || !*arg) {
+      char buf[80];
+      const char* jt = (activeJoystick == JOY_SEESAW) ? "seesaw" :
+                       (activeJoystick == JOY_M5)     ? "M5HAT"  : "none";
+      snprintf(buf, sizeof(buf), "Joystick: %s | X=%d Y=%d | L=%d R=%d",
+        jt, (int)joyDisplayX, (int)joyDisplayY,
+        transmitCmd.leftMotor, transmitCmd.rightMotor);
+      serialWritelnAll(buf);
+    } else {
+      serialWritelnAll("Usage: joy info | joy cal | joy settings");
+    }
+  }
   else if (cmdIs(raw,"bt"))    serialHandleBT(cmdArg(raw,"bt"));
   else if (cmdIs(raw,"wifi"))  serialHandleWiFi(cmdArg(raw,"wifi"));
   else if (cmdIs(raw,"ir"))    serialHandleIR(cmdArg(raw,"ir"));
@@ -2648,13 +2738,19 @@ void renderFunction() {
       if (lastFunction != (int)FUNCTION_CONTROLLER) {
         initController();
         initGamePad();
+        controllerSubScreen       = pendingControllerSettings ? 1 : 0;
+        pendingControllerSettings = false;
       }
-      renderController();
+
+      if (controllerSubScreen == 1) renderControllerSettings();
+      else                          renderController();
       statusSprite.pushSprite(0, SPRITE_Y);
 
       if (millis() - previousMillis >= 100) {
         previousMillis = millis();
-        readGamePad();
+        if (activeJoystick == JOY_M5) updateM5JoyCalibration();
+        if (controllerSubScreen == 0) readGamePad();
+        else transmitRemoteCommand(0, 0);        // stop motors while in settings
       }
       if (millis() - previousMillisButtons >= 300) {
         previousMillisButtons = millis();
@@ -3257,14 +3353,22 @@ void renderController() {
   }
   statusSprite.fillCircle(dotX, dotY, 6, COLOR_ORANGE);
 
-  // Action label
+  // Action label — 4-way for M5 HAT, dominant-axis for seesaw
   const int dead = 15;
-  const char* actionStr =
-    (joyDisplayX >  dead) ? "FORWARD"    :
-    (joyDisplayX < -dead) ? "REVERSE"    :
-    (joyDisplayY >  dead) ? "ROTATE CW"  :
-    (joyDisplayY < -dead) ? "ROTATE CCW" :
-                            "STOP";
+  const char* actionStr;
+  if (activeJoystick == JOY_M5) {
+    bool fwd = joyDisplayX >  dead, rev = joyDisplayX < -dead;
+    bool cw  = joyDisplayY >  dead, ccw = joyDisplayY < -dead;
+    actionStr = (fwd && cw)  ? "FWD+CW"    : (fwd && ccw) ? "FWD+CCW"   :
+                (rev && cw)  ? "REV+CW"    : (rev && ccw) ? "REV+CCW"   :
+                fwd          ? "FORWARD"   : rev          ? "REVERSE"   :
+                cw           ? "ROTATE CW" : ccw          ? "ROTATE CCW": "STOP";
+  } else {
+    actionStr = (joyDisplayX >  dead) ? "FORWARD"    :
+                (joyDisplayX < -dead) ? "REVERSE"    :
+                (joyDisplayY >  dead) ? "ROTATE CW"  :
+                (joyDisplayY < -dead) ? "ROTATE CCW" : "STOP";
+  }
 
   uint16_t connColor = controllerConnected ? COLOR_GREEN : COLOR_RED;
 
@@ -3294,23 +3398,31 @@ void renderController() {
     sprintf(motorStr, "R %4d", transmitCmd.rightMotor);
     statusSprite.drawString(motorStr, ix, 74);
 
-    // Face buttons: SEL / STA on left side, Y/X/A/B diamond on right
-    bool bSel = !(gamepadButtons & (1UL << BUTTON_SELECT));
-    bool bSta = !(gamepadButtons & (1UL << BUTTON_START));
-    bool bY   = !(gamepadButtons & (1UL << BUTTON_Y));
-    bool bX   = !(gamepadButtons & (1UL << BUTTON_X));
-    bool bA   = !(gamepadButtons & (1UL << BUTTON_A));
-    bool bB   = !(gamepadButtons & (1UL << BUTTON_B));
+    if (activeJoystick == JOY_M5) {
+      char rawStr[20];
+      statusSprite.setTextColor(display.color565(60, 60, 60));
+      sprintf(rawStr, "x%4d y%4d", (int)m5RawX, (int)m5RawY);
+      statusSprite.drawString(rawStr, ix, 88);
+    }
 
-    drawGamepadBtn(ix + 10, sh - 14, "SEL", bSel);
-    drawGamepadBtn(ix + 35, sh - 14, "STA", bSta);
-
-    // Diamond: Y=top, X=left, A=right, B=bottom
-    int dx = sw - 42, dy = sh - 14;
-    drawGamepadBtn(dx,      dy - 22, "Y", bY);
-    drawGamepadBtn(dx - 22, dy,      "X", bX);
-    drawGamepadBtn(dx + 22, dy,      "A", bA);
-    drawGamepadBtn(dx,      dy,      "B", bB);
+    if (activeJoystick == JOY_SEESAW) {
+      // Face buttons: SEL / STA on left side, Y/X/A/B diamond on right
+      bool bSel = !(gamepadButtons & (1UL << BUTTON_SELECT));
+      bool bSta = !(gamepadButtons & (1UL << BUTTON_START));
+      bool bY   = !(gamepadButtons & (1UL << BUTTON_Y));
+      bool bX   = !(gamepadButtons & (1UL << BUTTON_X));
+      bool bA   = !(gamepadButtons & (1UL << BUTTON_A));
+      bool bB   = !(gamepadButtons & (1UL << BUTTON_B));
+      drawGamepadBtn(ix + 10, sh - 14, "SEL", bSel);
+      drawGamepadBtn(ix + 35, sh - 14, "STA", bSta);
+      int dx = sw - 42, dy = sh - 14;
+      drawGamepadBtn(dx,      dy - 22, "Y", bY);
+      drawGamepadBtn(dx - 22, dy,      "X", bX);
+      drawGamepadBtn(dx + 22, dy,      "A", bA);
+      drawGamepadBtn(dx,      dy,      "B", bB);
+    } else if (activeJoystick == JOY_M5) {
+      drawGamepadBtn(ix + 22, sh - 14, "BTN", m5JoyButton);
+    }
 
   } else {
     // Info panel below the joystick circle (portrait)
@@ -3338,107 +3450,298 @@ void renderController() {
     statusSprite.setTextDatum(TR_DATUM);
     sprintf(motorStr, "R %4d", transmitCmd.rightMotor);
     statusSprite.drawString(motorStr, sw - 10, iy + 38);
+    if (activeJoystick == JOY_M5) {
+      char rawStr[20];
+      statusSprite.setTextDatum(TC_DATUM);
+      statusSprite.setTextColor(display.color565(60, 60, 60));
+      sprintf(rawStr, "x%d y%d", (int)m5RawX, (int)m5RawY);
+      statusSprite.drawString(rawStr, sw / 2, iy + 52);
+    }
 
-    // Face buttons: SEL / STA row, then Y/X/A/B diamond
-    bool bSel = !(gamepadButtons & (1UL << BUTTON_SELECT));
-    bool bSta = !(gamepadButtons & (1UL << BUTTON_START));
-    bool bY   = !(gamepadButtons & (1UL << BUTTON_Y));
-    bool bX   = !(gamepadButtons & (1UL << BUTTON_X));
-    bool bA   = !(gamepadButtons & (1UL << BUTTON_A));
-    bool bB   = !(gamepadButtons & (1UL << BUTTON_B));
+    if (activeJoystick == JOY_SEESAW) {
+      // Face buttons: SEL / STA row, then Y/X/A/B diamond
+      bool bSel = !(gamepadButtons & (1UL << BUTTON_SELECT));
+      bool bSta = !(gamepadButtons & (1UL << BUTTON_START));
+      bool bY   = !(gamepadButtons & (1UL << BUTTON_Y));
+      bool bX   = !(gamepadButtons & (1UL << BUTTON_X));
+      bool bA   = !(gamepadButtons & (1UL << BUTTON_A));
+      bool bB   = !(gamepadButtons & (1UL << BUTTON_B));
+      int btnY0 = iy + 60;
+      drawGamepadBtn(sw / 2 - 18, btnY0, "SEL", bSel);
+      drawGamepadBtn(sw / 2 + 18, btnY0, "STA", bSta);
+      int dx = sw / 2, dy = btnY0 + 38;
+      drawGamepadBtn(dx,      dy - 22, "Y", bY);
+      drawGamepadBtn(dx - 22, dy,      "X", bX);
+      drawGamepadBtn(dx + 22, dy,      "A", bA);
+      drawGamepadBtn(dx,      dy,      "B", bB);
+    } else if (activeJoystick == JOY_M5) {
+      drawGamepadBtn(sw / 2, iy + 60, "BTN", m5JoyButton);
+    }
+  }
 
-    int btnY0 = iy + 60;   // SEL/STA row
-    drawGamepadBtn(sw / 2 - 18, btnY0, "SEL", bSel);
-    drawGamepadBtn(sw / 2 + 18, btnY0, "STA", bSta);
+  // ── M5 Joystick calibration overlay ──────────────────────────────
+  if (m5CalState != CAL_IDLE) {
+    unsigned long elapsed = millis() - m5CalStartMs;
 
-    // Diamond: Y=top, X=left, A=right, B=bottom
-    int dx = sw / 2, dy = btnY0 + 38;
-    drawGamepadBtn(dx,      dy - 22, "Y", bY);
-    drawGamepadBtn(dx - 22, dy,      "X", bX);
-    drawGamepadBtn(dx + 22, dy,      "A", bA);
-    drawGamepadBtn(dx,      dy,      "B", bB);
+    statusSprite.fillRoundRect(4, 4, sw - 8, sh - 8, 6, display.color565(8, 8, 36));
+    statusSprite.drawRoundRect(4, 4, sw - 8, sh - 8, 6, COLOR_TEAL);
+
+    statusSprite.setTextDatum(TC_DATUM);
+    statusSprite.setTextSize(1);
+    statusSprite.setTextColor(COLOR_TEAL);
+    statusSprite.drawString("JOY CALIBRATION", sw / 2, 12);
+    statusSprite.drawFastHLine(12, 25, sw - 24, display.color565(0, 60, 60));
+
+    statusSprite.setTextSize(2);
+    statusSprite.setTextColor(COLOR_WHITE);
+    int cy = sh / 2 - 14;
+
+    if (m5CalState == CAL_CENTER) {
+      statusSprite.drawString("RELEASE", sw / 2, cy);
+      statusSprite.drawString("STICK", sw / 2, cy + 20);
+      statusSprite.setTextSize(1);
+      statusSprite.setTextColor(COLOR_GRAY);
+      statusSprite.drawString("setting center point...", sw / 2, cy + 44);
+    } else if (m5CalState == CAL_MAX) {
+      statusSprite.drawString("ROTATE FULL", sw / 2, cy);
+      statusSprite.drawString("CIRCLE", sw / 2, cy + 20);
+      // progress bar
+      int barX = 12, barY = sh - 18, barW = sw - 24;
+      statusSprite.drawRect(barX, barY, barW, 8, COLOR_GRAY);
+      int fill = constrain((int)(elapsed * barW / 5000), 0, barW);
+      statusSprite.fillRect(barX, barY, fill, 8, COLOR_TEAL);
+    } else if (m5CalState == CAL_SAVING) {
+      statusSprite.drawString("SAVING...", sw / 2, cy + 10);
+    }
+  }
+}
+
+// ================================================================
+// FUNCTION_CONTROLLER — Settings sub-screen
+// ================================================================
+
+void renderControllerSettings() {
+  int sw = statusSprite.width();
+  int sh = statusSprite.height();
+
+  statusSprite.fillSprite(COLOR_BLACK);
+  statusSprite.setFont(&fonts::Font0);
+  statusSprite.setTextDatum(TC_DATUM);
+
+  // Title
+  statusSprite.setTextSize(1);
+  statusSprite.setTextColor(COLOR_TEAL);
+  statusSprite.drawString("CONTROLLER SETTINGS", sw / 2, 10);
+  statusSprite.drawFastHLine(8, 22, sw - 16, display.color565(0, 60, 60));
+
+  // Joystick type row
+  statusSprite.setTextColor(COLOR_GRAY);
+  const char* joyLabel = (activeJoystick == JOY_SEESAW) ? "Seesaw  0x50" :
+                         (activeJoystick == JOY_M5)     ? "M5 HAT  0x38" : "Not detected";
+  statusSprite.drawString(joyLabel, sw / 2, 30);
+
+  // Calibration status / instructions
+  int mid = sh / 2 - 8;
+  statusSprite.setTextSize(1);
+  if (activeJoystick == JOY_M5) {
+    bool running = (m5CalState != CAL_IDLE);
+    statusSprite.setTextColor(running ? COLOR_ORANGE : COLOR_TEAL);
+    statusSprite.setTextSize(2);
+    statusSprite.drawString(running ? "CALIBRATING..." : "CALIBRATE", sw / 2, mid);
+    statusSprite.setTextSize(1);
+    statusSprite.setTextColor(COLOR_GRAY);
+    if (!running) {
+      statusSprite.drawString("serial: 'joy cal'", sw / 2, mid + 22);
+      char center[28];
+      snprintf(center, sizeof(center), "center: X=%d Y=%d", (int)m5RawX, (int)m5RawY);
+      statusSprite.setTextColor(
+        (m5RawX == 0 && abs(m5RawY) <= 5) ? COLOR_GREEN : COLOR_ORANGE);
+      statusSprite.drawString(center, sw / 2, mid + 36);
+    }
+  } else {
+    statusSprite.setTextColor(display.color565(60, 60, 60));
+    statusSprite.drawString("Calibration: M5 HAT only", sw / 2, mid);
+  }
+
+  // Footer
+  statusSprite.setTextColor(display.color565(50, 50, 50));
+  statusSprite.setTextSize(1);
+  statusSprite.drawString("serial: 'joy settings' to close", sw / 2, sh - 8);
+}
+
+// ----------------------------------------------------------------
+// M5 Joystick HAT hardware calibration
+// Sequence: CAL_CENTER (2s, reg 0x03←0x01) → CAL_MAX (5s, reg 0x03←0x02)
+//           → CAL_SAVING (reg 0x03←0x03, save to flash)
+// Trigger: serial "joy cal"  OR  hold stick button ≥1.5s
+// ----------------------------------------------------------------
+
+static void m5JoyWriteCalReg(uint8_t cmd) {
+  Wire.beginTransmission(M5JOY_ADDR);
+  Wire.write(0x03);
+  Wire.write(cmd);
+  Wire.endTransmission();
+}
+
+void startM5JoyCalibration() {
+  if (activeJoystick != JOY_M5) return;
+  m5CalState   = CAL_CENTER;
+  m5CalStartMs = millis();
+  m5CalCmdSent = false;
+  debugln("M5 joy calibration started");
+}
+
+void updateM5JoyCalibration() {
+  if (m5CalState == CAL_IDLE) return;
+  unsigned long elapsed = millis() - m5CalStartMs;
+
+  switch (m5CalState) {
+    case CAL_CENTER:
+      if (!m5CalCmdSent) { m5JoyWriteCalReg(0x01); m5CalCmdSent = true; }
+      if (elapsed >= 2000) {
+        m5CalState = CAL_MAX; m5CalStartMs = millis(); m5CalCmdSent = false;
+      }
+      break;
+    case CAL_MAX:
+      if (!m5CalCmdSent) { m5JoyWriteCalReg(0x02); m5CalCmdSent = true; }
+      if (elapsed >= 5000) {
+        m5CalState = CAL_SAVING; m5CalStartMs = millis(); m5CalCmdSent = false;
+      }
+      break;
+    case CAL_SAVING:
+      if (!m5CalCmdSent) { m5JoyWriteCalReg(0x03); m5CalCmdSent = true; }
+      if (elapsed >= 500) {
+        m5CalState        = CAL_IDLE;
+        calibrationComplete = false;  // force software re-zero on next readGamePad()
+        debugln("M5 joy calibration saved");
+      }
+      break;
+    default: break;
   }
 }
 
 void initGamePad() {
   controllerConnected = false;
-  if (!joystickAvailable) return;  // not detected at boot, skip init
+  calibrationComplete = false;
+  if (!joystickAvailable) return;
 
-  // seesaw was already probed successfully at boot; re-init to configure pins
-  ss.begin(0x50);
-  debugln("seesaw started");
-  debugln(ss.getI2CAddr());
-
-  uint32_t version = ((ss.getVersion() >> 16) & 0xFFFF);
-  if (version != 5743) {
-    debug("Wrong firmware loaded? ");
-    debugln(version);
-    return;
+  if (activeJoystick == JOY_SEESAW) {
+    ss.begin(0x50);
+    debugln("seesaw started");
+    debugln(ss.getI2CAddr());
+    uint32_t version = ((ss.getVersion() >> 16) & 0xFFFF);
+    if (version != 5743) {
+      debug("Wrong firmware loaded? ");
+      debugln(version);
+      return;
+    }
+    debugln("Found Product 5743");
+    ss.pinModeBulk(button_mask, INPUT_PULLUP);
+    ss.setGPIOInterrupts(button_mask, 1);
   }
-  debugln("Found Product 5743");
-  ss.pinModeBulk(button_mask, INPUT_PULLUP);
-  ss.setGPIOInterrupts(button_mask, 1);
+  // M5 Joystick HAT operates in normal mode by default; no init sequence needed.
   controllerConnected = true;
 }
 
 void readGamePad() {
-  float x = 0, y = 0;
-  for (int s = 0; s < 4; s++) {
-    x += 1023 - ss.analogRead(JOY1_X);
-    y += 1023 - ss.analogRead(JOY1_Y);
-    delay(10);
+  if (activeJoystick == JOY_SEESAW) {
+    float x = 0, y = 0;
+    for (int s = 0; s < 4; s++) {
+      x += 1023 - ss.analogRead(JOY1_X);
+      y += 1023 - ss.analogRead(JOY1_Y);
+      delay(10);
+    }
+    x /= 4.0;
+    y /= 4.0;
+    debug("x: "); debug(x); debug(", "); debug("y: "); debugln(y);
+    if (!calibrationComplete) {
+      zero_x = x; zero_y = y;
+      calibrationComplete = true;
+      debugln("Calibration complete!");
+    }
+    int16_t powerx = x - zero_x;
+    int16_t powery = y - zero_y;
+    joyDisplayX = powerx;
+    joyDisplayY = powery;
+    if (powerx < 0) {
+      transmitRemoteCommand(map(powerx, 0, -515, 0, -255), map(powerx, 0, -515, 0, -255));
+    } else if (powerx > 0) {
+      transmitRemoteCommand(map(powerx, 0, 515, 0, 255), map(powerx, 0, 515, 0, 255));
+    } else if (powery < 0) {
+      int16_t p = map(powery, 0, -515, 0, -255);
+      transmitRemoteCommand(p, -p);
+    } else if (powery > 0) {
+      int16_t p = map(powery, 0, 515, 0, 255);
+      transmitRemoteCommand(p, -p);
+    } else {
+      transmitRemoteCommand(0, 0);
+    }
+    return;
   }
-  x /= 4.0;
-  y /= 4.0;
 
-  debug("x: "); debug(x); debug(", "); debug("y: "); debugln(y);
+  if (activeJoystick == JOY_M5) {
+    Wire.beginTransmission(M5JOY_ADDR);
+    Wire.write(0x02);
+    Wire.endTransmission();
+    uint8_t nRead = Wire.requestFrom((uint8_t)M5JOY_ADDR, (uint8_t)3);
+    if (nRead < 3) { debug("M5 joy I2C fail: "); debugln((int)nRead); return; }
+    int8_t mx = (int8_t)Wire.read();
+    int8_t my = (int8_t)Wire.read();
+    Wire.read();  // button byte — handled in readGamePadButtons()
+    m5RawX = mx; m5RawY = my;  // store for diagnostics
 
-  if (!calibrationComplete) {
-    zero_x              = x;
-    zero_y              = y;
-    calibrationComplete = true;
-    debugln("Calibration complete!");
-  }
+    if (!calibrationComplete) {
+      zero_x = mx; zero_y = my;
+      calibrationComplete = true;
+      debugln("M5 joy software zero set");
+    }
 
-  int16_t powerx = x - zero_x;
-  int16_t powery = y - zero_y;
+    // Physical X = left/right rotation, Physical Y = forward/backward.
+    // Scale -127..127  →  -255..255 to match seesaw range.
+    int16_t powerx = constrain((int16_t)(my - (int8_t)zero_y) * 2, -255, 255);
+    int16_t powery = constrain((int16_t)(mx - (int8_t)zero_x) * 2, -255, 255);
 
-  // Store raw axis values for the joystick visualisation
-  joyDisplayX = powerx;
-  joyDisplayY = powery;
+    joyDisplayX = powerx;
+    joyDisplayY = powery;
 
-  if (powerx < 0) {
-    int16_t p = map(powerx, 0, -515, 0, -255);
-    transmitRemoteCommand(p, p);
-  } else if (powerx > 0) {
-    int16_t p = map(powerx, 0, 515, 0, 255);
-    transmitRemoteCommand(p, p);
-  } else if (powery < 0) {
-    int16_t p = map(powery, 0, -515, 0, -255);
-    transmitRemoteCommand(p, -p);
-  } else if (powery > 0) {
-    int16_t p = map(powery, 0, 515, 0, 255);
-    transmitRemoteCommand(p, -p);
-  } else {
-    transmitRemoteCommand(0, 0);
+    // Tank drive — both axes active simultaneously; apply per-axis deadzone
+    const int16_t DZ = 5;
+    if (abs(powerx) < DZ) powerx = 0;
+    if (abs(powery) < DZ) powery = 0;
+    int16_t L = constrain(powerx + powery, -255, 255);
+    int16_t R = constrain(powerx - powery, -255, 255);
+    transmitRemoteCommand(L, R);
   }
 }
 
 void readGamePadButtons() {
-  uint32_t buttons = ss.digitalReadBulk(button_mask);
-  gamepadButtons = buttons;  // snapshot for renderController()
+  if (activeJoystick == JOY_SEESAW) {
+    uint32_t buttons = ss.digitalReadBulk(button_mask);
+    gamepadButtons = buttons;
+    if (!(buttons & (1UL << BUTTON_A))) debugln("Button A pressed");
+    if (!(buttons & (1UL << BUTTON_B))) debugln("Button B pressed");
+    if (!(buttons & (1UL << BUTTON_Y))) debugln("Button Y pressed");
+    if (!(buttons & (1UL << BUTTON_X))) debugln("Button X pressed");
+    if (!(buttons & (1UL << BUTTON_SELECT))) {
+      debugln("Button SELECT pressed");
+      if (WiFi.status() != WL_CONNECTED) connectToWiFi();
+    }
+    if (!(buttons & (1UL << BUTTON_START))) {
+      debugln("Button START pressed");
+      if (WiFi.status() != WL_CONNECTED) connectToWiFi();
+    }
+  } else if (activeJoystick == JOY_M5) {
+    Wire.beginTransmission(M5JOY_ADDR);
+    Wire.write(0x02);
+    Wire.endTransmission();
+    if (Wire.requestFrom((uint8_t)M5JOY_ADDR, (uint8_t)3) >= 3) {
+      Wire.read(); Wire.read();  // X, Y
+      bool pressed = (Wire.read() == 0);  // 0 = pressed, 1 = released
 
-  if (!(buttons & (1UL << BUTTON_A))) debugln("Button A pressed");
-  if (!(buttons & (1UL << BUTTON_B))) debugln("Button B pressed");
-  if (!(buttons & (1UL << BUTTON_Y))) debugln("Button Y pressed");
-  if (!(buttons & (1UL << BUTTON_X))) debugln("Button X pressed");
-  if (!(buttons & (1UL << BUTTON_SELECT))) {
-    debugln("Button SELECT pressed");
-    if (WiFi.status() != WL_CONNECTED) connectToWiFi();
-  }
-  if (!(buttons & (1UL << BUTTON_START))) {
-    debugln("Button START pressed");
-    if (WiFi.status() != WL_CONNECTED) connectToWiFi();
+      // BTN state for display only. The stick-click pin on this HAT reads 0 (pressed)
+      // permanently — interaction is handled via serial commands instead.
+      m5JoyButton = pressed;
+    }
   }
 }
 
