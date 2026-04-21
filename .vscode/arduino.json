@@ -1,0 +1,7 @@
+{
+    "configuration": "JTAGAdapter=default,CDCOnBoot=default,PartitionScheme=app3M_fat9M_16MB,CPUFreq=160,FlashMode=qio,UploadSpeed=921600,DebugLevel=none,EraseFlash=none,ZigbeeMode=default",
+    "board": "esp32:esp32:arduino_nesso_n1",
+    "port": "COM36",
+    "sketch": "Nesso_base.ino",
+    "output": "./build"
+}

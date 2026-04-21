@@ -6,6 +6,7 @@ arduino_secrets.h
 
 # Arduino IDE build artifacts
 build/
+build_temp/
 *.elf
 *.hex
 *.bin
