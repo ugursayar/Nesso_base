@@ -1,0 +1,9 @@
+{
+  "wifi_ssid": "",
+  "wifi_pass": "REDACTED",
+  "ntp_server": "pool.ntp.org",
+  "gmt_offset": 10800,
+  "dst_offset": 0,
+  "udp_port": 8889,
+  "robot_ip": "192.168.1.27"
+}

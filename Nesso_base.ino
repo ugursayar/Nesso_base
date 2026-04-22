@@ -25,8 +25,46 @@
 #include <BLEAdvertising.h>
 #include <Preferences.h>
 #include "esp_sleep.h"
-#include <IRremoteESP8266.h>
-#include <IRsend.h>
+#define DISABLE_CODE_FOR_RECEIVER
+#include <IRremote.hpp>
+#include <LittleFS.h>
+#include <WebServer.h>
+
+// IR type definitions placed before #include <ArduinoJson.h> so the
+// Arduino preprocessor sees them before inserting auto-generated prototypes.
+#define IR_MAX_FILES   32
+#define IR_MAX_BUTTONS 48
+#define IR_MAX_RAW_LEN 128
+
+enum IRFileProto : uint8_t {
+  IRP_NEC, IRP_SAMSUNG, IRP_SIRC12, IRP_SIRC15, IRP_SIRC20,
+  IRP_RC5, IRP_RC6, IRP_LG, IRP_JVC, IRP_RAW, IRP_UNKNOWN
+};
+
+struct IRButton {
+  char        label[20];
+  IRFileProto proto;
+  uint8_t     _pad;
+  uint16_t    rawFreq;
+  uint16_t    rawLen;
+  uint32_t    address;
+  uint32_t    command;
+  uint16_t    rawData[IR_MAX_RAW_LEN];
+};
+
+struct IRFileEntry {
+  char name[40];
+  char path[64];
+};
+
+#define IR_DIR_MAX 48
+struct IRDirEntry {
+  char name[40];
+  char path[64];
+  bool isDir;
+};
+
+#include <ArduinoJson.h>
 
 // ----------------------------------------------------------------
 // Display
@@ -125,11 +163,11 @@ const char* password = secretPass;
 
 bool wifiAuthFailed = false;  // set when wrong-password disconnect is detected
 
-const char* ntpServer          = "pool.ntp.org";
-const long  gmtOffset_sec      = 3600 * 3;
-const int   daylightOffset_sec = 0;
-const int   udpPort            = 8889;
-const char* targetIpAddress    = "192.168.1.27";
+char ntpServer[64]        = "pool.ntp.org";
+long gmtOffset_sec        = 3600 * 3;
+int  daylightOffset_sec   = 0;
+int  udpPort              = 8889;
+char targetIpAddress[16]  = "192.168.1.27";
 
 NetworkUDP udp;
 struct tm  timeinfo;
@@ -491,223 +529,34 @@ int  lastMediaSubScreen = -1;
 
 #define IR_SEND_PIN IR_TX_PIN   // GPIO 9 — built-in IR blaster on Nesso N1
 
-enum IRDBProto : uint8_t {
-  IRDB_SAMSUNG, IRDB_NEC, IRDB_SONY, IRDB_RC5, IRDB_LG, IRDB_JVC, IRDB_SHARP, IRDB_RC6
-};
+// ── Flat scan — used by serial commands (ir list / ir send) ──────
+static IRFileEntry irFiles[IR_MAX_FILES];
+static int         irFileCount   = 0;
+static int         irSelectedIdx = -1;  // index in irFiles[] of loaded device
 
-struct IRDev {
-  const char*  brand;
-  const char*  type;   // device category: "TV", "Soundbar", "AV Rcvr", "Projector"
-  const char*  name;   // specific variant/model family
-  IRDBProto    proto;
-  uint8_t      nbits;
-  uint16_t     addr;   // Sharp: IR address; others: 0
-  uint32_t     power, volUp, volDown, mute, chUp, chDown;
-  // Extended navigation (0 = button not available for this device)
-  uint32_t     input;   // source/input switching
-  uint32_t     menu;    // menu / home / guide
-  uint32_t     ok;      // OK / enter / select
-  uint32_t     navUp, navDown, navLeft, navRight;
-  uint32_t     back;    // back / return / exit
-};
+// ── Directory browser ─────────────────────────────────────────────
+static IRDirEntry  irDir[IR_DIR_MAX];
+static int         irDirCount    = 0;
+static char        irBrowsePath[64];
 
-// Code encoding notes:
-//   NEC1/NEC2 32-bit: bitrev8(device)<<24 | bitrev8(subdev)<<16 | bitrev8(cmd)<<8 | bitrev8(~cmd)
-//   Sony SIRC:  (device<<7)|command  (stored as n-bit value, sendSony handles bit order)
-//   RC5 12-bit: (device<<6)|command
-//   Sharp:      addr + command passed separately to sendSharp(addr, cmd, nbits)
-static const IRDev IRDB[] = {
-  // ═══ TVs — (power,volUp,volDown,mute,chUp,chDown, input,menu,ok,navUp,navDown,navLeft,navRight,back)
-  // ── ADLER (NEC1 d=2) ──────────────────────────────────────────────
-  {"ADLER",    "TV","2/-1",        IRDB_NEC,   32,0, 0x40BF50AF,0x40BF8A75,0x40BF58A7,0x40BFE01F,0,0,
-   0,0,0,0,0,0,0,0},
-  // ── Arcelik (NEC, Turkish brand) ─────────────────────────────────
-  {"Arcelik",  "TV","standard",    IRDB_NEC,   32,0, 0x9B6748B7,0x9B6740BF,0x9B67C03F,0x9B670CF3,0x9B6700FF,0x9B67807F,
-   0,0,0,0,0,0,0,0},
-  // ── Beko (NEC, same family as Arcelik) ───────────────────────────
-  {"Beko",     "TV","standard",    IRDB_NEC,   32,0, 0x9B6748B7,0x9B6740BF,0x9B67C03F,0x9B670CF3,0x9B6700FF,0x9B67807F,
-   0,0,0,0,0,0,0,0},
-  // ── Coby (NEC d=0,s=127) ──────────────────────────────────────────
-  {"Coby",     "TV","0/127",       IRDB_NEC,   32,0, 0x00FE50AF,0x00FE7887,0x00FEFA05,0x00FE32CD,0x00FEF807,0x00FE3AC5,
-   0,0,0,0,0,0,0,0},
-  // ── Emerson (NEC1 d=0) ────────────────────────────────────────────
-  {"Emerson",  "TV","standard",    IRDB_NEC,   32,0, 0x00FFF807,0x00FFC837,0x00FFF00F,0x00FFE817,0x00FFD02F,0x00FFE01F,
-   0,0,0,0,0,0,0,0},
-  // ── Fast (RC5 d=28) ───────────────────────────────────────────────
-  {"Fast",     "TV","28/-1",       IRDB_RC5,   12,0, 0x070C,0x0742,0x0741,0x070D,0,0x075F,
-   0,0,0,0,0,0,0,0},
-  // ── Fisher (NEC1 d=56, same as Sanyo) ────────────────────────────
-  {"Fisher",   "TV","56/-1",       IRDB_NEC,   32,0, 0x1CE348B7,0x1CE3708F,0x1CE3F00F,0x1CE318E7,0x1CE350AF,0x1CE3D02F,
-   0,0,0,0,0,0,0,0},
-  // ── Grundig (RC5 d=0, same system as Philips) ────────────────────
-  {"Grundig",  "TV","RC5",         IRDB_RC5,   12,0, 0x000C,0x0010,0x0011,0x000D,0x0020,0x0021,
-   0x0038,0x002E,0,0x001C,0x001D,0x002C,0x002B,0x000F},
-  // ── Haier ─────────────────────────────────────────────────────────
-  {"Haier",    "TV","standard",    IRDB_NEC,   32,0, 0x60DF0CF3,0x60DF40BF,0x60DFC03F,0x60DF48B7,0x60DF00FF,0x60DF807F,
-   0,0,0,0,0,0,0,0},
-  // ── Hisense ───────────────────────────────────────────────────────
-  {"Hisense",  "TV","standard",    IRDB_NEC,   32,0, 0x00FF38C7,0x00FF40BF,0x00FFC03F,0x00FF906F,0x00FF00FF,0x00FF807F,
-   0,0,0,0,0,0,0,0},
-  // ── Hitachi (NEC1 d=80) ───────────────────────────────────────────
-  {"Hitachi",  "TV","standard",    IRDB_NEC,   32,0, 0x0AF5E817,0x0AF548B7,0x0AF5A857,0x0AF5D02F,0x0AF59867,0x0AF518E7,
-   0,0,0,0,0,0,0,0},
-  // ── Insignia (NEC d=134,s=5) ──────────────────────────────────────
-  {"Insignia", "TV","134/5",       IRDB_NEC,   32,0, 0x61A0F00F,0,0x61A0B04F,0x61A0708F,0x61A050AF,0x61A0D02F,
-   0,0,0,0,0,0,0,0},
-  // ── JVC (JVC 16-bit protocol) ─────────────────────────────────────
-  {"JVC",      "TV","standard",    IRDB_JVC,   16,0, 0xC5E8,0xC508,0xC588,0xC518,0xC538,0xC5B8,
-   0,0,0,0,0,0,0,0},
-  // ── LG ────────────────────────────────────────────────────────────
-  {"LG",       "TV","OLED/NanoCell",IRDB_NEC,  32,0, 0x20DF10EF,0x20DF40BF,0x20DFC03F,0x20DF906F,0x20DF00FF,0x20DF807F,
-   0x20DF19E6,0x20DFC23D,0x20DF22DD,0x20DF02FD,0x20DF827D,0x20DFE01F,0x20DF609F,0x20DFDA25},
-  // ── Loewe (RC5 d=0) ───────────────────────────────────────────────
-  {"Loewe",    "TV","RC5",         IRDB_RC5,   12,0, 0x000C,0x0010,0x0011,0x000D,0x0020,0x0021,
-   0,0,0,0,0,0,0,0},
-  // ── LXI (NEC1 d=4, Sears house brand) ────────────────────────────
-  {"LXI",      "TV","4/-1",        IRDB_NEC,   32,0, 0x20DF10EF,0x20DF40BF,0x20DFC03F,0x20DF906F,0x20DF00FF,0x20DF807F,
-   0,0,0,0,0,0,0,0},
-  // ── Magnavox (RC5 d=0) ────────────────────────────────────────────
-  {"Magnavox", "TV","RC5",         IRDB_RC5,   12,0, 0x000C,0x0010,0x0011,0x000D,0x0020,0x0021,
-   0,0,0,0,0,0,0,0},
-  // ── Memorex (NEC1 d=4) ────────────────────────────────────────────
-  {"Memorex",  "TV","4/-1",        IRDB_NEC,   32,0, 0x20DF10EF,0x20DF40BF,0x20DFC03F,0x20DF906F,0x20DF00FF,0x20DF807F,
-   0,0,0,0,0,0,0,0},
-  // ── Mitsubishi (Sharp proto d=1) ──────────────────────────────────
-  {"Mitsubishi","TV","Sharp IR",   IRDB_SHARP, 15,1, 22,20,21,23,17,18,
-   0,0,0,0,0,0,0,0},
-  // ── Panasonic (NEC Kaseikyo TX series) ───────────────────────────
-  {"Panasonic","TV","TX series",   IRDB_NEC,   32,0, 0x40040100,0x40040200,0x40041200,0x40040900,0x40040800,0x40041800,
-   0,0,0,0,0,0,0,0},
-  // ── Philips (RC5 d=0, nav from Philips/TV/0,-1.csv) ──────────────
-  {"Philips",  "TV","RC5",         IRDB_RC5,   12,0, 0x000C,0x0010,0x0011,0x000D,0x0020,0x0021,
-   0x0038,0x002E,0,0x001C,0x001D,0x002C,0x002B,0x000F},
-  // ── Proton (NEC1 d=4) ─────────────────────────────────────────────
-  {"Proton",   "TV","4/-1",        IRDB_NEC,   32,0, 0x20DF10EF,0x20DF40BF,0x20DFC03F,0x20DF906F,0x20DF00FF,0x20DF807F,
-   0,0,0,0,0,0,0,0},
-  // ── Samsung ───────────────────────────────────────────────────────
-  {"Samsung",  "TV","Smart/QLED",  IRDB_SAMSUNG,32,0, 0xE0E040BF,0xE0E0E01F,0xE0E0D02F,0xE0E0F00F,0xE0E048B7,0xE0E008F7,
-   0xE0E0807F,0xE0E058A7,0xE0E016E9,0xE0E006F9,0xE0E08679,0xE0E0A659,0xE0E046B9,0xE0E01AE5},
-  // ── Sanyo (NEC1 d=56) ─────────────────────────────────────────────
-  {"Sanyo",    "TV","standard",    IRDB_NEC,   32,0, 0x1CE348B7,0x1CE3708F,0x1CE3F00F,0x1CE318E7,0x1CE350AF,0x1CE3D02F,
-   0,0,0,0,0,0,0,0},
-  // ── Sharp (Sharp proto d=1, Aquos series) ────────────────────────
-  {"Sharp",    "TV","Aquos",       IRDB_SHARP, 15,1, 0x45,0x07,0x0B,0x6B,0xC5,0xC1,
-   0,0,0,0,0,0,0,0},
-  // ── Sony SIRC-12 (d=1, nav codes from Sony/TV/1,-1.csv) ──────────
-  {"Sony",     "TV","SIRC-12",     IRDB_SONY,  12,0, 0x95,0x92,0x93,0x94,0x90,0x91,
-   0x00A4,0x00E0,0x008B,0x00F4,0x00F5,0x00B4,0x00B3,0x00E3},
-  // ── Sony Bravia SIRC-15 (same device address, 15-bit frame) ──────
-  {"Sony",     "TV","Bravia/SIRC-15",IRDB_SONY,15,0, 0x95,0x92,0x93,0x94,0x90,0x91,
-   0x00A4,0x00E0,0x008B,0x00F4,0x00F5,0x00B4,0x00B3,0x00E3},
-  // ── TCL ───────────────────────────────────────────────────────────
-  {"TCL",      "TV","P/C series",  IRDB_NEC,   32,0, 0xE31EB14E,0xE31EA15E,0xE31E619E,0xE31EE11E,0xE31EC13E,0xE31E41BE,
-   0,0,0,0,0,0,0,0},
-  // ── Toshiba (NEC1 d=64, input/menu/ok from irdb 64,-1.csv) ───────
-  {"Toshiba",  "TV","standard",    IRDB_NEC,   32,0, 0x02FD48B7,0x02FD58A7,0x02FD7887,0x02FD08F7,0x02FDD827,0x02FDF807,
-   0x02FDF00F,0x02FD01FE,0x02FDE817,0,0,0,0,0x02FD1AE5},
-  // ── Vestel (NEC, Turkish market) ─────────────────────────────────
-  {"Vestel",   "TV","NEC variant", IRDB_NEC,   32,0, 0x56AB0CF3,0x56AB40BF,0x56ABC03F,0x56AB48B7,0x56AB00FF,0x56AB807F,
-   0,0,0,0,0,0,0,0},
-  // ── Vivax (NEC1 d=2) ──────────────────────────────────────────────
-  {"Vivax",    "TV","2/-1",        IRDB_NEC,   32,0, 0x40BF50AF,0x40BF8A75,0x40BF58A7,0x40BFE01F,0,0,
-   0,0,0,0,0,0,0,0},
-  // ═══ AV Receivers
-  // ── Adcom ─────────────────────────────────────────────────────────
-  {"Adcom",    "AV Rcvr","26/-1",       IRDB_NEC,32,0, 0x58A701FE,0x58A7AB54,0x58A78B74,0x58A741BE,0,0x58A7E31C,
-   0,0,0,0,0,0,0,0},
-  // ── Aiwa Receiver (Sony SIRC-12 d=22) ────────────────────────────
-  {"Aiwa",     "AV Rcvr","16/-1",       IRDB_SONY,12,0, 0x0815,0x0812,0x0813,0x0814,0,0,
-   0,0,0,0,0,0,0,0},
-  // ── Arcam (RC5 d=16) ──────────────────────────────────────────────
-  {"Arcam",    "AV Rcvr","16/-1",       IRDB_RC5,12,0, 0x040C,0x0410,0x0411,0x0477,0x0438,0,
-   0,0,0,0,0,0,0,0},
-  // ── BnK Components ────────────────────────────────────────────────
-  {"BnK Comp", "AV Rcvr","27/78",       IRDB_NEC,32,0, 0xD872807F,0xD87224DB,0xD872C43B,0xD872C03F,0xD87218E7,0xD872E817,
-   0,0,0,0,0,0,0,0},
-  // ── Cambridge Audio ───────────────────────────────────────────────
-  {"Cambridge","AV Rcvr","192/192",     IRDB_NEC,32,0, 0x030330CF,0x0303C03F,0x0303F807,0,0,0x0303B04F,
-   0,0,0,0,0,0,0,0},
-  // ── Carver ────────────────────────────────────────────────────────
-  {"Carver",   "AV Rcvr","135/123",     IRDB_NEC,32,0, 0xE1DE02FD,0xE1DE42BD,0xE1DEC23D,0xE1DEDA25,0,0,
-   0,0,0,0,0,0,0,0},
-  // ── Cary Audio Design (RC5 d=19) ─────────────────────────────────
-  {"Cary Audio","AV Rcvr","19/-1",      IRDB_RC5,12,0, 0x04CC,0x04D0,0x04D1,0x04F9,0,0,
-   0,0,0,0,0,0,0,0},
-  // ── Denon ─────────────────────────────────────────────────────────
-  {"Denon",    "AV Rcvr","AVR series",  IRDB_NEC,32,0, 0x4BB640BF,0x4BB658A7,0x4BB6D827,0x4BB6A05F,0x4BB6E21D,0x4BB6629D,
-   0,0,0,0,0,0,0,0},
-  // ── Harman Kardon ─────────────────────────────────────────────────
-  {"Harman Kar","AV Rcvr","128/112",    IRDB_NEC,32,0, 0x010E03FC,0x010EE31C,0x010E13EC,0x010E837C,0x010EBD42,0x010E7D82,
-   0,0,0,0,0,0,0,0},
-  // ── Integra (same as Onkyo TX) ────────────────────────────────────
-  {"Integra",  "AV Rcvr","210/109",     IRDB_NEC,32,0, 0x4BB620DF,0x4BB640BF,0x4BB6C03F,0x4BB633CC,0x4BB600FF,0x4BB6807F,
-   0,0,0,0,0,0,0,0},
-  // ── Kenwood ───────────────────────────────────────────────────────
-  {"Kenwood",  "AV Rcvr","184/-1",      IRDB_NEC,32,0, 0x1DE2B946,0x1DE2D926,0x1DE259A6,0x1DE239C6,0x1DE29966,0x1DE231CE,
-   0,0,0,0,0,0,0,0},
-  // ── Kinergetics Research (RC5) ────────────────────────────────────
-  {"Kinergetic","AV Rcvr","0/-1",       IRDB_RC5,12,0, 0,0x000C,0x000B,0x0003,0x0007,0x0008,
-   0,0,0,0,0,0,0,0},
-  // ── Lexicon ───────────────────────────────────────────────────────
-  {"Lexicon",  "AV Rcvr","130/11",      IRDB_NEC,32,0, 0x41D059A6,0x41D0E817,0x41D06897,0x41D0A857,0,0,
-   0,0,0,0,0,0,0,0},
-  // ── Marantz ───────────────────────────────────────────────────────
-  {"Marantz",  "AV Rcvr","SR/PM series",IRDB_RC5,12,0, 0x040C,0x0410,0x0411,0x040D,0x0420,0x0421,
-   0,0,0,0,0,0,0,0},
-  // ── Myryad (RC5 d=16) ─────────────────────────────────────────────
-  {"Myryad",   "AV Rcvr","16/-1",       IRDB_RC5,12,0, 0x040C,0x0410,0x0411,0x040D,0,0,
-   0,0,0,0,0,0,0,0},
-  // ── NAD ───────────────────────────────────────────────────────────
-  {"NAD",      "AV Rcvr","135/124",     IRDB_NEC,32,0, 0xE13E01FE,0xE13E11EE,0xE13E31CE,0xE13E29D6,0,0,
-   0,0,0,0,0,0,0,0},
-  // ── Nakamichi ─────────────────────────────────────────────────────
-  {"Nakamichi","AV Rcvr","130/93",      IRDB_NEC,32,0, 0x41BA20DF,0x41BAA05F,0x41BA08F7,0x41BA30CF,0x41BA3AC5,0x41BABA45,
-   0,0,0,0,0,0,0,0},
-  // ── Onkyo ─────────────────────────────────────────────────────────
-  {"Onkyo",    "AV Rcvr","TX-NR series",IRDB_NEC,32,0, 0x4BB620DF,0x4BB640BF,0x4BB6C03F,0x4BB6A05F,0x4BB600FF,0x4BB6807F,
-   0,0,0,0,0,0,0,0},
-  // ── Onkyo Integra ─────────────────────────────────────────────────
-  {"Onkyo Intg","AV Rcvr","210/109",    IRDB_NEC,32,0, 0x4BB620DF,0x4BB640BF,0x4BB6C03F,0x4BB6A05F,0x4BB600FF,0x4BB6807F,
-   0,0,0,0,0,0,0,0},
-  // ── Parasound ─────────────────────────────────────────────────────
-  {"Parasound","AV Rcvr","3/240",       IRDB_NEC,32,0, 0xC00F51AE,0xC00F43BC,0xC00FC33C,0xC00F936C,0xC00FD32C,0,
-   0,0,0,0,0,0,0,0},
-  // ── Pioneer ───────────────────────────────────────────────────────
-  {"Pioneer",  "AV Rcvr","VSX series",  IRDB_NEC,32,0, 0xA55AE21D,0xA55A18E7,0xA55A9867,0xA55A48B7,0xA55A58A7,0xA55AD827,
-   0,0,0,0,0,0,0,0},
-  // ── Yamaha ────────────────────────────────────────────────────────
-  {"Yamaha",   "AV Rcvr","RX-V/RX-A",  IRDB_NEC,32,0, 0x1EE1F00F,0x1EE17887,0x1EE1F807,0x1EE139C6,0x1EE1D827,0x1EE138C7,
-   0,0,0,0,0,0,0,0},
-  // ═══ Soundbars
-  // ── Bose ──────────────────────────────────────────────────────────
-  {"Bose",     "Soundbar","Wave/Solo",  IRDB_NEC,32,0, 0x5DD232CD,0x5DD2C03F,0x5DD240BF,0x5DD2807F,0x5DD29867,0x5DD218E7,
-   0,0,0,0,0,0,0,0},
-  // ═══ Projectors
-  // ── Digital Projection ────────────────────────────────────────────
-  {"DigiProj", "Projector","32/-1",     IRDB_NEC,32,0, 0x04FB00FF,0x04FB609F,0x04FB50AF,0x04FB708F,0,0,
-   0,0,0,0,0,0,0,0},
-  // ── Epson ─────────────────────────────────────────────────────────
-  {"Epson",    "Projector","131/85",    IRDB_NEC,32,0, 0xC1AA09F6,0xC1AA19E6,0xC1AA9966,0xC1AAC936,0,0,
-   0,0,0,0,0,0,0,0},
-};
-static const int IRDB_COUNT = sizeof(IRDB) / sizeof(IRDB[0]);
+// ── Currently loaded device ───────────────────────────────────────
+static IRButton    irBtns[IR_MAX_BUTTONS];
+static int         irBtnCount    = 0;
+static char        irLoadedPath[64];  // full path of loaded .ir file
+static char        irLoadedName[40];  // display name (no path, no .ir)
+static char        irSavedPath[64];   // NVS-persisted path
 
-IRsend irsend(IR_SEND_PIN);
+// IrSender is a global provided by IRremote.hpp; initialised in initIR().
 
 // ── IR UI state ───────────────────────────────────────────────────
-enum IRLevel : uint8_t { IR_LEVEL_BRAND=0, IR_LEVEL_TYPE=1, IR_LEVEL_DEVICE=2, IR_LEVEL_REMOTE=3 };
-IRLevel  irLevel       = IR_LEVEL_BRAND; // current navigation level
-char     irSelBrand[32]= "";             // brand chosen at level 0
-char     irSelType[32] = "";             // type chosen at level 1
-int      irBrandOff    = 0;              // scroll offset — brand list
-int      irTypeOff     = 0;             // scroll offset — type list
-int      irDevOff      = 0;             // scroll offset — device list
-uint64_t irSelectedMask= 0;             // bitmask of selected devices (64-bit for up to 64 entries)
-uint8_t  irActiveDev   = 0;             // index into selected set for remote view
-int      irFlashX      = -1;            // sprite-local tap X for button flash feedback
-int      irFlashY      = -1;            // sprite-local tap Y for button flash feedback
-uint32_t irFlashMs     = 0;             // when the button was tapped (ms)
-uint32_t irTxMs        = 0;             // when the last IR signal was transmitted (ms)
+enum IRLevel : uint8_t { IR_LEVEL_LIST = 0, IR_LEVEL_REMOTE = 1 };
+IRLevel  irLevel      = IR_LEVEL_LIST;
+int      irListOff    = 0;   // scroll offset — directory list
+int      irBtnPageOff = 0;   // scroll offset — remote button grid
+int      irFlashX     = -1;
+int      irFlashY     = -1;
+uint32_t irFlashMs    = 0;
+uint32_t irTxMs       = 0;
 
 // ----------------------------------------------------------------
 // Navigation
@@ -726,6 +575,10 @@ enum MainFunctions {
 
 const int  mainFunctionCount = 8;
 int        lastFunction;
+
+// ── Web file manager ─────────────────────────────────────────────
+static bool   webFMRunning      = false;
+static bool   webFMPendingStart = false;
 
 // ── Button press detection ───────────────────────────────────────
 const long LONG_PRESS_MS   = 700;   // ms held → long press
@@ -886,9 +739,7 @@ void loadSettings() {
   btDebugMode      = p.getBool ("btDebug",    false);
   btAdvEnabled     = p.getBool ("btAdv",      true);
   btStartupEnabled = p.getBool ("btStartup",  true);
-  { uint32_t lo = p.getUInt("irSel",  0);
-    uint32_t hi = p.getUInt("irSel1", 0);
-    irSelectedMask = ((uint64_t)hi << 32) | lo; }
+  p.getString("irPath", irSavedPath, sizeof(irSavedPath));
   p.getString("wifiSsid", wifiUserSsid, sizeof(wifiUserSsid));
   p.getString("wifiPass", wifiUserPass, sizeof(wifiUserPass));
   wifiDebugMode    = p.getBool ("wifiDbg",    false);
@@ -912,8 +763,7 @@ void saveSettings() {
   p.putBool ("btDebug",    btDebugMode);
   p.putBool ("btAdv",      btAdvEnabled);
   p.putBool ("btStartup",  btStartupEnabled);
-  p.putUInt  ("irSel",  (uint32_t)(irSelectedMask & 0xFFFFFFFF));
-  p.putUInt  ("irSel1", (uint32_t)(irSelectedMask >> 32));
+  p.putString("irPath",  irSavedPath);
   p.putString("wifiSsid", wifiUserSsid);
   p.putString("wifiPass", wifiUserPass);
   p.putBool ("wifiDbg",    wifiDebugMode);
@@ -931,10 +781,50 @@ void saveSettings() {
 
 
 // ================================================================
+// LittleFS config  (/config.json)
+// ================================================================
+
+// Priority: NVS (runtime user-set) > config.json > compiled-in fallback.
+// Called after LittleFS.begin() and after loadSettings() so NVS values are
+// already in wifiUserSsid/wifiUserPass before we decide whether to apply FS creds.
+void loadConfig() {
+  File f = LittleFS.open("/config.json", "r");
+  if (!f) return;
+
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, f);
+  f.close();
+  if (err) return;
+
+  if (wifiUserSsid[0] == '\0') {
+    strlcpy(wifiUserSsid, doc["wifi_ssid"] | "", sizeof(wifiUserSsid));
+    strlcpy(wifiUserPass, doc["wifi_pass"] | "", sizeof(wifiUserPass));
+  }
+  strlcpy(ntpServer,       doc["ntp_server"] | "pool.ntp.org", sizeof(ntpServer));
+  gmtOffset_sec      = doc["gmt_offset"]  | 10800L;
+  daylightOffset_sec = doc["dst_offset"]  | 0;
+  udpPort            = doc["udp_port"]    | 8889;
+  strlcpy(targetIpAddress, doc["robot_ip"] | "192.168.1.27",  sizeof(targetIpAddress));
+}
+
+// Forward declarations for filesystem manager
+void serialHandleFS(const char* arg);
+
+// Forward declarations for IR remote helpers
+void initIR();
+void renderIR();
+void irScanFiles();
+void irOpenDir(const char* path);
+void irLoadDevice(const char* path);
+void irSendButton(int btnIdx);
+void serialHandleIR(const char* arg);
+
+// ================================================================
 // Setup & Loop
 // ================================================================
 
 void setup() {
+  Serial.setRxBufferSize(8192);
   Serial.begin(115200);
   debugln("N#1 initializing...");
   loadSettings();
@@ -981,6 +871,14 @@ void setup() {
   joystickAvailable = ss.begin(0x50);
   if (joystickAvailable) splashLog("> Joystick: found", COLOR_GREEN);
   else                   splashLog("> Joystick: not found", COLOR_GRAY);
+
+  if (LittleFS.begin(true)) {
+    loadConfig();
+    irScanFiles();
+    splashLog("> FS: ready", COLOR_GREEN);
+  } else {
+    splashLog("> FS: mount failed", COLOR_RED);
+  }
 
   splashLog("> WiFi: connecting...", COLOR_ORANGE);
   connectToWiFi();
@@ -1078,6 +976,8 @@ void loop() {
   btProcessPendingEvents();
   checkPowerManagement(msNow);
   renderFunction();
+  if (webFMPendingStart) { webFMPendingStart = false; webFMStart(); }
+  webFMHandle();
 
   // Deferred BLE init: silently start the stack ~2 s after boot if enabled.
   // This runs once — after the clock has already rendered at least one frame.
@@ -1309,12 +1209,6 @@ void uiClick(uint16_t freq, uint16_t durationMs);
 extern bool vaderNeedsRedraw;
 extern bool obiwanNeedsRedraw;
 
-// Forward declarations for IR remote helpers
-void initIR();
-void renderIR();
-void irSendFunc(int devIdx, uint32_t code);
-void serialHandleIR(const char* arg);
-
 // Forward declarations for WiFi scan helpers
 void initWiFi();
 void renderWiFi();
@@ -1494,189 +1388,64 @@ void onTap(int16_t sx, int16_t sy) {
     int sprite_y = sy - SPRITE_Y;
     int sw = statusSprite.width(), sh = statusSprite.height();
     bool isLand = sw > sh;
-    int rowH    = isLand ? 20 : 22;
 
-    if (irLevel == IR_LEVEL_BRAND) {
-      // ── Level 0: Brand list ─────────────────────────────────────
-      int listTop     = isLand ? 32 : 36;
-      int totalBrands = 0;
-      for (int i = 0; i < IRDB_COUNT; i++) {
-        bool dup = false;
-        for (int j = 0; j < i; j++) if (!strcmp(IRDB[j].brand, IRDB[i].brand)) { dup=true; break; }
-        if (!dup) totalBrands++;
-      }
-      int listArea = sh - listTop - (irSelectedMask ? 22 : 4);
-      int visRows  = max(1, listArea / rowH);
-      // "Use Remote" button tap
-      if (irSelectedMask) {
-        int btnH = 18, btnY = sh - 4 - btnH;
-        if (sprite_y >= btnY && sprite_y < btnY + btnH) {
-          irLevel = IR_LEVEL_REMOTE; irActiveDev = 0; return;
+    if (irLevel == IR_LEVEL_LIST) {
+      // ── Directory browser ───────────────────────────────────────
+      int titleH  = isLand ? 20 : 24;
+      // Tap title = go back to parent directory
+      if (sprite_y < titleH) {
+        if (strcmp(irBrowsePath, "/irdb") != 0) {
+          char parent[64]; strlcpy(parent, irBrowsePath, sizeof(parent));
+          char* last = strrchr(parent, '/');
+          if (last && last != parent) *last = '\0';
+          else strlcpy(parent, "/irdb", sizeof(parent));
+          irOpenDir(parent);
         }
+        return;
       }
-      for (int i = 0; i < visRows; i++) {
-        int n = i + irBrandOff;
-        if (n >= totalBrands) break;
-        int rowY = listTop + i * rowH;
-        if (sprite_y >= rowY && sprite_y < rowY + rowH) {
-          // Find the Nth unique brand
-          int c = 0;
-          for (int k = 0; k < IRDB_COUNT; k++) {
-            bool dup = false;
-            for (int j = 0; j < k; j++) if (!strcmp(IRDB[j].brand, IRDB[k].brand)) { dup=true; break; }
-            if (!dup) { if (c == n) { strncpy(irSelBrand, IRDB[k].brand, 31); break; } c++; }
-          }
-          irLevel = IR_LEVEL_TYPE; irTypeOff = 0; return;
-        }
-      }
-
-    } else if (irLevel == IR_LEVEL_TYPE) {
-      // ── Level 1: Device Type list ───────────────────────────────
-      int titleH = isLand ? 22 : 26;
+      int rowH    = isLand ? 18 : 20;
       int listTop = titleH + 4;
-      // Back (tap title)
-      if (sprite_y < titleH) { irLevel = IR_LEVEL_BRAND; return; }
-      int typeCount = 0;
-      for (int i = 0; i < IRDB_COUNT; i++) {
-        if (strcmp(IRDB[i].brand, irSelBrand)) continue;
-        bool dup = false;
-        for (int j = 0; j < i; j++)
-          if (!strcmp(IRDB[j].brand,irSelBrand) && !strcmp(IRDB[j].type,IRDB[i].type)) { dup=true; break; }
-        if (!dup) typeCount++;
-      }
       int visRows = max(1, (sh - listTop - 4) / rowH);
       for (int i = 0; i < visRows; i++) {
-        int n = i + irTypeOff;
-        if (n >= typeCount) break;
+        int n = i + irListOff;
+        if (n >= irDirCount) break;
         int rowY = listTop + i * rowH;
         if (sprite_y >= rowY && sprite_y < rowY + rowH) {
-          // Find Nth unique type for brand
-          int c = 0;
-          for (int k = 0; k < IRDB_COUNT; k++) {
-            if (strcmp(IRDB[k].brand, irSelBrand)) continue;
-            bool dup = false;
-            for (int j = 0; j < k; j++)
-              if (!strcmp(IRDB[j].brand,irSelBrand) && !strcmp(IRDB[j].type,IRDB[k].type)) { dup=true; break; }
-            if (!dup) { if (c == n) { strncpy(irSelType, IRDB[k].type, 31); break; } c++; }
+          if (irDir[n].isDir) {
+            irOpenDir(irDir[n].path);
+          } else {
+            irLoadDevice(irDir[n].path);
+            irLevel = IR_LEVEL_REMOTE;
+            irBtnPageOff = 0;
+            strlcpy(irSavedPath, irDir[n].path, sizeof(irSavedPath));
+            saveSettings();
           }
-          irLevel = IR_LEVEL_DEVICE; irDevOff = 0; return;
-        }
-      }
-
-    } else if (irLevel == IR_LEVEL_DEVICE) {
-      // ── Level 2: Device list (checkboxes) ──────────────────────
-      int titleH = isLand ? 22 : 26;
-      int listTop = titleH + 4;
-      if (sprite_y < titleH) { irLevel = IR_LEVEL_TYPE; return; }  // tap title = back
-      int devCount = 0;
-      for (int i = 0; i < IRDB_COUNT; i++)
-        if (!strcmp(IRDB[i].brand,irSelBrand) && !strcmp(IRDB[i].type,irSelType)) devCount++;
-      // "Use Remote" button
-      int selCount = 0;
-      for (int i = 0; i < IRDB_COUNT; i++) if (irSelectedMask & (1ULL<<i)) selCount++;
-      int doneH = 20, doneY = sh - 4 - doneH;
-      if (selCount > 0 && sprite_y >= doneY && sprite_y < doneY + doneH) {
-        irLevel = IR_LEVEL_REMOTE; irActiveDev = 0; return;
-      }
-      int listArea = (selCount > 0 ? doneY - 4 : sh - 4) - listTop;
-      int visRows  = max(1, listArea / rowH);
-      for (int i = 0; i < visRows; i++) {
-        int n = i + irDevOff;
-        if (n >= devCount) break;
-        int rowY = listTop + i * rowH;
-        if (sprite_y >= rowY && sprite_y < rowY + rowH) {
-          int c = 0, devIdx = -1;
-          for (int k = 0; k < IRDB_COUNT; k++) {
-            if (!strcmp(IRDB[k].brand,irSelBrand) && !strcmp(IRDB[k].type,irSelType)) {
-              if (c == n) { devIdx = k; break; } c++;
-            }
-          }
-          // TEST button on right edge — fire power without toggling selection
-          if (sx > sw - 30) {
-            if (devIdx >= 0) irSendFunc(devIdx, IRDB[devIdx].power);
-            return;
-          }
-          if (devIdx >= 0) { irSelectedMask ^= (1ULL << devIdx); saveSettings(); }
           return;
         }
       }
 
     } else if (irLevel == IR_LEVEL_REMOTE) {
-      // ── Level 3: Remote buttons ─────────────────────────────────
-      int selIdx = -1, count = 0;
-      for (int i = 0; i < IRDB_COUNT; i++) {
-        if (irSelectedMask & (1ULL << i)) {
-          if (count == (int)irActiveDev) { selIdx = i; break; }
-          count++;
+      // ── Level 1: Remote buttons ─────────────────────────────────
+      int titleH = isLand ? 22 : 26;
+      if (sprite_y < titleH) { irLevel = IR_LEVEL_LIST; return; }
+      int pad   = 3;
+      int areaY = titleH + pad;
+      int cols  = 2;
+      int btnH  = isLand ? 22 : 24;
+      int btnW  = (sw - pad * (cols + 1)) / cols;
+      int visRows = max(1, (sh - areaY - pad) / (btnH + pad));
+      for (int row = irBtnPageOff; row < irBtnPageOff + visRows; row++) {
+        for (int col = 0; col < cols; col++) {
+          int idx = row * cols + col;
+          if (idx >= irBtnCount) break;
+          int bx   = pad + col * (btnW + pad);
+          int rowY = areaY + (row - irBtnPageOff) * (btnH + pad);
+          if (sx >= bx && sx < bx + btnW && sprite_y >= rowY && sprite_y < rowY + btnH) {
+            irFlashX = sx; irFlashY = sprite_y; irFlashMs = millis();
+            irSendButton(idx);
+            return;
+          }
         }
-      }
-      if (selIdx < 0) return;
-      const IRDev& d = IRDB[selIdx];
-      int titleH = isLand ? 22 : 28;
-      int tapY   = sprite_y - titleH;
-      if (tapY < 0) { irLevel = IR_LEVEL_DEVICE; return; }
-      int pad    = 3;
-      int areaH  = sh - titleH - 2*pad;
-      bool hasNav = (d.navUp != 0);
-      bool hasExt = (d.input || d.menu || d.ok || d.back || hasNav);
-      int  tapInArea = tapY - pad;
-      uint32_t code  = 0;
-
-      if (!hasNav && !hasExt) {
-        // Layout A: 4 rows
-        int rH  = areaH / 4;
-        int row = tapInArea / rH;
-        bool lft = (sx < sw / 2);
-        if      (row == 0) code = d.power;
-        else if (row == 1) code = lft ? d.volUp   : d.chUp;
-        else if (row == 2) code = lft ? d.volDown : d.chDown;
-        else if (row == 3) code = d.input ? (lft ? d.mute : d.input) : d.mute;
-
-      } else if (!hasNav) {
-        // Layout B: 5 rows
-        int rH  = areaH / 5;
-        int row = tapInArea / rH;
-        bool lft = (sx < sw / 2);
-        if      (row == 0) code = d.power;
-        else if (row == 1) code = lft ? d.volUp   : d.chUp;
-        else if (row == 2) code = lft ? d.volDown : d.chDown;
-        else if (row == 3) code = lft ? d.mute    : d.input;
-        else if (row == 4) code = lft ? d.menu    : (d.ok ? d.ok : d.back);
-
-      } else {
-        // Layout C: 5 rows; rows 1-3 = 3 columns; row 4 = 4 mini-buttons
-        int rH  = areaH / 5;
-        int row = tapInArea / rH;
-        int cW  = (sw - pad*4) / 3;
-        int col = (sx < pad + cW) ? 0 : (sx < 2*pad + 2*cW) ? 1 : 2;
-        if      (row == 0) code = d.power;
-        else if (row == 1) {
-          if      (col == 0) code = d.volUp;
-          else if (col == 1) code = d.navUp;
-          else               code = d.chUp;
-        } else if (row == 2) {
-          if      (col == 0) code = d.navLeft;
-          else if (col == 1) code = d.ok;
-          else               code = d.navRight;
-        } else if (row == 3) {
-          if      (col == 0) code = d.volDown;
-          else if (col == 1) code = d.navDown;
-          else               code = d.chDown;
-        } else if (row == 4) {
-          // 4 mini-buttons: MUTE / INPUT / MENU / BACK
-          int q       = (sw - pad*5) / 4;
-          int quarter = max(0, min(3, (sx - pad) / (q + pad)));
-          if      (quarter == 0) code = d.mute;
-          else if (quarter == 1) code = d.input;
-          else if (quarter == 2) code = d.menu;
-          else                   code = d.back;
-        }
-      }
-      if (code) {
-        irFlashX  = sx;
-        irFlashY  = sprite_y;
-        irFlashMs = millis();
-        irSendFunc(selIdx, code);
       }
     }
   } else if (currentFunction == FUNCTION_WIFI && navState == NAV_NORMAL) {
@@ -1788,40 +1557,18 @@ void onSwipe(int16_t dx, int16_t dy) {
       else        wifiScanOffset = max(wifiScanOffset - 1, 0);
       wifiScanOffset = constrain(wifiScanOffset, 0, max(0, wifiScanCount - 1));
     } else if (currentFunction == FUNCTION_IR && navState == NAV_NORMAL) {
-      if (irLevel == IR_LEVEL_BRAND) {
-        int totalBrands = 0;
-        for (int i = 0; i < IRDB_COUNT; i++) {
-          bool dup = false;
-          for (int j = 0; j < i; j++) if (!strcmp(IRDB[j].brand, IRDB[i].brand)) { dup=true; break; }
-          if (!dup) totalBrands++;
-        }
-        if (dy < 0) irBrandOff = min(irBrandOff + 1, totalBrands - 1);
-        else        irBrandOff = max(irBrandOff - 1, 0);
-      } else if (irLevel == IR_LEVEL_TYPE) {
-        int typeCount = 0;
-        for (int i = 0; i < IRDB_COUNT; i++) {
-          if (strcmp(IRDB[i].brand, irSelBrand)) continue;
-          bool dup = false;
-          for (int j = 0; j < i; j++)
-            if (!strcmp(IRDB[j].brand,irSelBrand) && !strcmp(IRDB[j].type,IRDB[i].type)) { dup=true; break; }
-          if (!dup) typeCount++;
-        }
-        if (dy < 0) irTypeOff = min(irTypeOff + 1, typeCount - 1);
-        else        irTypeOff = max(irTypeOff - 1, 0);
-      } else if (irLevel == IR_LEVEL_DEVICE) {
-        int devCount = 0;
-        for (int i = 0; i < IRDB_COUNT; i++)
-          if (!strcmp(IRDB[i].brand,irSelBrand) && !strcmp(IRDB[i].type,irSelType)) devCount++;
-        if (dy < 0) irDevOff = min(irDevOff + 1, devCount - 1);
-        else        irDevOff = max(irDevOff - 1, 0);
+      if (irLevel == IR_LEVEL_LIST) {
+        if (dy < 0) irListOff = min(irListOff + 1, max(0, irDirCount - 1));
+        else        irListOff = max(irListOff - 1, 0);
       } else if (irLevel == IR_LEVEL_REMOTE) {
-        // Cycle through selected devices
-        int selCount = 0;
-        for (int i = 0; i < IRDB_COUNT; i++) if (irSelectedMask & (1ULL << i)) selCount++;
-        if (selCount > 1) {
-          if (dy < 0) irActiveDev = (irActiveDev + 1) % selCount;
-          else        irActiveDev = (irActiveDev + selCount - 1) % selCount;
-        }
+        bool isLandScroll = statusSprite.width() > statusSprite.height();
+        int btnH = isLandScroll ? 22 : 24;
+        int titleH = isLandScroll ? 22 : 26;
+        int areaH = statusSprite.height() - titleH - 6;
+        int visRows = max(1, areaH / (btnH + 3));
+        int totalRows = (irBtnCount + 1) / 2;
+        if (dy < 0) irBtnPageOff = min(irBtnPageOff + 1, max(0, totalRows - visRows));
+        else        irBtnPageOff = max(irBtnPageOff - 1, 0);
       }
     }
   }
@@ -1989,6 +1736,20 @@ static bool               bleUartReady = false;
 static char sSerialBuf[160];  static int sSerialLen = 0;
 static char sBleBuf[160];     static int sBleLen    = 0;
 
+// ── Web file manager upload state ────────────────────────────────
+static File   webFMUploadFile;
+static String webFMUploadPath;
+static bool   webFMUploadOk     = false;
+
+// ── FS upload state (active between "fs upload" cmd and "---END---") ─
+static bool     fsUploadActive  = false;
+static File     fsUploadFile;
+static char     fsUploadPath[64];
+static uint32_t fsUploadBytes   = 0;
+static char     fsLineBuf[12];   // only needs to hold "---END---" (9 chars)
+static int      fsLineBufLen    = 0;
+static bool     fsLineOverflow  = false;
+
 // Receives bytes from the connected BLE UART client (runs on BLE RTOS task)
 class BLERxCB : public BLECharacteristicCallbacks {
 public:
@@ -2013,83 +1774,9 @@ void serialWriteAll(const char* s) {
 }
 void serialWritelnAll(const char* s) { serialWriteAll(s); serialWriteAll("\r\n"); }
 
-// ── Contextual help — current selection shown in UPPERCASE ───────
+// ── Per-section static command lists ─────────────────────────────
 
-void serialPrintFunctionHelp(int fn) {
-  char buf[200];
-  switch (fn) {
-    case FUNCTION_MAIN:
-      serialWritelnAll("[CLOCK] clock | status | next | prev | goto <screen>");
-      break;
-    case FUNCTION_BATTERY:
-      snprintf(buf, sizeof(buf),
-        "[BATTERY] dim:%s  sleep:%s  lowbat:%s | battery | long-press=device settings",
-        DIM_TIMEOUT_LABELS[dimTimeoutIdx],
-        SLEEP_TIMEOUT_LABELS[sleepTimeoutIdx],
-        LOW_BAT_LABELS[lowBatIdx]);
-      serialWritelnAll(buf);
-      break;
-    case FUNCTION_CONTROLLER:
-      snprintf(buf, sizeof(buf),
-        "[CONTROLLER] WiFi:%s | controller | send <L> <R> (-255..255)",
-        WiFi.isConnected() ? "CONNECTED" : "off");
-      serialWritelnAll(buf);
-      break;
-    case FUNCTION_IR: {
-      int selCount = 0;
-      for (int i = 0; i < IRDB_COUNT; i++) if (irSelectedMask & (1ULL << i)) selCount++;
-      const char* lvlName[] = {"brands","types","devices","remote"};
-      snprintf(buf, sizeof(buf),
-        "[IR] selected:%d  level:%s | ir list | ir send <N> <func> | ir select <N> | ir deselect <N>",
-        selCount, lvlName[irLevel]);
-      serialWritelnAll(buf);
-      break;
-    }
-    case FUNCTION_WIFI:
-      snprintf(buf, sizeof(buf),
-        "[WIFI] connected:%s  scanning:%s  debug:%s  auto-scan:%s | wifi scan|list|status|debug on|off",
-        WiFi.isConnected() ? WiFi.localIP().toString().c_str() : "no",
-        wifiScanning  ? "yes" : "no",
-        wifiDebugMode ? "ON"  : "OFF",
-        wifiAutoScan  ? "ON"  : "OFF");
-      serialWritelnAll(buf);
-      break;
-    case FUNCTION_BT:
-      snprintf(buf, sizeof(buf),
-        "[BT] scan:%s  adv:%s  startup:%s  mode:%s  filter:%s",
-        btScanning        ? "ON"     : "off",
-        btAdvEnabled      ? "ON"     : "off",
-        btStartupEnabled  ? "ON"     : "off",
-        btScanModeIdx == 0 ? "ACTIVE" : "passive",
-        BT_RSSI_LABELS[btRssiFilterIdx]);
-      serialWritelnAll(buf);
-      serialWritelnAll("  bt scan on|off | bt adv on|off | bt startup on|off"
-                       " | bt mode active|passive | bt filter -70|-80|-90|off"
-                       " | bt list | bt detail <N>");
-      break;
-    case FUNCTION_LORA:
-      snprintf(buf, sizeof(buf),
-        "[LORA] preset:%s  reply:%s  dedup:%s",
-        LORA_PRESETS[loraPresetIdx].name,
-        loraAutoReply ? "ON" : "off",
-        loraDedup     ? "ON" : "off");
-      serialWritelnAll(buf);
-      serialWritelnAll("  lora list | lora send <text> | lora preset 0-3 | lora reply on|off | lora dedup on|off");
-      break;
-    case FUNCTION_MEDIA: {
-      static const char* subName[] = {"MATRIX","VADER","OBI-WAN"};
-      snprintf(buf, sizeof(buf), "[MEDIA:%s] music:%s  swipe up/down=change | music on|off",
-        subName[mediaSubScreen], buzzerPlaying ? "ON" : "off");
-      serialWritelnAll(buf);
-      break;
-    }
-  }
-}
-
-// ── General help ─────────────────────────────────────────────────
-
-void serialPrintHelp() {
-  serialWritelnAll("========= NESSO N1 SERIAL =========");
+static void printHelpNav() {
   serialWritelnAll("Navigation:");
   serialWritelnAll("  next | prev           next/prev screen");
   serialWritelnAll("  goto <screen>         main|controller|bt|wifi|lora|ir|media|battery");
@@ -2099,6 +1786,9 @@ void serialPrintHelp() {
   serialWritelnAll("  battery               voltage, level, charge status, uptime");
   serialWritelnAll("  controller            joystick position and last motor values");
   serialWritelnAll("  send <L> <R>          transmit motor command  (-255..255)");
+}
+
+static void printHelpWifi() {
   serialWritelnAll("WiFi:");
   serialWritelnAll("  wifi scan             start a network scan");
   serialWritelnAll("  wifi list             print scan results");
@@ -2107,6 +1797,9 @@ void serialPrintHelp() {
   serialWritelnAll("  wifi connect ssid <SSID> pass <PASS>   connect to any network");
   serialWritelnAll("  wifi disconnect       disconnect");
   serialWritelnAll("  wifi debug on|off     toggle debug info (channel, BSSID)");
+}
+
+static void printHelpBT() {
   serialWritelnAll("Bluetooth:");
   serialWritelnAll("  bt list               list discovered BLE devices (sorted by RSSI)");
   serialWritelnAll("  bt detail <N>         full detail for device N  (0-based)");
@@ -2115,23 +1808,131 @@ void serialPrintHelp() {
   serialWritelnAll("  bt startup on|off     auto-init BLE at boot (persisted)");
   serialWritelnAll("  bt mode active|passive");
   serialWritelnAll("  bt filter -70|-80|-90|off");
+}
+
+static void printHelpLora() {
   serialWritelnAll("LoRa:");
   serialWritelnAll("  lora list             received packets");
   serialWritelnAll("  lora send <text>      transmit a Meshtastic text message");
   serialWritelnAll("  lora reply on|off     auto-reply ACK");
   serialWritelnAll("  lora dedup on|off     duplicate suppression");
   serialWritelnAll("  lora preset 0-3       0=LONG_FAST 1=LONG_SLOW 2=MED_FAST 3=SHORT_FAST");
+}
+
+static void printHelpFS() {
+  serialWritelnAll("Filesystem:");
+  serialWritelnAll("  fs info               LittleFS total/used/free");
+  serialWritelnAll("  fs ls [path]          list directory (default /)");
+  serialWritelnAll("  fs cat <path>         print file contents");
+  serialWritelnAll("  fs rm <path>          delete file");
+  serialWritelnAll("  fs mkdir <path>       create directory");
+  serialWritelnAll("  fs mv <src> <dst>     rename / move");
+  serialWritelnAll("  fs upload <path>      paste file, end with ---END--- on its own line");
+}
+
+static void printHelpIR() {
   serialWritelnAll("IR Remote:");
-  serialWritelnAll("  ir list               list all known brands/devices");
-  serialWritelnAll("  ir send <N> <func>    send func to device N (power|volup|voldn|mute|chup|chdn)");
-  serialWritelnAll("  ir select <N>         add device N to active remote set");
-  serialWritelnAll("  ir deselect <N>       remove device N from active set");
-  serialWritelnAll("  ir pin                show built-in IR blaster pin info");
+  serialWritelnAll("  ir list               list all .ir files in /irdb/ (with index)");
+  serialWritelnAll("  ir select <N>         load device N and open remote UI");
+  serialWritelnAll("  ir send <N> <label>   send one button from device N");
+  serialWritelnAll("  ir reload             re-scan /irdb/ for new files");
+  serialWritelnAll("  ir pin                show IR blaster pin");
+}
+
+static void printHelpMusic() {
   serialWritelnAll("Music (matrix / vader / obiwan screens):");
   serialWritelnAll("  music on|off");
+}
+
+// ── Contextual help — status line + section commands ─────────────
+
+void serialPrintFunctionHelp(int fn) {
+  char buf[200];
+  switch (fn) {
+    case FUNCTION_MAIN:
+      printHelpNav();
+      break;
+    case FUNCTION_BATTERY:
+      snprintf(buf, sizeof(buf),
+        "[BATTERY] dim:%s  sleep:%s  lowbat:%s  (long-press KEY1=device settings)",
+        DIM_TIMEOUT_LABELS[dimTimeoutIdx],
+        SLEEP_TIMEOUT_LABELS[sleepTimeoutIdx],
+        LOW_BAT_LABELS[lowBatIdx]);
+      serialWritelnAll(buf);
+      break;
+    case FUNCTION_CONTROLLER:
+      snprintf(buf, sizeof(buf),
+        "[CONTROLLER] WiFi:%s | send <L> <R>  (-255..255)",
+        WiFi.isConnected() ? "CONNECTED" : "off");
+      serialWritelnAll(buf);
+      break;
+    case FUNCTION_IR: {
+      snprintf(buf, sizeof(buf),
+        "[IR] files:%d  loaded:%s  level:%s",
+        irFileCount,
+        irLoadedName[0] ? irLoadedName : "none",
+        irLevel == IR_LEVEL_LIST ? "list" : "remote");
+      serialWritelnAll(buf);
+      printHelpIR();
+      break;
+    }
+    case FUNCTION_WIFI:
+      snprintf(buf, sizeof(buf),
+        "[WIFI] connected:%s  scanning:%s  debug:%s  auto-scan:%s",
+        WiFi.isConnected() ? WiFi.localIP().toString().c_str() : "no",
+        wifiScanning  ? "yes" : "no",
+        wifiDebugMode ? "ON"  : "OFF",
+        wifiAutoScan  ? "ON"  : "OFF");
+      serialWritelnAll(buf);
+      printHelpWifi();
+      break;
+    case FUNCTION_BT:
+      snprintf(buf, sizeof(buf),
+        "[BT] scan:%s  adv:%s  startup:%s  mode:%s  filter:%s",
+        btScanning         ? "ON"     : "off",
+        btAdvEnabled       ? "ON"     : "off",
+        btStartupEnabled   ? "ON"     : "off",
+        btScanModeIdx == 0 ? "ACTIVE" : "passive",
+        BT_RSSI_LABELS[btRssiFilterIdx]);
+      serialWritelnAll(buf);
+      printHelpBT();
+      break;
+    case FUNCTION_LORA:
+      snprintf(buf, sizeof(buf),
+        "[LORA] preset:%s  reply:%s  dedup:%s",
+        LORA_PRESETS[loraPresetIdx].name,
+        loraAutoReply ? "ON" : "off",
+        loraDedup     ? "ON" : "off");
+      serialWritelnAll(buf);
+      printHelpLora();
+      break;
+    case FUNCTION_MEDIA: {
+      static const char* subName[] = {"MATRIX","VADER","OBI-WAN"};
+      snprintf(buf, sizeof(buf), "[MEDIA:%s] music:%s  (swipe up/down to change)",
+        subName[mediaSubScreen], buzzerPlaying ? "ON" : "off");
+      serialWritelnAll(buf);
+      printHelpMusic();
+      break;
+    }
+  }
+}
+
+// ── General help — full formatted dump ───────────────────────────
+
+void serialPrintHelp() {
+  serialWritelnAll("========= NESSO N1 SERIAL =========");
+  printHelpNav();
+  printHelpWifi();
+  printHelpBT();
+  printHelpLora();
+  printHelpFS();
+  printHelpIR();
+  printHelpMusic();
   serialWritelnAll("IMU / Orientation:");
   serialWritelnAll("  imu                    single accelerometer snapshot");
   serialWritelnAll("  imu debug on|off       stream readings every 300 ms");
+  serialWritelnAll("Web File Manager:");
+  serialWritelnAll("  webfm                  print web file manager URL (WiFi required)");
   serialWritelnAll("===================================");
 }
 
@@ -2310,56 +2111,217 @@ void serialHandleImu(const char* arg) {
 
 void serialHandleIR(const char* arg) {
   if (!*arg) {
-    serialWritelnAll("ir list|send <N> <func>|select <N>|deselect <N>|pin <GPIO>");
+    serialWritelnAll("ir list|select <N>|send <N> <btn>|reload|pin");
     return;
   }
   if (cmdIs(arg,"list")) {
     char buf[80];
-    for (int i = 0; i < IRDB_COUNT; i++) {
-      bool sel = (irSelectedMask & (1ULL << i)) != 0;
-      snprintf(buf, sizeof(buf), "%2d: [%c] %-10s %-8s %s",
-        i, sel ? 'X' : ' ', IRDB[i].brand, IRDB[i].type, IRDB[i].name);
+    for (int i = 0; i < irFileCount; i++) {
+      snprintf(buf, sizeof(buf), "%2d: [%c] %s", i, i == irSelectedIdx ? '*' : ' ', irFiles[i].name);
       serialWritelnAll(buf);
     }
-  } else if (cmdIs(arg,"select")) {
-    int idx = atoi(cmdArg(arg,"select"));
-    if (idx < 0 || idx >= IRDB_COUNT) { serialWritelnAll("Invalid index."); return; }
-    irSelectedMask |= (1ULL << idx);
-    saveSettings();
-    char buf[56]; snprintf(buf,sizeof(buf),"Selected: %s %s %s",IRDB[idx].brand,IRDB[idx].type,IRDB[idx].name);
+    if (irFileCount == 0) serialWritelnAll("No .ir files found in /irdb/");
+  } else if (cmdIs(arg,"reload")) {
+    irScanFiles();
+    irOpenDir(irBrowsePath[0] ? irBrowsePath : "/irdb");
+    char buf[32]; snprintf(buf, sizeof(buf), "Found %d device(s).", irFileCount);
     serialWritelnAll(buf);
-  } else if (cmdIs(arg,"deselect")) {
-    int idx = atoi(cmdArg(arg,"deselect"));
-    if (idx < 0 || idx >= IRDB_COUNT) { serialWritelnAll("Invalid index."); return; }
-    irSelectedMask &= ~(1ULL << idx);
-    saveSettings();
-    serialWritelnAll("Deselected.");
   } else if (cmdIs(arg,"send")) {
     const char* rest = cmdArg(arg,"send");
-    int idx = atoi(rest);
+    int devIdx = atoi(rest);
     while (*rest && *rest != ' ') rest++;
     while (*rest == ' ') rest++;
-    if (idx < 0 || idx >= IRDB_COUNT || !*rest) {
-      serialWritelnAll("Usage: ir send <N> power|volup|voldn|mute|chup|chdn");
+    if (devIdx < 0 || devIdx >= irFileCount || !*rest) {
+      serialWritelnAll("Usage: ir send <device N> <button label>  (use 'ir list' for indices)");
       return;
     }
-    uint32_t code = 0;
-    if      (strcasecmp(rest,"power")==0) code = IRDB[idx].power;
-    else if (strcasecmp(rest,"volup")==0) code = IRDB[idx].volUp;
-    else if (strcasecmp(rest,"voldn")==0) code = IRDB[idx].volDown;
-    else if (strcasecmp(rest,"mute") ==0) code = IRDB[idx].mute;
-    else if (strcasecmp(rest,"chup") ==0) code = IRDB[idx].chUp;
-    else if (strcasecmp(rest,"chdn") ==0) code = IRDB[idx].chDown;
-    else { serialWritelnAll("Unknown function. Use: power|volup|voldn|mute|chup|chdn"); return; }
-    irSendFunc(idx, code);
-    char buf[56]; snprintf(buf,sizeof(buf),"Sent %s -> %s %s %s (0x%08X)",
-      rest,IRDB[idx].brand,IRDB[idx].type,IRDB[idx].name,(unsigned)code);
+    if (irSelectedIdx != devIdx) irLoadDevice(irFiles[devIdx].path);
+    int btnIdx = -1;
+    for (int i = 0; i < irBtnCount; i++) {
+      if (!strcasecmp(irBtns[i].label, rest)) { btnIdx = i; break; }
+    }
+    if (btnIdx < 0) {
+      serialWritelnAll("Button not found — label is case-sensitive after first char.");
+      return;
+    }
+    irSendButton(btnIdx);
+    char buf[64]; snprintf(buf, sizeof(buf), "Sent %s -> %s", irFiles[devIdx].name, irBtns[btnIdx].label);
+    serialWritelnAll(buf);
+  } else if (cmdIs(arg,"select")) {
+    const char* rest = cmdArg(arg,"select");
+    int idx = atoi(rest);
+    if (idx < 0 || idx >= irFileCount) {
+      serialWritelnAll("Usage: ir select <N>  (use 'ir list' for indices)");
+      return;
+    }
+    irLoadDevice(irFiles[idx].path);
+    strlcpy(irSavedPath, irFiles[idx].path, sizeof(irSavedPath));
+    saveSettings();
+    if (currentFunction == FUNCTION_IR) irLevel = IR_LEVEL_REMOTE;
+    char buf[64]; snprintf(buf, sizeof(buf), "Selected: %s", irLoadedName);
     serialWritelnAll(buf);
   } else if (cmdIs(arg,"pin")) {
-    char buf[48]; snprintf(buf,sizeof(buf),"IR blaster: built-in GPIO %d (IR_TX_PIN).", IR_SEND_PIN);
+    char buf[48]; snprintf(buf, sizeof(buf), "IR blaster: GPIO %d (IR_TX_PIN).", IR_SEND_PIN);
     serialWritelnAll(buf);
   } else {
     serialWritelnAll("Unknown ir subcommand. Type 'help'.");
+  }
+}
+
+// Called per-character when fsUploadActive — char-by-char so data lines
+// of any length don't overflow the command buffer.
+static void fsUploadFeed(char c) {
+  if (c == '\r') return;
+  if (c == '\n') {
+    fsLineBuf[fsLineBufLen] = '\0';
+    if (!fsLineOverflow && !strcmp(fsLineBuf, "---END---")) {
+      fsUploadFile.close();
+      fsUploadActive = false;
+      char msg[80];
+      snprintf(msg, sizeof(msg), "OK: %lu bytes -> %s", (unsigned long)fsUploadBytes, fsUploadPath);
+      serialWritelnAll(msg);
+      int plen = strlen(fsUploadPath);
+      if (plen > 3 && !strcasecmp(fsUploadPath + plen - 3, ".ir")) {
+        irScanFiles();
+        snprintf(msg, sizeof(msg), "Rescanned /irdb: %d device(s)", irFileCount);
+        serialWritelnAll(msg);
+      }
+    } else {
+      if (!fsLineOverflow && fsLineBufLen > 0) {
+        fsUploadFile.write((const uint8_t*)fsLineBuf, fsLineBufLen);
+        fsUploadBytes += fsLineBufLen;
+      }
+      fsUploadFile.write('\n');
+      fsUploadBytes++;
+    }
+    fsLineBufLen = 0;
+    fsLineOverflow = false;
+    return;
+  }
+  if (fsLineOverflow) {
+    fsUploadFile.write((uint8_t)c);
+    fsUploadBytes++;
+  } else if (fsLineBufLen < (int)sizeof(fsLineBuf) - 1) {
+    fsLineBuf[fsLineBufLen++] = c;
+  } else {
+    fsUploadFile.write((const uint8_t*)fsLineBuf, fsLineBufLen);
+    fsUploadFile.write((uint8_t)c);
+    fsUploadBytes += fsLineBufLen + 1;
+    fsLineOverflow = true;
+  }
+}
+
+void serialHandleFS(const char* arg) {
+  if (!*arg) {
+    serialWritelnAll("fs info | ls [path] | cat <path> | rm <path> | mkdir <path> | mv <src> <dst> | upload <path>");
+    return;
+  }
+
+  if (cmdIs(arg, "info")) {
+    char buf[80];
+    snprintf(buf, sizeof(buf), "LittleFS: %lu KB total  %lu KB used  %lu KB free",
+      (unsigned long)LittleFS.totalBytes()  / 1024,
+      (unsigned long)LittleFS.usedBytes()   / 1024,
+      (unsigned long)(LittleFS.totalBytes() - LittleFS.usedBytes()) / 1024);
+    serialWritelnAll(buf);
+
+  } else if (cmdIs(arg, "ls")) {
+    const char* path = cmdArg(arg, "ls");
+    if (!*path) path = "/";
+    File dir = LittleFS.open(path);
+    if (!dir || !dir.isDirectory()) {
+      serialWritelnAll("Not a directory.");
+      if (dir) dir.close();
+      return;
+    }
+    char buf[80];
+    snprintf(buf, sizeof(buf), "--- %s ---", path);
+    serialWritelnAll(buf);
+    while (true) {
+      File entry = dir.openNextFile();
+      if (!entry) break;
+      char fullPath[64];
+      snprintf(fullPath, sizeof(fullPath), "%s/%s",
+        strcmp(path, "/") ? path : "", entry.name());
+      bool isDir  = entry.isDirectory();
+      size_t size = isDir ? 0 : entry.size();
+      entry.close();
+      if (isDir)
+        snprintf(buf, sizeof(buf), "  [DIR]  %s", fullPath);
+      else
+        snprintf(buf, sizeof(buf), "  %5lu B  %s", (unsigned long)size, fullPath);
+      serialWritelnAll(buf);
+    }
+    dir.close();
+
+  } else if (cmdIs(arg, "cat")) {
+    const char* path = cmdArg(arg, "cat");
+    File f = LittleFS.open(path, "r");
+    if (!f) { serialWritelnAll("File not found."); return; }
+    uint8_t buf[128];
+    while (f.available()) {
+      while (Serial.availableForWrite() < (int)sizeof(buf)) yield();
+      int n = f.readBytes((char*)buf, sizeof(buf));
+      Serial.write(buf, n);
+    }
+    f.close();
+    Serial.println();
+
+  } else if (cmdIs(arg, "rm")) {
+    const char* path = cmdArg(arg, "rm");
+    if (LittleFS.remove(path)) {
+      serialWritelnAll("Deleted.");
+      int plen = strlen(path);
+      if (plen > 3 && !strcasecmp(path + plen - 3, ".ir")) {
+        irScanFiles();
+        char buf[48]; snprintf(buf, sizeof(buf), "Rescanned: %d device(s)", irFileCount);
+        serialWritelnAll(buf);
+      }
+    } else {
+      serialWritelnAll("Failed — not found or is a directory.");
+    }
+
+  } else if (cmdIs(arg, "mkdir")) {
+    const char* path = cmdArg(arg, "mkdir");
+    if (LittleFS.mkdir(path)) serialWritelnAll("Created.");
+    else                      serialWritelnAll("Failed — already exists or invalid path.");
+
+  } else if (cmdIs(arg, "mv")) {
+    const char* rest = cmdArg(arg, "mv");
+    char src[64] = {}, dst[64] = {};
+    int si = 0;
+    while (*rest && *rest != ' ' && si < 63) src[si++] = *rest++;
+    while (*rest == ' ') rest++;
+    int di = 0;
+    while (*rest && di < 63) dst[di++] = *rest++;
+    if (!src[0] || !dst[0]) { serialWritelnAll("Usage: fs mv <src> <dst>"); return; }
+    if (LittleFS.rename(src, dst)) {
+      serialWritelnAll("Moved.");
+      irScanFiles();
+    } else {
+      serialWritelnAll("Failed.");
+    }
+
+  } else if (cmdIs(arg, "upload")) {
+    const char* path = cmdArg(arg, "upload");
+    if (!*path) { serialWritelnAll("Usage: fs upload <path>"); return; }
+    // Create parent directory if needed
+    char parent[64];
+    strlcpy(parent, path, sizeof(parent));
+    char* last = strrchr(parent, '/');
+    if (last && last != parent) { *last = '\0'; LittleFS.mkdir(parent); }
+    File f = LittleFS.open(path, "w");
+    if (!f) { serialWritelnAll("Cannot create file — check path."); return; }
+    strlcpy(fsUploadPath, path, sizeof(fsUploadPath));
+    fsUploadFile    = f;
+    fsUploadBytes   = 0;
+    fsLineBufLen    = 0;
+    fsLineOverflow  = false;
+    fsUploadActive  = true;
+    serialWritelnAll("Ready — paste file content, then send  ---END---  on its own line.");
+
+  } else {
+    serialWritelnAll("Unknown fs subcommand. Type 'fs' for usage.");
   }
 }
 
@@ -2543,12 +2505,22 @@ void serialHandleCommand(const char* raw) {
     char buf[40]; snprintf(buf,sizeof(buf),"Sent: L=%d R=%d",L,R);
     serialWritelnAll(buf);
   }
+  else if (cmdIs(raw,"fs"))    serialHandleFS(cmdArg(raw,"fs"));
   else if (cmdIs(raw,"bt"))    serialHandleBT(cmdArg(raw,"bt"));
   else if (cmdIs(raw,"wifi"))  serialHandleWiFi(cmdArg(raw,"wifi"));
   else if (cmdIs(raw,"ir"))    serialHandleIR(cmdArg(raw,"ir"));
   else if (cmdIs(raw,"lora"))  serialHandleLora(cmdArg(raw,"lora"));
   else if (cmdIs(raw,"music")) serialHandleMusic(cmdArg(raw,"music"));
   else if (cmdIs(raw,"imu"))   serialHandleImu(cmdArg(raw,"imu"));
+  else if (cmdIs(raw,"webfm")) {
+    if (webFMRunning) {
+      char buf[64];
+      snprintf(buf, sizeof(buf), "[WebFM] http://%s/", WiFi.localIP().toString().c_str());
+      serialWritelnAll(buf);
+    } else {
+      serialWritelnAll("[WebFM] not running (connect WiFi first)");
+    }
+  }
   else {
     char err[64]; snprintf(err,sizeof(err),"Unknown: '%s'  (type help)",raw);
     serialWritelnAll(err);
@@ -2561,6 +2533,7 @@ void serialCheckInput() {
   // USB Serial
   while (Serial.available()) {
     char c = (char)Serial.read();
+    if (fsUploadActive) { fsUploadFeed(c); continue; }
     if (c == '\n' || c == '\r') {
       if (sSerialLen > 0) {
         sSerialBuf[sSerialLen] = '\0';
@@ -2602,7 +2575,6 @@ void renderFunction() {
   if (lastFunction == (int)FUNCTION_MEDIA && currentFunction != FUNCTION_MEDIA)
     stopBuzzer();
 
-  // Send contextual help over serial when the screen changes
   static int serialLastScreen = -1;
   if ((int)currentFunction != serialLastScreen) {
     serialPrintFunctionHelp((int)currentFunction);
@@ -3444,6 +3416,160 @@ void readGamePadButtons() {
 
 
 // ================================================================
+// Web File Manager
+// ================================================================
+
+#include "web_fm_html.h"
+
+static WebServer webFM(80);
+
+static void webFMJson(int code, const char* json) {
+  webFM.send(code, "application/json", json);
+}
+
+static void webFMHandleRoot() {
+  webFM.sendHeader("Cache-Control", "no-cache");
+  webFM.send_P(200, "text/html; charset=utf-8", WEB_FM_HTML);
+}
+
+static void webFMHandleLs() {
+  String path = webFM.arg("path");
+  if (path.isEmpty()) path = "/";
+  File dir = LittleFS.open(path);
+  if (!dir || !dir.isDirectory()) {
+    dir.close();
+    webFMJson(404, "{\"error\":\"Not a directory\"}");
+    return;
+  }
+  String json = "{\"path\":\"";
+  for (int i = 0; i < (int)path.length(); i++) {
+    char c = path[i];
+    if (c == '"' || c == '\\') json += '\\';
+    json += c;
+  }
+  json += "\",\"entries\":[";
+  bool first = true;
+  while (true) {
+    File entry = dir.openNextFile();
+    if (!entry) break;
+    char bare[64];
+    strlcpy(bare, entry.name(), sizeof(bare));
+    bool isD = entry.isDirectory();
+    size_t fsz = isD ? 0 : entry.size();
+    entry.close();
+    if (!first) json += ",";
+    first = false;
+    json += "{\"name\":\"";
+    for (char* p = bare; *p; p++) {
+      if (*p == '"' || *p == '\\') json += '\\';
+      json += *p;
+    }
+    json += "\",\"isDir\":";
+    json += isD ? "true" : "false";
+    if (!isD) { json += ",\"size\":"; json += fsz; }
+    json += "}";
+  }
+  dir.close();
+  json += "]}";
+  webFMJson(200, json.c_str());
+}
+
+static void webFMHandleDl() {
+  String path = webFM.arg("path");
+  if (path.isEmpty()) { webFM.send(400, "text/plain", "Missing path"); return; }
+  File f = LittleFS.open(path, "r");
+  if (!f) { webFM.send(404, "text/plain", "Not found"); return; }
+  String fname = path;
+  int sl = fname.lastIndexOf('/');
+  if (sl >= 0) fname = fname.substring(sl + 1);
+  webFM.sendHeader("Content-Disposition", "attachment; filename=\"" + fname + "\"");
+  webFM.streamFile(f, "application/octet-stream");
+  f.close();
+}
+
+static void webFMHandleRm() {
+  String path = webFM.arg("path");
+  if (path.isEmpty()) { webFMJson(400, "{\"error\":\"Missing path\"}"); return; }
+  File f = LittleFS.open(path);
+  if (!f) { webFMJson(404, "{\"error\":\"Not found\"}"); return; }
+  bool isD = f.isDirectory();
+  f.close();
+  bool ok = isD ? LittleFS.rmdir(path) : LittleFS.remove(path);
+  if (ok) {
+    if (path.endsWith(".ir") || path.endsWith(".IR") || isD) irScanFiles();
+    webFMJson(200, "{\"ok\":true}");
+  } else {
+    webFMJson(500, "{\"error\":\"Delete failed (dir must be empty)\"}");
+  }
+}
+
+static void webFMHandleMkdir() {
+  String path = webFM.arg("path");
+  if (path.isEmpty()) { webFMJson(400, "{\"error\":\"Missing path\"}"); return; }
+  if (LittleFS.mkdir(path)) { webFMJson(200, "{\"ok\":true}"); }
+  else { webFMJson(500, "{\"error\":\"mkdir failed\"}"); }
+}
+
+static void webFMHandleMv() {
+  String from = webFM.arg("from"), to = webFM.arg("to");
+  if (from.isEmpty() || to.isEmpty()) { webFMJson(400, "{\"error\":\"Missing from/to\"}"); return; }
+  if (LittleFS.rename(from, to)) {
+    if (from.endsWith(".ir") || to.endsWith(".ir") ||
+        from.endsWith(".IR") || to.endsWith(".IR")) irScanFiles();
+    webFMJson(200, "{\"ok\":true}");
+  } else {
+    webFMJson(500, "{\"error\":\"Rename failed\"}");
+  }
+}
+
+static void webFMUploadHandler() {
+  HTTPUpload& up = webFM.upload();
+  if (up.status == UPLOAD_FILE_START) {
+    webFMUploadPath = webFM.arg("path");
+    webFMUploadOk   = false;
+    webFMUploadFile = LittleFS.open(webFMUploadPath, "w");
+    webFMUploadOk   = (bool)webFMUploadFile;
+  } else if (up.status == UPLOAD_FILE_WRITE) {
+    if (webFMUploadFile) webFMUploadFile.write(up.buf, up.currentSize);
+  } else if (up.status == UPLOAD_FILE_END) {
+    if (webFMUploadFile) webFMUploadFile.close();
+    if (webFMUploadOk &&
+        (webFMUploadPath.endsWith(".ir") || webFMUploadPath.endsWith(".IR")))
+      irScanFiles();
+  }
+}
+
+void webFMStart() {
+  if (webFMRunning) return;
+  webFM.on("/",           HTTP_GET,  webFMHandleRoot);
+  webFM.on("/api/ls",     HTTP_GET,  webFMHandleLs);
+  webFM.on("/api/dl",     HTTP_GET,  webFMHandleDl);
+  webFM.on("/api/rm",     HTTP_POST, webFMHandleRm);
+  webFM.on("/api/mkdir",  HTTP_POST, webFMHandleMkdir);
+  webFM.on("/api/mv",     HTTP_POST, webFMHandleMv);
+  webFM.on("/api/upload", HTTP_POST,
+    []() { webFMJson(webFMUploadOk ? 200 : 500,
+                     webFMUploadOk ? "{\"ok\":true}" : "{\"error\":\"Open failed\"}"); },
+    webFMUploadHandler);
+  webFM.begin();
+  webFMRunning = true;
+  char buf[64];
+  snprintf(buf, sizeof(buf), "[WebFM] http://%s/", WiFi.localIP().toString().c_str());
+  serialWritelnAll(buf);
+}
+
+void webFMStop() {
+  if (!webFMRunning) return;
+  webFM.stop();
+  webFMRunning = false;
+}
+
+void webFMHandle() {
+  if (webFMRunning) webFM.handleClient();
+}
+
+
+// ================================================================
 // WiFi & Networking
 // ================================================================
 
@@ -3472,6 +3598,7 @@ void WiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
       debugln(WiFi.localIP());
       wifiAuthFailed = false;
       udp.begin(udpPort);
+      webFMPendingStart = true;
       break;
     case ARDUINO_EVENT_WIFI_STA_DISCONNECTED: {
       uint8_t reason = info.wifi_sta_disconnected.reason;
@@ -5496,33 +5623,230 @@ void handleBatteryResetTap(int16_t sx, int16_t sy) {
 }
 
 // ================================================================
-// FUNCTION_IR — IR Remote Control
+// FUNCTION_IR — IR Remote Control (LittleFS .ir file based)
 // ================================================================
 
-// Send an IR code using the correct protocol for device devIdx
-void irSendFunc(int devIdx, uint32_t code) {
-  if (devIdx < 0 || devIdx >= IRDB_COUNT || code == 0) return;
-  irTxMs = millis();  // record send time for TX indicator
-  const IRDev& d = IRDB[devIdx];
-  switch (d.proto) {
-    case IRDB_SAMSUNG: irsend.sendSAMSUNG(code, d.nbits);         break;
-    case IRDB_NEC:     irsend.sendNEC(code, d.nbits);             break;
-    case IRDB_SONY:    irsend.sendSony(code, d.nbits);            break;
-    case IRDB_RC5:     irsend.sendRC5(code, d.nbits);             break;
-    case IRDB_LG:      irsend.sendLG(code, d.nbits);              break;
-    case IRDB_JVC:     irsend.sendJVC(code, d.nbits, 0);          break;
-    case IRDB_SHARP:   irsend.sendSharp(d.addr, code, d.nbits);   break;
-    case IRDB_RC6:     irsend.sendRC6(code, d.nbits);             break;
+static IRFileProto irProtoFromStr(const char* s) {
+  if (!strcasecmp(s,"NEC"))                          return IRP_NEC;
+  if (!strcasecmp(s,"SAMSUNG")||!strcasecmp(s,"SAMSUNG32")) return IRP_SAMSUNG;
+  if (!strcasecmp(s,"SIRC12")||!strcasecmp(s,"SIRC-12"))    return IRP_SIRC12;
+  if (!strcasecmp(s,"SIRC15")||!strcasecmp(s,"SIRC-15"))    return IRP_SIRC15;
+  if (!strcasecmp(s,"SIRC20")||!strcasecmp(s,"SIRC-20"))    return IRP_SIRC20;
+  if (!strcasecmp(s,"RC5"))                          return IRP_RC5;
+  if (!strcasecmp(s,"RC6"))                          return IRP_RC6;
+  if (!strcasecmp(s,"LG"))                           return IRP_LG;
+  if (!strcasecmp(s,"JVC"))                          return IRP_JVC;
+  return IRP_UNKNOWN;
+}
+
+static uint32_t irParseHexLE(const char* s) {
+  // Parses "30 00 00 00" as little-endian hex bytes → 0x00000030
+  uint32_t v = 0;
+  for (int i = 0; i < 4; i++) {
+    while (*s == ' ') s++;
+    if (!*s) break;
+    char* end;
+    uint8_t b = (uint8_t)strtoul(s, &end, 16);
+    v |= ((uint32_t)b << (i * 8));
+    s = end;
+  }
+  return v;
+}
+
+static void irScanDir(const char* dirPath) {
+  File dir = LittleFS.open(dirPath);
+  if (!dir || !dir.isDirectory()) { dir.close(); return; }
+  while (irFileCount < IR_MAX_FILES) {
+    File entry = dir.openNextFile();
+    if (!entry) break;
+    // entry.name() returns bare name; build full path manually
+    char pathBuf[64];
+    snprintf(pathBuf, sizeof(pathBuf), "%s/%s", dirPath, entry.name());
+    bool isDir = entry.isDirectory();
+    entry.close();
+    if (isDir) {
+      irScanDir(pathBuf);
+    } else {
+      const char* slash    = strrchr(pathBuf, '/');
+      const char* fileName = slash ? slash + 1 : pathBuf;
+      int len = strlen(fileName);
+      if (len > 3 && !strcasecmp(fileName + len - 3, ".ir")) {
+        strlcpy(irFiles[irFileCount].path, pathBuf, sizeof(irFiles[0].path));
+        strlcpy(irFiles[irFileCount].name, fileName, sizeof(irFiles[0].name));
+        int nlen = strlen(irFiles[irFileCount].name);
+        if (nlen > 3) irFiles[irFileCount].name[nlen - 3] = '\0'; // strip .ir
+        irFileCount++;
+      }
+    }
+  }
+  dir.close();
+}
+
+void irScanFiles() {
+  irFileCount = 0;
+  memset(irFiles, 0, sizeof(irFiles));
+  irScanDir("/irdb");
+}
+
+void irOpenDir(const char* path) {
+  char p[64];
+  strlcpy(p, path, sizeof(p));   // copy before memset wipes irDir[] (path may point into it)
+  irDirCount = 0;
+  memset(irDir, 0, sizeof(irDir));
+  strlcpy(irBrowsePath, p, sizeof(irBrowsePath));
+  irListOff = 0;
+  File dir = LittleFS.open(p);
+  if (!dir || !dir.isDirectory()) { dir.close(); return; }
+  while (irDirCount < IR_DIR_MAX) {
+    File entry = dir.openNextFile();
+    if (!entry) break;
+    char bare[40];
+    strlcpy(bare, entry.name(), sizeof(bare));
+    bool isD = entry.isDirectory();
+    entry.close();
+    IRDirEntry& e = irDir[irDirCount];
+    e.isDir = isD;
+    snprintf(e.path, sizeof(e.path), "%s/%s", p, bare);
+    strlcpy(e.name, bare, sizeof(e.name));
+    if (!isD) {
+      int n = strlen(e.name);
+      if (n > 3 && !strcasecmp(e.name + n - 3, ".ir")) e.name[n - 3] = '\0';
+    }
+    irDirCount++;
+  }
+  dir.close();
+}
+
+void irLoadDevice(const char* path) {
+  File f = LittleFS.open(path, "r");
+  if (!f) { irBtnCount = 0; irLoadedPath[0] = '\0'; irLoadedName[0] = '\0'; return; }
+  irBtnCount = 0;
+  strlcpy(irLoadedPath, path, sizeof(irLoadedPath));
+  const char* sl = strrchr(path, '/');
+  strlcpy(irLoadedName, sl ? sl + 1 : path, sizeof(irLoadedName));
+  int nl = strlen(irLoadedName);
+  if (nl > 3 && !strcasecmp(irLoadedName + nl - 3, ".ir")) irLoadedName[nl - 3] = '\0';
+  irSelectedIdx = -1;
+  for (int i = 0; i < irFileCount; i++)
+    if (!strcmp(irFiles[i].path, path)) { irSelectedIdx = i; break; }
+  IRButton* btn = nullptr;
+
+  while (f.available()) {
+    // Read key (up to colon)
+    char key[24]; int ki = 0; bool gotKey = false; char c;
+    while (f.available()) {
+      c = f.read();
+      if (c == '\n') break;
+      if (c == '\r') continue;
+      if (c == '#') { while (f.available()) { c = f.read(); if (c=='\n') break; } break; }
+      if (c == ':') { key[ki] = '\0'; gotKey = true; break; }
+      if (ki < (int)sizeof(key)-1) key[ki++] = c;
+    }
+    if (!gotKey) continue;
+
+    bool isDataLine = (!strcmp(key,"data") && btn && btn->proto == IRP_RAW && btn->rawLen == 0);
+
+    if (!isDataLine) {
+      // Read value into a small buffer
+      char val[100]; int vi = 0;
+      while (f.available()) {
+        c = f.read(); if (c == '\n') break; if (c == '\r') continue;
+        if (vi < (int)sizeof(val)-1) val[vi++] = c;
+      }
+      val[vi] = '\0';
+      char* v = val; while (*v == ' ') v++;
+      int vlen = strlen(v);
+      while (vlen > 0 && (v[vlen-1]==' '||v[vlen-1]=='\r'||v[vlen-1]=='\n')) vlen--;
+      v[vlen] = '\0';
+
+      if (!strcmp(key,"name") && irBtnCount < IR_MAX_BUTTONS) {
+        btn = &irBtns[irBtnCount++];
+        memset(btn, 0, sizeof(*btn));
+        strlcpy(btn->label, v, sizeof(btn->label));
+      } else if (!strcmp(key,"type") && btn) {
+        if (!strcmp(v,"raw")) btn->proto = IRP_RAW;
+      } else if (!strcmp(key,"protocol") && btn) {
+        btn->proto = irProtoFromStr(v);
+      } else if (!strcmp(key,"address") && btn) {
+        btn->address = irParseHexLE(v);
+      } else if (!strcmp(key,"command") && btn) {
+        btn->command = irParseHexLE(v);
+      } else if (!strcmp(key,"frequency") && btn) {
+        btn->rawFreq = (uint16_t)atoi(v);
+      }
+    } else {
+      // Stream-parse raw timing data; stop at first inter-frame gap (>15000 µs)
+      btn->rawLen = 0;
+      uint32_t acc = 0; bool inNum = false;
+      while (f.available()) {
+        c = f.read();
+        if (c == '\n' || c == '\r') {
+          if (inNum) {
+            if (acc <= 15000 && btn->rawLen < IR_MAX_RAW_LEN)
+              btn->rawData[btn->rawLen++] = (uint16_t)acc;
+          }
+          if (c == '\n') break;
+          continue;
+        }
+        if (c >= '0' && c <= '9') {
+          acc = inNum ? acc * 10 + (uint32_t)(c - '0') : (uint32_t)(c - '0');
+          inNum = true;
+        } else if (inNum) {
+          inNum = false;
+          if (acc > 15000) {
+            // Drain rest of this data line
+            while (f.available()) { c = f.read(); if (c == '\n') break; }
+            break;
+          }
+          if (btn->rawLen < IR_MAX_RAW_LEN)
+            btn->rawData[btn->rawLen++] = (uint16_t)acc;
+          acc = 0;
+        }
+      }
+    }
+  }
+  f.close();
+}
+
+void irSendButton(int btnIdx) {
+  if (!irLoadedPath[0] || btnIdx < 0 || btnIdx >= irBtnCount) return;
+  IRButton& b = irBtns[btnIdx];
+  irTxMs = millis();
+  switch (b.proto) {
+    case IRP_NEC:     IrSender.sendNEC(b.address, b.command & 0xFF, 0);                    break;
+    case IRP_SAMSUNG: IrSender.sendSamsung(b.address & 0xFF, b.command & 0xFF, 0);         break;
+    case IRP_SIRC12:  IrSender.sendSony(b.address, b.command, 2, 12);                      break;
+    case IRP_SIRC15:  IrSender.sendSony(b.address, b.command, 2, 15);                      break;
+    case IRP_SIRC20:  IrSender.sendSony(b.address, b.command, 2, 20);                      break;
+    case IRP_RC5:     IrSender.sendRC5(b.address & 0x1F, b.command & 0x3F, 0);             break;
+    case IRP_RC6:     IrSender.sendRC6(b.address & 0xFF, b.command & 0xFF, 0);             break;
+    case IRP_LG:      IrSender.sendLG(b.address & 0xFF, b.command & 0xFF, 0);              break;
+    case IRP_JVC:     IrSender.sendJVC((uint8_t)(b.address&0xFF),(uint8_t)(b.command&0xFF),0); break;
+    case IRP_RAW:
+      if (b.rawLen >= 8) {
+        uint8_t freqKHz = b.rawFreq > 0 ? (uint8_t)(b.rawFreq / 1000) : 38;
+        for (int r = 0; r < 3; r++) {
+          IrSender.sendRaw(b.rawData, b.rawLen, freqKHz);
+          if (r < 2) delay(45);
+        }
+      }
+      break;
+    default: break;
   }
 }
 
 void initIR() {
-  irsend.begin();
+  IrSender.begin(IR_SEND_PIN);
   display.fillScreen(BG_COLOR);
   renderHeader();
-  irBrandOff = 0; irTypeOff = 0; irDevOff = 0;
-  irLevel    = (irSelectedMask != 0) ? IR_LEVEL_REMOTE : IR_LEVEL_BRAND;
-  irActiveDev = 0;
+  irBtnPageOff = 0;
+  irOpenDir("/irdb");
+  if (irSavedPath[0] != '\0') {
+    irLoadDevice(irSavedPath);
+    irLevel = IR_LEVEL_REMOTE;
+  } else {
+    irLevel = IR_LEVEL_LIST;
+  }
 }
 
 // ── Shared: draw a list title bar with optional back arrow ────────
@@ -5543,390 +5867,136 @@ static void irDrawTitle(const char* title, bool showBack, int sw, int titleH, bo
 }
 
 
-// ── Level 0: Brand list ───────────────────────────────────────────
-static void renderIRBrandList() {
-  int sw = statusSprite.width(), sh = statusSprite.height();
-  bool isLand = sw > sh;
-  statusSprite.fillSprite(COLOR_BLACK);
-  statusSprite.setFont(&fonts::Font0);
-
-  int titleH = isLand ? 20 : 24;
-  irDrawTitle("IR REMOTE", false, sw, titleH, isLand);
-
-  // Subtitle
-  statusSprite.setTextDatum(TC_DATUM);
-  statusSprite.setTextSize(1);
-  statusSprite.setTextColor(display.color565(100,45,0));
-  statusSprite.drawString("Select Brand", sw/2, titleH+2);
-
-  // Count unique brands
-  int totalBrands = 0;
-  for (int i = 0; i < IRDB_COUNT; i++) {
-    bool dup = false;
-    for (int j = 0; j < i; j++) if (!strcmp(IRDB[j].brand, IRDB[i].brand)) { dup=true; break; }
-    if (!dup) totalBrands++;
-  }
-
-  // "Use Remote" button if any devices already selected
-  int selTotal = 0;
-  for (int i = 0; i < IRDB_COUNT; i++) if (irSelectedMask & (1ULL<<i)) selTotal++;
-  bool showBtn = (selTotal > 0);
-  int btnH = 20, btnY = sh - 4 - btnH;
-  if (showBtn) {
-    statusSprite.fillRect(8, btnY, sw-16, btnH, display.color565(0,50,0));
-    statusSprite.drawRect(8, btnY, sw-16, btnH, COLOR_GREEN);
-    statusSprite.setTextDatum(MC_DATUM);
-    statusSprite.setTextSize(1);
-    statusSprite.setTextColor(COLOR_GREEN);
-    char s[28]; snprintf(s, sizeof(s), "USE REMOTE  (%d sel)", selTotal);
-    statusSprite.drawString(s, sw/2, btnY+btnH/2);
-  }
-
-  int listTop  = titleH + 12;
-  int rowH     = isLand ? 18 : 20;
-  int listArea = (showBtn ? btnY-4 : sh-4) - listTop;
-  int visRows  = max(1, listArea / rowH);
-  irBrandOff   = constrain(irBrandOff, 0, max(0, totalBrands - visRows));
-
-  // Scroll bar
-  if (totalBrands > visRows) {
-    int barH = max(6, listArea * visRows / totalBrands);
-    int barY = listTop + (listArea - barH) * irBrandOff / max(1, totalBrands - visRows);
-    statusSprite.fillRect(sw-3, listTop, 2, listArea, display.color565(20,20,20));
-    statusSprite.fillRect(sw-3, barY,    2, barH,     display.color565(180,70,0));
-  }
-
-  // Enumerate unique brands
-  int c = 0;
-  for (int i = 0; i < IRDB_COUNT; i++) {
-    bool dup = false;
-    for (int j = 0; j < i; j++) if (!strcmp(IRDB[j].brand, IRDB[i].brand)) { dup=true; break; }
-    if (dup) continue;
-    int n = c++;
-    if (n < irBrandOff || n >= irBrandOff + visRows) continue;
-    int rowY  = listTop + (n - irBrandOff) * rowH;
-    int textY = rowY + (rowH-8)/2;
-    // Count selections for this brand
-    int selForBrand = 0;
-    for (int k = 0; k < IRDB_COUNT; k++)
-      if (!strcmp(IRDB[k].brand, IRDB[i].brand) && (irSelectedMask & (1ULL<<k))) selForBrand++;
-    bool hasSel = (selForBrand > 0);
-    if (hasSel) statusSprite.fillRect(2, rowY, sw-4, rowH-1, display.color565(25,12,0));
-    statusSprite.setTextDatum(TL_DATUM);
-    statusSprite.setTextSize(1);
-    statusSprite.setTextColor(hasSel ? COLOR_WHITE : display.color565(180,100,20));
-    statusSprite.drawString(IRDB[i].brand, 8, textY);
-    statusSprite.setTextDatum(TR_DATUM);
-    if (hasSel) {
-      char badge[8]; snprintf(badge, sizeof(badge), "[%d]", selForBrand);
-      statusSprite.setTextColor(display.color565(200,80,0));
-      statusSprite.drawString(badge, sw-6, textY);
-    } else {
-      statusSprite.setTextColor(display.color565(60,30,5));
-      statusSprite.drawString(">", sw-6, textY);
-    }
-    if (n < irBrandOff + visRows - 1 && n < totalBrands - 1)
-      statusSprite.drawFastHLine(4, rowY+rowH-1, sw-8, display.color565(20,10,0));
-  }
-}
-
-// ── Level 1: Device type list ─────────────────────────────────────
-static void renderIRTypeList() {
-  int sw = statusSprite.width(), sh = statusSprite.height();
-  bool isLand = sw > sh;
-  statusSprite.fillSprite(COLOR_BLACK);
-  statusSprite.setFont(&fonts::Font0);
-
-  int titleH = isLand ? 20 : 24;
-  irDrawTitle(irSelBrand, true, sw, titleH, isLand);
-
-  // Count unique types
-  int typeCount = 0;
-  for (int i = 0; i < IRDB_COUNT; i++) {
-    if (strcmp(IRDB[i].brand, irSelBrand)) continue;
-    bool dup = false;
-    for (int j = 0; j < i; j++)
-      if (!strcmp(IRDB[j].brand,irSelBrand) && !strcmp(IRDB[j].type,IRDB[i].type)) { dup=true; break; }
-    if (!dup) typeCount++;
-  }
-
-  int listTop = titleH + 4;
-  int rowH    = isLand ? 22 : 26;
-  int visRows = max(1, (sh - listTop - 4) / rowH);
-  irTypeOff   = constrain(irTypeOff, 0, max(0, typeCount - visRows));
-
-  if (typeCount > visRows) {
-    int listArea = sh - listTop - 4;
-    int barH = max(6, listArea * visRows / typeCount);
-    int barY = listTop + (listArea - barH) * irTypeOff / max(1, typeCount - visRows);
-    statusSprite.fillRect(sw-3, listTop, 2, listArea, display.color565(20,20,20));
-    statusSprite.fillRect(sw-3, barY,    2, barH,     display.color565(180,70,0));
-  }
-
-  int c = 0;
-  for (int i = 0; i < IRDB_COUNT; i++) {
-    if (strcmp(IRDB[i].brand, irSelBrand)) continue;
-    bool dup = false;
-    for (int j = 0; j < i; j++)
-      if (!strcmp(IRDB[j].brand,irSelBrand) && !strcmp(IRDB[j].type,IRDB[i].type)) { dup=true; break; }
-    if (dup) continue;
-    int n = c++;
-    if (n < irTypeOff || n >= irTypeOff + visRows) continue;
-    int rowY  = listTop + (n - irTypeOff) * rowH;
-    int textY = rowY + (rowH-8)/2;
-    // Count devices of this type + selected count
-    int devCount = 0, selCount = 0;
-    for (int k = 0; k < IRDB_COUNT; k++) {
-      if (!strcmp(IRDB[k].brand,irSelBrand) && !strcmp(IRDB[k].type,IRDB[i].type)) {
-        devCount++;
-        if (irSelectedMask & (1ULL<<k)) selCount++;
-      }
-    }
-    bool hasSel = (selCount > 0);
-    if (hasSel) statusSprite.fillRect(2, rowY, sw-4, rowH-1, display.color565(25,12,0));
-    statusSprite.setTextDatum(TL_DATUM);
-    statusSprite.setTextSize(2);
-    statusSprite.setTextColor(hasSel ? COLOR_WHITE : display.color565(180,100,20));
-    statusSprite.drawString(IRDB[i].type, 10, textY);
-    statusSprite.setTextDatum(TR_DATUM);
-    statusSprite.setTextSize(1);
-    char badge[16];
-    snprintf(badge, sizeof(badge), hasSel ? "%d/%d sel >" : "%d >", hasSel ? selCount : devCount, devCount);
-    statusSprite.setTextColor(hasSel ? display.color565(200,80,0) : display.color565(60,30,5));
-    statusSprite.drawString(badge, sw-6, textY+6);
-    if (n < irTypeOff + visRows - 1 && n < typeCount - 1)
-      statusSprite.drawFastHLine(4, rowY+rowH-1, sw-8, display.color565(20,10,0));
-  }
-}
-
-// ── Level 2: Device list with checkboxes ─────────────────────────
-static void renderIRDeviceList() {
-  int sw = statusSprite.width(), sh = statusSprite.height();
-  bool isLand = sw > sh;
-  statusSprite.fillSprite(COLOR_BLACK);
-  statusSprite.setFont(&fonts::Font0);
-
-  char titleBuf[40];
-  snprintf(titleBuf, sizeof(titleBuf), "%s %s", irSelBrand, irSelType);
-  int titleH = isLand ? 20 : 24;
-  irDrawTitle(titleBuf, true, sw, titleH, isLand);
-
-  int devCount = 0;
-  for (int i = 0; i < IRDB_COUNT; i++)
-    if (!strcmp(IRDB[i].brand,irSelBrand) && !strcmp(IRDB[i].type,irSelType)) devCount++;
-
-  int selCount = 0;
-  for (int i = 0; i < IRDB_COUNT; i++) if (irSelectedMask & (1ULL<<i)) selCount++;
-
-  bool showBtn = (selCount > 0);
-  int doneH = 20, doneY = sh - 4 - doneH;
-  if (showBtn) {
-    statusSprite.fillRect(8, doneY, sw-16, doneH, display.color565(0,50,0));
-    statusSprite.drawRect(8, doneY, sw-16, doneH, COLOR_GREEN);
-    statusSprite.setTextDatum(MC_DATUM);
-    statusSprite.setTextSize(1);
-    statusSprite.setTextColor(COLOR_GREEN);
-    char s[32]; snprintf(s, sizeof(s), "USE REMOTE  (%d sel)", selCount);
-    statusSprite.drawString(s, sw/2, doneY+doneH/2);
-  }
-
-  int listTop  = titleH + 4;
-  int rowH     = isLand ? 20 : 22;
-  int listArea = (showBtn ? doneY-4 : sh-4) - listTop;
-  int visRows  = max(1, listArea / rowH);
-  irDevOff     = constrain(irDevOff, 0, max(0, devCount - visRows));
-
-  if (devCount > visRows) {
-    int barH = max(6, listArea * visRows / devCount);
-    int barY = listTop + (listArea - barH) * irDevOff / max(1, devCount - visRows);
-    statusSprite.fillRect(sw-3, listTop, 2, listArea, display.color565(20,20,20));
-    statusSprite.fillRect(sw-3, barY,    2, barH,     display.color565(180,70,0));
-  }
-
-  const char* protoName[] = {"SMSG","NEC","SONY","RC5","LG","JVC","SHRP","RC6"};
-  int c = 0;
-  for (int i = 0; i < IRDB_COUNT; i++) {
-    if (!strcmp(IRDB[i].brand,irSelBrand) && !strcmp(IRDB[i].type,irSelType)) {
-      int n = c++;
-      if (n < irDevOff || n >= irDevOff + visRows) continue;
-      bool sel  = (irSelectedMask & (1ULL<<i)) != 0;
-      int rowY  = listTop + (n - irDevOff) * rowH;
-      int textY = rowY + (rowH-8)/2;
-      if (sel) statusSprite.fillRect(2, rowY, sw-4, rowH-1, display.color565(30,15,0));
-      // Checkbox
-      uint16_t cbCol = sel ? display.color565(200,80,0) : COLOR_GRAY;
-      statusSprite.drawRect(5, textY, 8, 8, cbCol);
-      if (sel) {
-        statusSprite.drawLine(6, textY+4, 8, textY+6, cbCol);
-        statusSprite.drawLine(8, textY+6, 12, textY+2, cbCol);
-      }
-      // Name
-      statusSprite.setTextDatum(TL_DATUM);
-      statusSprite.setTextSize(1);
-      statusSprite.setTextColor(sel ? COLOR_WHITE : COLOR_GRAY);
-      statusSprite.drawString(IRDB[i].name, 18, textY);
-      // TEST fire button (▶) on right — tap to send power without selecting
-      uint16_t testCol = display.color565(60,80,30);
-      statusSprite.fillRect(sw-28, rowY+2, 22, rowH-4, display.color565(15,20,5));
-      statusSprite.drawRect(sw-28, rowY+2, 22, rowH-4, testCol);
-      statusSprite.setTextDatum(MC_DATUM);
-      statusSprite.setTextColor(testCol);
-      statusSprite.drawString("TEST", sw-17, textY+1);
-      if (n < irDevOff + visRows - 1 && n < devCount - 1)
-        statusSprite.drawFastHLine(4, rowY+rowH-1, sw-8, display.color565(20,15,5));
-    }
-  }
-}
-
-// ── Level 3: Remote view ──────────────────────────────────────────
-// Draws one button cell at (bx,by) with size (bw,bh)
-static void irDrawBtn(int bx, int by, int bw, int bh,
-                      const char* label, uint16_t col, bool active=true) {
-  // Flash the button that was just tapped (for 200 ms)
-  bool flashing = active && irFlashMs > 0 &&
-                  (millis() - irFlashMs) < 200 &&
-                  irFlashX >= bx && irFlashX < bx + bw &&
-                  irFlashY >= by && irFlashY < by + bh;
-  uint16_t bg   = flashing ? display.color565(60, 30,  5)
-                : active   ? display.color565(12,  6,  0)
-                :            display.color565( 6,  6,  6);
-  uint16_t edge = flashing ? display.color565(255,220,100)
-                : active   ? col
-                :            display.color565(35, 30, 20);
+// ── Draw one button cell ──────────────────────────────────────────
+static void irDrawBtn(int bx, int by, int bw, int bh, const char* label, uint16_t col) {
+  bool flashing = irFlashMs > 0 && (millis() - irFlashMs) < 200 &&
+                  irFlashX >= bx && irFlashX < bx+bw &&
+                  irFlashY >= by && irFlashY < by+bh;
+  uint16_t bg   = flashing ? display.color565(60,30,5) : display.color565(12,6,0);
+  uint16_t edge = flashing ? display.color565(255,220,100) : col;
   statusSprite.fillRoundRect(bx, by, bw, bh, 3, bg);
   statusSprite.drawRoundRect(bx, by, bw, bh, 3, edge);
   if (label && *label) {
     statusSprite.setTextDatum(MC_DATUM);
-    statusSprite.setTextSize(active ? 2 : 1);
-    statusSprite.setTextColor(flashing ? display.color565(255,220,100)
-                              : active ? col : display.color565(50,45,30));
-    statusSprite.drawString(label, bx + bw/2, by + bh/2);
+    statusSprite.setTextSize(1);
+    statusSprite.setTextColor(flashing ? display.color565(255,220,100) : col);
+    statusSprite.drawString(label, bx+bw/2, by+bh/2);
   }
 }
 
-static void renderIRRemote() {
-  int selIdx = -1, selCount = 0, countSoFar = 0;
-  for (int i = 0; i < IRDB_COUNT; i++) {
-    if (irSelectedMask & (1ULL << i)) {
-      if (countSoFar == (int)irActiveDev) selIdx = i;
-      countSoFar++;
-      selCount++;
-    }
-  }
-  if (selIdx < 0) { irLevel = IR_LEVEL_BRAND; return; }
-
-  const IRDev& d = IRDB[selIdx];
+// ── Level 0: Directory browser ────────────────────────────────────
+static void renderIRDir() {
   int sw = statusSprite.width(), sh = statusSprite.height();
   bool isLand = sw > sh;
   statusSprite.fillSprite(COLOR_BLACK);
   statusSprite.setFont(&fonts::Font0);
 
-  // ── Title bar ──────────────────────────────────────────────────
-  int titleH = isLand ? 22 : 28;
-  statusSprite.fillRect(0, 0, sw, titleH, display.color565(30,15,0));
-  char title[32];
-  snprintf(title, sizeof(title), "%s %s", d.brand, d.type);
-  statusSprite.setTextDatum(TC_DATUM);
-  statusSprite.setTextSize(2);
-  statusSprite.setTextColor(display.color565(200,80,0));
-  statusSprite.drawString(title, sw/2, isLand ? 3 : 5);
-  if (selCount > 1) {
-    int ds = 8, dotX = (sw - selCount*ds)/2;
-    for (int k = 0; k < selCount; k++)
-      statusSprite.fillCircle(dotX + k*ds + 3, titleH-5, 2,
-        k==(int)irActiveDev ? display.color565(200,80,0) : display.color565(60,30,0));
-    statusSprite.setTextDatum(TR_DATUM);
+  int titleH = isLand ? 20 : 24;
+  bool atRoot = (strcmp(irBrowsePath, "/irdb") == 0);
+  const char* sl = strrchr(irBrowsePath, '/');
+  const char* dirLabel = (sl && !atRoot) ? sl + 1 : "IR REMOTE";
+  irDrawTitle(dirLabel, !atRoot, sw, titleH, isLand);
+
+  if (irDirCount == 0) {
+    statusSprite.setTextDatum(MC_DATUM);
     statusSprite.setTextSize(1);
-    statusSprite.setTextColor(display.color565(60,40,10));
-    statusSprite.drawString("swipe", sw-2, titleH-8);
+    statusSprite.setTextColor(COLOR_GRAY);
+    statusSprite.drawString(atRoot ? "No .ir files in /irdb/" : "Empty", sw/2, sh/2);
+    return;
   }
 
-  // ── IR TX indicator: blinking red dot top-right for 500 ms after send ──
-  uint32_t txAge = (irTxMs > 0) ? (uint32_t)(millis() - irTxMs) : 0xFFFFFFFFu;
-  if (txAge < 500 && (txAge / 100) % 2 == 0) {
-    int dotR = 4, dotCx = sw - dotR - 4, dotCy = titleH / 2;
-    statusSprite.fillCircle(dotCx, dotCy, dotR, display.color565(220, 0, 0));
-    statusSprite.drawCircle(dotCx, dotCy, dotR, display.color565(255, 90, 90));
+  int rowH     = isLand ? 18 : 20;
+  int listTop  = titleH + 4;
+  int listArea = sh - listTop - 4;
+  int visRows  = max(1, listArea / rowH);
+  irListOff    = constrain(irListOff, 0, max(0, irDirCount - visRows));
+
+  if (irDirCount > visRows) {
+    int barH = max(6, listArea * visRows / irDirCount);
+    int barY = listTop + (listArea - barH) * irListOff / max(1, irDirCount - visRows);
+    statusSprite.fillRect(sw-3, listTop, 2, listArea, display.color565(20,20,20));
+    statusSprite.fillRect(sw-3, barY,    2, barH,     display.color565(180,70,0));
   }
 
-  // ── Determine layout ──────────────────────────────────────────
-  bool hasNav = (d.navUp != 0);
-  bool hasExt = (d.input || d.menu || d.ok || d.back || hasNav);
+  uint16_t colDir  = display.color565(220,150,20);
+  uint16_t colFile = display.color565(180,100,20);
+  uint16_t colSel  = COLOR_WHITE;
+  uint16_t colArrow = display.color565(60,30,5);
+
+  for (int i = 0; i < visRows; i++) {
+    int n    = i + irListOff;
+    if (n >= irDirCount) break;
+    int rowY  = listTop + i * rowH;
+    int textY = rowY + (rowH-8)/2;
+    bool isSel = !irDir[n].isDir && !strcmp(irDir[n].path, irLoadedPath);
+
+    if (isSel) statusSprite.fillRect(2, rowY, sw-4, rowH-1, display.color565(25,12,0));
+
+    statusSprite.setTextDatum(TL_DATUM);
+    statusSprite.setTextSize(1);
+
+    if (irDir[n].isDir) {
+      statusSprite.setTextColor(colDir);
+      char label[44]; snprintf(label, sizeof(label), "> %s", irDir[n].name);
+      statusSprite.drawString(label, 8, textY);
+    } else {
+      statusSprite.setTextColor(isSel ? colSel : colFile);
+      statusSprite.drawString(irDir[n].name, 8, textY);
+      statusSprite.setTextDatum(TR_DATUM);
+      statusSprite.setTextColor(isSel ? display.color565(200,80,0) : colArrow);
+      statusSprite.drawString(isSel ? "OPEN>" : ">", sw-6, textY);
+    }
+
+    if (i < visRows-1 && n < irDirCount-1)
+      statusSprite.drawFastHLine(4, rowY+rowH-1, sw-8, display.color565(20,10,0));
+  }
+}
+
+// ── Level 1: Remote button grid ──────────────────────────────────
+static void renderIRRemote() {
+  if (!irLoadedPath[0] || irBtnCount == 0) { irLevel = IR_LEVEL_LIST; return; }
+
+  int sw = statusSprite.width(), sh = statusSprite.height();
+  bool isLand = sw > sh;
+  statusSprite.fillSprite(COLOR_BLACK);
+  statusSprite.setFont(&fonts::Font0);
+
+  int titleH = isLand ? 22 : 26;
+  irDrawTitle(irLoadedName, true, sw, titleH, isLand);
+
+  // TX indicator: blinking red dot for 500 ms
+  uint32_t txAge = irTxMs ? (uint32_t)(millis() - irTxMs) : 0xFFFFFFFFu;
+  if (txAge < 500 && (txAge / 100) % 2 == 0)
+    statusSprite.fillCircle(sw - 8, titleH/2, 4, display.color565(220,0,0));
 
   int pad   = 3;
   int areaY = titleH + pad;
+  int cols  = 2;
+  int btnH  = isLand ? 22 : 24;
+  int btnW  = (sw - pad * (cols + 1)) / cols;
   int areaH = sh - areaY - pad;
-  int areaW = sw;
+  int visRows   = max(1, areaH / (btnH + pad));
+  int totalRows = (irBtnCount + cols - 1) / cols;
+  irBtnPageOff  = constrain(irBtnPageOff, 0, max(0, totalRows - visRows));
 
-  if (!hasNav && !hasExt) {
-    // ── Layout A: basic 4-row ─────────────────────────────────
-    int rH = areaH / 4;
-    int hW = (areaW - pad*3) / 2;
-    // POWER full-width
-    irDrawBtn(pad, areaY,           areaW-pad*2, rH-pad, "POWER",  display.color565(180,30,30));
-    // VOL+ / CH+
-    irDrawBtn(pad,       areaY+rH,  hW, rH-pad, "VOL +", display.color565(20,100,200));
-    irDrawBtn(pad+hW+pad,areaY+rH,  hW, rH-pad, "CH +",  display.color565(0,110,60));
-    // VOL- / CH-
-    irDrawBtn(pad,       areaY+2*rH,hW, rH-pad, "VOL -", display.color565(20,100,200));
-    irDrawBtn(pad+hW+pad,areaY+2*rH,hW, rH-pad, "CH -",  display.color565(0,110,60));
-    // MUTE / INPUT (half-half if input exists, else full)
-    if (d.input) {
-      irDrawBtn(pad,       areaY+3*rH,hW, rH-pad, "MUTE",  display.color565(100,80,0));
-      irDrawBtn(pad+hW+pad,areaY+3*rH,hW, rH-pad, "INPUT", display.color565(60,120,60));
-    } else {
-      irDrawBtn(pad, areaY+3*rH, areaW-pad*2, rH-pad, "MUTE", display.color565(100,80,0));
-    }
-
-  } else if (!hasNav) {
-    // ── Layout B: 4-row + 1 ext row ──────────────────────────
-    int rH = areaH / 5;
-    int hW = (areaW - pad*3) / 2;
-    irDrawBtn(pad, areaY,            areaW-pad*2, rH-pad, "POWER", display.color565(180,30,30));
-    irDrawBtn(pad,       areaY+rH,   hW, rH-pad, "VOL +", display.color565(20,100,200));
-    irDrawBtn(pad+hW+pad,areaY+rH,   hW, rH-pad, "CH +",  display.color565(0,110,60));
-    irDrawBtn(pad,       areaY+2*rH, hW, rH-pad, "VOL -", display.color565(20,100,200));
-    irDrawBtn(pad+hW+pad,areaY+2*rH, hW, rH-pad, "CH -",  display.color565(0,110,60));
-    irDrawBtn(pad,       areaY+3*rH, hW, rH-pad, "MUTE",  display.color565(100,80,0));
-    irDrawBtn(pad+hW+pad,areaY+3*rH, hW, rH-pad, "INPUT", display.color565(60,120,60), d.input!=0);
-    // ext row: MENU / OK (or BACK)
-    irDrawBtn(pad,       areaY+4*rH, hW, rH-pad, "MENU",  display.color565(80,80,150), d.menu!=0);
-    irDrawBtn(pad+hW+pad,areaY+4*rH, hW, rH-pad, d.ok?"OK":"BACK",
-              display.color565(150,100,0), (d.ok||d.back)!=0);
-
-  } else {
-    // ── Layout C: full nav (5 rows, 3 cols + 4-button row) ───
-    int rH = areaH / 5;
-    int cW = (areaW - pad*4) / 3;  // column width
-    int c1 = pad, c2 = pad*2+cW, c3 = pad*3+cW*2;
-
-    // Row 0: POWER full-width
-    irDrawBtn(pad, areaY, areaW-pad*2, rH-pad, "POWER", display.color565(180,30,30));
-    // Row 1: VOL+ | ↑UP | CH+
-    irDrawBtn(c1, areaY+rH,   cW, rH-pad, "VOL +", display.color565(20,100,200));
-    irDrawBtn(c2, areaY+rH,   cW, rH-pad, "UP",    display.color565(120,100,30));
-    irDrawBtn(c3, areaY+rH,   cW, rH-pad, "CH +",  display.color565(0,110,60));
-    // Row 2: ←LEFT | OK | RIGHT→
-    irDrawBtn(c1, areaY+2*rH, cW, rH-pad, "LEFT",  display.color565(120,100,30));
-    irDrawBtn(c2, areaY+2*rH, cW, rH-pad, "OK",    display.color565(200,150,0), d.ok!=0);
-    irDrawBtn(c3, areaY+2*rH, cW, rH-pad, "RIGHT", display.color565(120,100,30));
-    // Row 3: VOL- | ↓DOWN | CH-
-    irDrawBtn(c1, areaY+3*rH, cW, rH-pad, "VOL -", display.color565(20,100,200));
-    irDrawBtn(c2, areaY+3*rH, cW, rH-pad, "DOWN",  display.color565(120,100,30));
-    irDrawBtn(c3, areaY+3*rH, cW, rH-pad, "CH -",  display.color565(0,110,60));
-    // Row 4: MUTE | INPUT | MENU | BACK (4 equal mini-buttons)
-    int q = (areaW - pad*5) / 4;
-    struct { const char* lbl; uint32_t code; uint16_t col; } r4[4] = {
-      {"MUTE",  d.mute,  display.color565(100,80,0)},
-      {"INPUT", d.input, display.color565(60,120,60)},
-      {"MENU",  d.menu,  display.color565(80,80,150)},
-      {"BACK",  d.back,  display.color565(150,60,60)},
-    };
-    for (int k = 0; k < 4; k++)
-      irDrawBtn(pad + k*(q+pad), areaY+4*rH, q, rH-pad, r4[k].lbl, r4[k].col, r4[k].code!=0);
+  if (totalRows > visRows) {
+    int barH = max(6, areaH * visRows / totalRows);
+    int barY = areaY + (areaH - barH) * irBtnPageOff / max(1, totalRows - visRows);
+    statusSprite.fillRect(sw-3, areaY, 2, areaH, display.color565(20,20,20));
+    statusSprite.fillRect(sw-3, barY,  2, barH,  display.color565(180,70,0));
   }
 
-  // Hint
+  uint16_t btnCol = display.color565(150,70,10);
+  for (int row = irBtnPageOff; row < irBtnPageOff + visRows && row < totalRows; row++) {
+    int rowY = areaY + (row - irBtnPageOff) * (btnH + pad);
+    for (int col = 0; col < cols; col++) {
+      int idx = row * cols + col;
+      if (idx >= irBtnCount) break;
+      int bx = pad + col * (btnW + pad);
+      irDrawBtn(bx, rowY, btnW, btnH, irBtns[idx].label, btnCol);
+    }
+  }
+
   statusSprite.setTextDatum(BL_DATUM);
   statusSprite.setTextSize(1);
   statusSprite.setTextColor(display.color565(30,15,0));
@@ -5934,12 +6004,8 @@ static void renderIRRemote() {
 }
 
 void renderIR() {
-  switch (irLevel) {
-    case IR_LEVEL_BRAND:  renderIRBrandList();  break;
-    case IR_LEVEL_TYPE:   renderIRTypeList();   break;
-    case IR_LEVEL_DEVICE: renderIRDeviceList(); break;
-    case IR_LEVEL_REMOTE: renderIRRemote();     break;
-  }
+  if (irLevel == IR_LEVEL_LIST) renderIRDir();
+  else                          renderIRRemote();
 }
 
 // ================================================================
