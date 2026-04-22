@@ -807,6 +807,19 @@ void loadConfig() {
   strlcpy(targetIpAddress, doc["robot_ip"] | "192.168.1.27",  sizeof(targetIpAddress));
 }
 
+void saveConfig() {
+  JsonDocument doc;
+  doc["wifi_ssid"]  = wifiUserSsid;
+  doc["wifi_pass"]  = wifiUserPass;
+  doc["ntp_server"] = ntpServer;
+  doc["gmt_offset"] = gmtOffset_sec;
+  doc["dst_offset"] = daylightOffset_sec;
+  doc["udp_port"]   = udpPort;
+  doc["robot_ip"]   = targetIpAddress;
+  File f = LittleFS.open("/config.json", "w");
+  if (f) { serializeJson(doc, f); f.close(); }
+}
+
 // Forward declarations for filesystem manager
 void serialHandleFS(const char* arg);
 
@@ -3539,6 +3552,62 @@ static void webFMUploadHandler() {
   }
 }
 
+static void webFMHandleGetSettings() {
+  JsonDocument doc;
+  doc["wifi_ssid"]     = wifiUserSsid;
+  doc["wifi_pass"]     = wifiUserPass;
+  doc["ntp_server"]    = ntpServer;
+  doc["gmt_offset"]    = (int)(gmtOffset_sec / 3600);
+  doc["dst_offset"]    = daylightOffset_sec;
+  doc["robot_ip"]      = targetIpAddress;
+  doc["udp_port"]      = udpPort;
+  doc["dim_timeout"]   = dimTimeoutIdx;
+  doc["sleep_timeout"] = sleepTimeoutIdx;
+  doc["low_bat"]       = lowBatIdx;
+  doc["ui_click"]      = uiClickEnabled;
+  String json; serializeJson(doc, json);
+  webFMJson(200, json.c_str());
+}
+
+static void webFMHandlePostSettings() {
+  String body = webFM.arg("plain");
+  JsonDocument doc;
+  if (deserializeJson(doc, body)) {
+    webFMJson(400, "{\"error\":\"Invalid JSON\"}");
+    return;
+  }
+  strlcpy(wifiUserSsid,    doc["wifi_ssid"]  | wifiUserSsid,    sizeof(wifiUserSsid));
+  strlcpy(wifiUserPass,    doc["wifi_pass"]  | wifiUserPass,    sizeof(wifiUserPass));
+  strlcpy(ntpServer,       doc["ntp_server"] | ntpServer,       sizeof(ntpServer));
+  int gmtH       = doc["gmt_offset"]  | (int)(gmtOffset_sec / 3600);
+  gmtOffset_sec  = (long)(gmtH * 3600);
+  daylightOffset_sec = doc["dst_offset"]  | daylightOffset_sec;
+  strlcpy(targetIpAddress, doc["robot_ip"]  | targetIpAddress,  sizeof(targetIpAddress));
+  udpPort        = doc["udp_port"]    | udpPort;
+  dimTimeoutIdx  = constrain((int)(doc["dim_timeout"]   | dimTimeoutIdx),   0, 3);
+  sleepTimeoutIdx= constrain((int)(doc["sleep_timeout"] | sleepTimeoutIdx), 0, 3);
+  lowBatIdx      = constrain((int)(doc["low_bat"]       | lowBatIdx),       0, 2);
+  uiClickEnabled =           doc["ui_click"]  | uiClickEnabled;
+  saveSettings();
+  saveConfig();
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  webFMJson(200, "{\"ok\":true}");
+}
+
+static void webFMHandleSysInfo() {
+  JsonDocument doc;
+  doc["ip"]          = WiFi.localIP().toString();
+  doc["wifi_ssid"]   = (wifiUserSsid[0] != '\0') ? wifiUserSsid : secretSsid;
+  doc["wifi_rssi"]   = WiFi.RSSI();
+  doc["battery_v"]   = batteryVoltage;
+  doc["battery_pct"] = (int)voltagePercent;
+  doc["uptime_s"]    = (unsigned long)(millis() / 1000);
+  doc["fs_total"]    = (unsigned long)LittleFS.totalBytes();
+  doc["fs_used"]     = (unsigned long)LittleFS.usedBytes();
+  String json; serializeJson(doc, json);
+  webFMJson(200, json.c_str());
+}
+
 void webFMStart() {
   if (webFMRunning) return;
   webFM.on("/",           HTTP_GET,  webFMHandleRoot);
@@ -3551,6 +3620,9 @@ void webFMStart() {
     []() { webFMJson(webFMUploadOk ? 200 : 500,
                      webFMUploadOk ? "{\"ok\":true}" : "{\"error\":\"Open failed\"}"); },
     webFMUploadHandler);
+  webFM.on("/api/settings", HTTP_GET,  webFMHandleGetSettings);
+  webFM.on("/api/settings", HTTP_POST, webFMHandlePostSettings);
+  webFM.on("/api/sysinfo",  HTTP_GET,  webFMHandleSysInfo);
   webFM.begin();
   webFMRunning = true;
   char buf[64];

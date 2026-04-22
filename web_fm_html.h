@@ -15,8 +15,8 @@ nav{margin:4px 0 10px;color:#6b7280}
 nav a{color:#38bdf8;text-decoration:none;cursor:pointer}
 nav a:hover{text-decoration:underline}
 .bar{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:8px}
-input{background:#1f2937;border:1px solid #374151;color:#d1d5db;padding:3px 7px;font:13px monospace;border-radius:3px;outline:none}
-input:focus{border-color:#38bdf8}
+input,select{background:#1f2937;border:1px solid #374151;color:#d1d5db;padding:3px 7px;font:13px monospace;border-radius:3px;outline:none}
+input:focus,select:focus{border-color:#38bdf8}
 button{background:#1f2937;border:1px solid #374151;color:#d1d5db;padding:3px 10px;cursor:pointer;font:13px monospace;border-radius:3px}
 button:hover{border-color:#38bdf8;color:#38bdf8}
 table{width:100%;border-collapse:collapse}
@@ -32,6 +32,18 @@ tr.sel td{background:#1e293b}
 .del:hover{color:#fca5a5!important}
 .st{color:#6b7280;font-size:11px;margin:6px 0;min-height:15px}
 .err{color:#f87171}
+#sp{display:none;background:#0f172a;border:1px solid #1e293b;border-radius:4px;padding:12px;margin-bottom:10px}
+.sph{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
+.sph h3{margin:0;color:#38bdf8;font-size:14px}
+.sg{margin-bottom:12px}
+.sg h4{margin:0 0 6px;color:#94a3b8;font-size:11px;text-transform:uppercase;letter-spacing:.05em;border-bottom:1px solid #1e293b;padding-bottom:4px}
+.sr{display:flex;align-items:center;gap:8px;margin-bottom:5px}
+.sr label{min-width:120px;color:#9ca3af;font-size:12px}
+.sr input,.sr select{flex:1;max-width:220px}
+#si{background:#0a0f1a;border:1px solid #1e293b;border-radius:3px;padding:7px 10px;font-size:12px;margin-bottom:12px;line-height:1.8}
+.sik{color:#6b7280}
+.siv{color:#e2e8f0}
+.snote{color:#6b7280;font-size:11px;margin-top:4px}
 </style>
 </head>
 <body>
@@ -48,6 +60,60 @@ tr.sel td{background:#1e293b}
   <span style="color:#374151">|</span>
   <input id="pb" placeholder="/irdb/..." style="width:180px">
   <button onclick="go(document.getElementById('pb').value)">Go</button>
+  <span style="color:#374151">|</span>
+  <button id="stb" onclick="toggleSettings()">&#9881; Device</button>
+</div>
+<div id="sp">
+  <div class="sph">
+    <h3>&#9881; Device Settings</h3>
+    <button onclick="toggleSettings()">&#10005;</button>
+  </div>
+  <div id="si">Loading...</div>
+  <div class="sg">
+    <h4>WiFi</h4>
+    <div class="sr"><label>SSID</label><input id="s_wifi_ssid" placeholder="SSID"></div>
+    <div class="sr"><label>Password</label><input id="s_wifi_pass" placeholder="password"></div>
+    <p class="snote">WiFi changes take effect on reboot.</p>
+  </div>
+  <div class="sg">
+    <h4>Network &amp; Time</h4>
+    <div class="sr"><label>NTP Server</label><input id="s_ntp_server" placeholder="pool.ntp.org"></div>
+    <div class="sr"><label>UTC Offset (h)</label><input id="s_gmt_offset" type="number" min="-12" max="14" style="max-width:80px"></div>
+    <div class="sr"><label>DST Offset (s)</label><input id="s_dst_offset" type="number" style="max-width:80px"></div>
+  </div>
+  <div class="sg">
+    <h4>Robot UDP</h4>
+    <div class="sr"><label>Robot IP</label><input id="s_robot_ip" placeholder="192.168.1.27"></div>
+    <div class="sr"><label>UDP Port</label><input id="s_udp_port" type="number" style="max-width:80px"></div>
+  </div>
+  <div class="sg">
+    <h4>Power</h4>
+    <div class="sr"><label>Dim Timeout</label>
+      <select id="s_dim">
+        <option value="0">30s</option><option value="1">60s</option>
+        <option value="2">2min</option><option value="3">OFF</option>
+      </select>
+    </div>
+    <div class="sr"><label>Sleep Timeout</label>
+      <select id="s_sleep">
+        <option value="0">2min</option><option value="1">5min</option>
+        <option value="2">10min</option><option value="3">OFF</option>
+      </select>
+    </div>
+    <div class="sr"><label>Low Battery</label>
+      <select id="s_lowbat">
+        <option value="0">5%</option><option value="1">10%</option>
+        <option value="2">OFF</option>
+      </select>
+    </div>
+    <div class="sr"><label>UI Clicks</label>
+      <select id="s_click"><option value="1">ON</option><option value="0">OFF</option></select>
+    </div>
+  </div>
+  <div style="display:flex;gap:8px;align-items:center">
+    <button onclick="saveDevSettings()" style="background:#1e3a5f;border-color:#38bdf8;color:#38bdf8">Save</button>
+    <span id="sst" class="st" style="margin:0"></span>
+  </div>
 </div>
 <div class="st" id="st"></div>
 <table>
@@ -129,6 +195,69 @@ function doUpload(){
       if(d.ok)next();else st(d.error,1);
     }).catch(function(e){st(''+e,1);});
   })();
+}
+var siTimer=null;
+function toggleSettings(){
+  var p=$('sp');
+  if(p.style.display==='none'||!p.style.display){
+    p.style.display='block';
+    loadDevSettings();
+    loadSysInfo();
+    if(siTimer)clearInterval(siTimer);
+    siTimer=setInterval(loadSysInfo,5000);
+  }else{
+    p.style.display='none';
+    if(siTimer){clearInterval(siTimer);siTimer=null;}
+  }
+}
+function loadDevSettings(){
+  fetch('/api/settings').then(function(r){return r.json();}).then(function(d){
+    $('s_wifi_ssid').value=d.wifi_ssid||'';
+    $('s_wifi_pass').value=d.wifi_pass||'';
+    $('s_ntp_server').value=d.ntp_server||'';
+    $('s_gmt_offset').value=d.gmt_offset||0;
+    $('s_dst_offset').value=d.dst_offset||0;
+    $('s_robot_ip').value=d.robot_ip||'';
+    $('s_udp_port').value=d.udp_port||8889;
+    $('s_dim').value=d.dim_timeout||0;
+    $('s_sleep').value=d.sleep_timeout||0;
+    $('s_lowbat').value=d.low_bat||0;
+    $('s_click').value=d.ui_click?'1':'0';
+  }).catch(function(e){$('sst').textContent='Load failed: '+e;$('sst').className='st err';});
+}
+function loadSysInfo(){
+  fetch('/api/sysinfo').then(function(r){return r.json();}).then(function(d){
+    var up=d.uptime_s,uph=Math.floor(up/3600),upm=Math.floor((up%3600)/60),ups=up%60;
+    var upt=(uph?uph+'h ':'')+(upm?upm+'m ':'')+ups+'s';
+    $('si').innerHTML=
+      '<span class="sik">IP </span><span class="siv">'+he(d.ip)+'</span>&nbsp;&nbsp;'+
+      '<span class="sik">WiFi </span><span class="siv">'+he(d.wifi_ssid)+'&nbsp;'+d.wifi_rssi+'dBm</span>&nbsp;&nbsp;'+
+      '<span class="sik">Bat </span><span class="siv">'+d.battery_v.toFixed(2)+'V&nbsp;'+d.battery_pct+'%</span>&nbsp;&nbsp;'+
+      '<span class="sik">FS </span><span class="siv">'+sz(d.fs_used)+' / '+sz(d.fs_total)+'</span>&nbsp;&nbsp;'+
+      '<span class="sik">Up </span><span class="siv">'+upt+'</span>';
+  }).catch(function(){});
+}
+function saveDevSettings(){
+  var payload={
+    wifi_ssid:$('s_wifi_ssid').value,
+    wifi_pass:$('s_wifi_pass').value,
+    ntp_server:$('s_ntp_server').value,
+    gmt_offset:parseInt($('s_gmt_offset').value)||0,
+    dst_offset:parseInt($('s_dst_offset').value)||0,
+    robot_ip:$('s_robot_ip').value,
+    udp_port:parseInt($('s_udp_port').value)||8889,
+    dim_timeout:parseInt($('s_dim').value),
+    sleep_timeout:parseInt($('s_sleep').value),
+    low_bat:parseInt($('s_lowbat').value),
+    ui_click:$('s_click').value==='1'
+  };
+  $('sst').textContent='Saving...';$('sst').className='st';
+  fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)})
+    .then(function(r){return r.json();})
+    .then(function(d){
+      if(d.ok){$('sst').textContent='Saved.';$('sst').className='st';}
+      else{$('sst').textContent=d.error||'Error';$('sst').className='st err';}
+    }).catch(function(e){$('sst').textContent=''+e;$('sst').className='st err';});
 }
 load();
 </script>
