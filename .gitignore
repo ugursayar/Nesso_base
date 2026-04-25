@@ -12,6 +12,9 @@ build_temp/
 *.bin
 *.map
 
+# Generated IR library — recreate with gen_irdb_all.py (2800+ files, ~9.9 MB)
+data/irdb/
+
 # Python
 __pycache__/
 *.pyc

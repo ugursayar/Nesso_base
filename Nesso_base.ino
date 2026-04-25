@@ -25,14 +25,13 @@
 #include <BLEAdvertising.h>
 #include <Preferences.h>
 #include "esp_sleep.h"
-#define DISABLE_CODE_FOR_RECEIVER
 #include <IRremote.hpp>
 #include <LittleFS.h>
 #include <WebServer.h>
 
 // IR type definitions placed before #include <ArduinoJson.h> so the
 // Arduino preprocessor sees them before inserting auto-generated prototypes.
-#define IR_MAX_FILES   32
+#define IR_MAX_FILES   128
 #define IR_MAX_BUTTONS 48
 #define IR_MAX_RAW_LEN 128
 
@@ -62,6 +61,22 @@ struct IRDirEntry {
   char name[40];
   char path[64];
   bool isDir;
+};
+
+enum BtnType : uint8_t {
+  BT_POWER, BT_MUTE, BT_VOL, BT_CHAN, BT_NAV_OK, BT_NAV_DIR,
+  BT_MEDIA, BT_NUM, BT_SOURCE, BT_GENERIC
+};
+struct IRBtnPos { int16_t x, y, w, h; };
+
+// Captured signal from M5Stack IR Unit (U002) learn session
+struct IRLearnData {
+  IRFileProto proto;
+  uint32_t    address;
+  uint32_t    command;
+  uint16_t    rawData[IR_MAX_RAW_LEN];
+  uint16_t    rawLen;
+  bool        hasDecoded;  // true = proto/address/command are valid
 };
 
 #include <ArduinoJson.h>
@@ -528,6 +543,10 @@ int  lastMediaSubScreen = -1;
 // ----------------------------------------------------------------
 
 #define IR_SEND_PIN IR_TX_PIN   // GPIO 9 — built-in IR blaster on Nesso N1
+// GPIO for M5Stack IR Unit (U002) receiver.
+// Nesso N1 PORT.CUSTOM wiring: G4 = IR_RX (demodulated receive), G5 = IR_TX (transmit).
+#define IR_RECV_PIN 4
+#define IR_UNIT_TX_PIN 5   // M5 IR Unit transmitter — alternative to built-in IR blaster
 
 // ── Flat scan — used by serial commands (ir list / ir send) ──────
 static IRFileEntry irFiles[IR_MAX_FILES];
@@ -552,11 +571,17 @@ static char        irSavedPath[64];   // NVS-persisted path
 enum IRLevel : uint8_t { IR_LEVEL_LIST = 0, IR_LEVEL_REMOTE = 1 };
 IRLevel  irLevel      = IR_LEVEL_LIST;
 int      irListOff    = 0;   // scroll offset — directory list
-int      irBtnPageOff = 0;   // scroll offset — remote button grid
-int      irFlashX     = -1;
-int      irFlashY     = -1;
+int      irBtnPageOff = 0;   // pixel scroll offset — remote button grid
+int      irFlashIdx   = -1;  // index of tapped button for flash highlight
 uint32_t irFlashMs    = 0;
+static IRBtnPos irLayout[IR_MAX_BUTTONS];
+static int16_t  irLayoutH = 0;
 uint32_t irTxMs       = 0;
+
+// ── IR learn mode (M5Stack IR Unit U002) ──────────────────────────
+bool         irLearnMode  = false;   // receiver active, capture in progress
+bool         irLearnReady = false;   // last received signal ready to bind
+IRLearnData  irLearnLast  = {};      // most recently captured signal
 
 // ----------------------------------------------------------------
 // Navigation
@@ -831,6 +856,12 @@ void irOpenDir(const char* path);
 void irLoadDevice(const char* path);
 void irSendButton(int btnIdx);
 void serialHandleIR(const char* arg);
+void irLearnStart();
+void irLearnStop();
+void irLearnPoll();
+static void irCustomNew(const char* name);
+static bool irCustomSave();
+static void irCustomBind(const char* label);
 
 // ================================================================
 // Setup & Loop
@@ -986,6 +1017,7 @@ void loop() {
   }
 
   serialCheckInput();
+  irLearnPoll();
   btProcessPendingEvents();
   checkPowerManagement(msNow);
   renderFunction();
@@ -1441,23 +1473,19 @@ void onTap(int16_t sx, int16_t sy) {
       // ── Level 1: Remote buttons ─────────────────────────────────
       int titleH = isLand ? 22 : 26;
       if (sprite_y < titleH) { irLevel = IR_LEVEL_LIST; return; }
-      int pad   = 3;
-      int areaY = titleH + pad;
-      int cols  = 2;
-      int btnH  = isLand ? 22 : 24;
-      int btnW  = (sw - pad * (cols + 1)) / cols;
-      int visRows = max(1, (sh - areaY - pad) / (btnH + pad));
-      for (int row = irBtnPageOff; row < irBtnPageOff + visRows; row++) {
-        for (int col = 0; col < cols; col++) {
-          int idx = row * cols + col;
-          if (idx >= irBtnCount) break;
-          int bx   = pad + col * (btnW + pad);
-          int rowY = areaY + (row - irBtnPageOff) * (btnH + pad);
-          if (sx >= bx && sx < bx + btnW && sprite_y >= rowY && sprite_y < rowY + btnH) {
-            irFlashX = sx; irFlashY = sprite_y; irFlashMs = millis();
-            irSendButton(idx);
-            return;
+      int areaY = titleH + 3;
+      int contentY = sprite_y - areaY + irBtnPageOff; // position in layout space
+      for (int i = 0; i < irBtnCount; i++) {
+        if (sx >= irLayout[i].x && sx < irLayout[i].x + irLayout[i].w &&
+            contentY >= irLayout[i].y && contentY < irLayout[i].y + irLayout[i].h) {
+          irFlashIdx = i; irFlashMs = millis();
+          if (irLearnMode && irLearnReady) {
+            // Learn mode: tap binds the captured signal to this button
+            irCustomBind(irBtns[i].label);
+          } else {
+            irSendButton(i);
           }
+          return;
         }
       }
     }
@@ -1575,13 +1603,10 @@ void onSwipe(int16_t dx, int16_t dy) {
         else        irListOff = max(irListOff - 1, 0);
       } else if (irLevel == IR_LEVEL_REMOTE) {
         bool isLandScroll = statusSprite.width() > statusSprite.height();
-        int btnH = isLandScroll ? 22 : 24;
         int titleH = isLandScroll ? 22 : 26;
-        int areaH = statusSprite.height() - titleH - 6;
-        int visRows = max(1, areaH / (btnH + 3));
-        int totalRows = (irBtnCount + 1) / 2;
-        if (dy < 0) irBtnPageOff = min(irBtnPageOff + 1, max(0, totalRows - visRows));
-        else        irBtnPageOff = max(irBtnPageOff - 1, 0);
+        int areaH  = statusSprite.height() - titleH - 5;
+        int maxOff = max(0, (int)irLayoutH - areaH);
+        irBtnPageOff = constrain(irBtnPageOff - dy * 8, 0, maxOff);
       }
     }
   }
@@ -1845,11 +1870,19 @@ static void printHelpFS() {
 
 static void printHelpIR() {
   serialWritelnAll("IR Remote:");
-  serialWritelnAll("  ir list               list all .ir files in /irdb/ (with index)");
-  serialWritelnAll("  ir select <N>         load device N and open remote UI");
-  serialWritelnAll("  ir send <N> <label>   send one button from device N");
-  serialWritelnAll("  ir reload             re-scan /irdb/ for new files");
-  serialWritelnAll("  ir pin                show IR blaster pin");
+  serialWritelnAll("  ir list                       list all .ir files in /irdb/");
+  serialWritelnAll("  ir select <N>                 load device N and open remote UI");
+  serialWritelnAll("  ir send <N> <label>           send one button from device N");
+  serialWritelnAll("  ir reload                     re-scan /irdb/ for new files");
+  serialWritelnAll("  ir pin                        show IR blaster GPIO");
+  serialWritelnAll("  ir custom new [name]          create new custom remote");
+  serialWritelnAll("  ir custom list                list custom remotes");
+  serialWritelnAll("  ir learn start                start M5 IR Unit capture mode");
+  serialWritelnAll("  ir learn stop                 stop capture mode");
+  serialWritelnAll("  ir learn bind <label>         bind last capture to button label");
+  serialWritelnAll("  ir learn show                 print last captured signal");
+  serialWritelnAll("  -- to add buttons to existing custom remote: --");
+  serialWritelnAll("  ir select <N>  +  ir learn start  +  ir learn bind <label>");
 }
 
 static void printHelpMusic() {
@@ -2174,8 +2207,86 @@ void serialHandleIR(const char* arg) {
     char buf[64]; snprintf(buf, sizeof(buf), "Selected: %s", irLoadedName);
     serialWritelnAll(buf);
   } else if (cmdIs(arg,"pin")) {
-    char buf[48]; snprintf(buf, sizeof(buf), "IR blaster: GPIO %d (IR_TX_PIN).", IR_SEND_PIN);
+    char buf[80];
+    snprintf(buf, sizeof(buf),
+      "Built-in TX: GPIO %d  |  M5 Unit RX (G4): GPIO %d  |  M5 Unit TX (G5): GPIO %d",
+      IR_SEND_PIN, IR_RECV_PIN, IR_UNIT_TX_PIN);
     serialWritelnAll(buf);
+  } else if (cmdIs(arg,"custom")) {
+    const char* sub = cmdArg(arg, "custom");
+    if (cmdIs(sub, "new")) {
+      const char* name = cmdArg(sub, "new");
+      if (!*name) {
+        // Auto-number: find next available Custom_N
+        char autoName[32];
+        int n = 1;
+        do {
+          snprintf(autoName, sizeof(autoName), "Custom_%d", n++);
+          char tryPath[80];
+          snprintf(tryPath, sizeof(tryPath), "/irdb/Custom/%s.ir", autoName);
+          if (!LittleFS.exists(tryPath)) break;
+        } while (n < 100);
+        irCustomNew(autoName);
+      } else {
+        irCustomNew(name);
+      }
+    } else if (cmdIs(sub, "list")) {
+      File dir = LittleFS.open("/irdb/Custom");
+      if (!dir || !dir.isDirectory()) {
+        serialWritelnAll("No custom remotes found.");
+      } else {
+        int cnt = 0;
+        File entry;
+        while ((entry = dir.openNextFile())) {
+          String n = entry.name();
+          entry.close();
+          if (n.endsWith(".ir") || n.endsWith(".IR")) {
+            serialWritelnAll(n.c_str());
+            cnt++;
+          }
+        }
+        if (cnt == 0) serialWritelnAll("No custom remotes found.");
+      }
+    } else {
+      serialWritelnAll("Usage: ir custom new [name] | ir custom list");
+    }
+  } else if (cmdIs(arg,"learn")) {
+    const char* sub = cmdArg(arg, "learn");
+    if (cmdIs(sub, "start")) {
+      irLearnStart();
+    } else if (cmdIs(sub, "stop")) {
+      irLearnStop();
+    } else if (cmdIs(sub, "bind")) {
+      const char* lbl = cmdArg(sub, "bind");
+      if (!*lbl) { serialWritelnAll("Usage: ir learn bind <label>"); return; }
+      irCustomBind(lbl);
+    } else if (cmdIs(sub, "show")) {
+      if (!irLearnReady) { serialWritelnAll("No signal learned yet."); return; }
+      char buf[120];
+      if (irLearnLast.hasDecoded) {
+        const char* pname = "PARSED";
+        switch (irLearnLast.proto) {
+          case IRP_NEC:     pname="NEC";       break;
+          case IRP_SAMSUNG: pname="SAMSUNG32"; break;
+          case IRP_SIRC12:  pname="SIRC12";    break;
+          case IRP_SIRC15:  pname="SIRC15";    break;
+          case IRP_SIRC20:  pname="SIRC20";    break;
+          case IRP_RC5:     pname="RC5";        break;
+          case IRP_RC6:     pname="RC6";        break;
+          case IRP_LG:      pname="LG";         break;
+          case IRP_JVC:     pname="JVC";        break;
+          default: break;
+        }
+        snprintf(buf, sizeof(buf), "Proto:%s  addr:0x%08lX  cmd:0x%08lX  raw:%d ticks",
+                 pname, (unsigned long)irLearnLast.address,
+                 (unsigned long)irLearnLast.command, irLearnLast.rawLen);
+      } else {
+        snprintf(buf, sizeof(buf), "Proto:RAW  ticks:%d", irLearnLast.rawLen);
+      }
+      serialWritelnAll(buf);
+    } else {
+      serialWritelnAll("Usage: ir learn start | stop | bind <label> | show");
+    }
   } else {
     serialWritelnAll("Unknown ir subcommand. Type 'help'.");
   }
@@ -5878,6 +5989,9 @@ void irLoadDevice(const char* path) {
     }
   }
   f.close();
+  // Pre-compute button layout for the current sprite orientation
+  bool isLand = statusSprite.width() > statusSprite.height();
+  irBuildLayout(statusSprite.width(), isLand);
 }
 
 void irSendButton(int btnIdx) {
@@ -5907,6 +6021,269 @@ void irSendButton(int btnIdx) {
   }
 }
 
+// ── M5Stack IR Unit (U002) learn / custom remote ─────────────────
+
+void irLearnStart() {
+  if (irLearnMode) { serialWritelnAll("Learn mode already active."); return; }
+  // Power up the GROVE port so the M5 IR Unit receives 5V
+  pinMode(GROVE_POWER_EN, OUTPUT);
+  digitalWrite(GROVE_POWER_EN, HIGH);
+  delay(80);  // let unit stabilise before arming the ISR
+  IrReceiver.begin(IR_RECV_PIN, false);
+  irLearnMode  = true;
+  irLearnReady = false;
+  serialWritelnAll("IR learn mode ON — point any remote at the M5 IR Unit and press a button.");
+  serialWritelnAll("  Then: ir learn bind <label>  (or tap a button in the UI to rebind it).");
+}
+
+void irLearnStop() {
+  if (!irLearnMode) { serialWritelnAll("Learn mode not active."); return; }
+  IrReceiver.stop();
+  digitalWrite(GROVE_POWER_EN, LOW);  // cut GROVE power — unit no longer needed
+  irLearnMode  = false;
+  irLearnReady = false;
+  serialWritelnAll("IR learn mode OFF.");
+}
+
+void irLearnPoll() {
+  if (!irLearnMode) return;
+  if (!IrReceiver.decode()) return;
+
+  auto& d = IrReceiver.decodedIRData;
+  memset(&irLearnLast, 0, sizeof(irLearnLast));
+
+  // Try to decode to a known protocol
+  if (d.protocol != UNKNOWN) {
+    irLearnLast.hasDecoded = true;
+    irLearnLast.address    = d.address;
+    irLearnLast.command    = d.command;
+    switch (d.protocol) {
+      case NEC:     irLearnLast.proto = IRP_NEC;     break;
+      case SAMSUNG: irLearnLast.proto = IRP_SAMSUNG; break;
+      case SONY:
+        if      (d.numberOfBits == 12) irLearnLast.proto = IRP_SIRC12;
+        else if (d.numberOfBits == 15) irLearnLast.proto = IRP_SIRC15;
+        else                           irLearnLast.proto = IRP_SIRC20;
+        break;
+      case RC5:     irLearnLast.proto = IRP_RC5;     break;
+      case RC6:     irLearnLast.proto = IRP_RC6;     break;
+      case JVC:     irLearnLast.proto = IRP_JVC;     break;
+      case LG:      irLearnLast.proto = IRP_LG;      break;
+      default:      irLearnLast.hasDecoded = false;  break;
+    }
+  }
+
+  // Always capture raw timings as fallback (read rawbuf BEFORE resume())
+  irLearnLast.rawLen = 0;
+  {
+    uint16_t rlen = d.rawlen;
+    for (uint16_t i = 1; i < rlen && irLearnLast.rawLen < IR_MAX_RAW_LEN; i++) {
+      uint32_t us = (uint32_t)IrReceiver.irparams.rawbuf[i] * MICROS_PER_TICK;
+      if (us > 15000) break;
+      irLearnLast.rawData[irLearnLast.rawLen++] = (uint16_t)us;
+    }
+  }
+
+  IrReceiver.resume();
+  irLearnReady = true;
+
+  char buf[100];
+  if (irLearnLast.hasDecoded) {
+    const char* pname = "PARSED";
+    switch (irLearnLast.proto) {
+      case IRP_NEC:     pname="NEC";       break;
+      case IRP_SAMSUNG: pname="SAMSUNG32"; break;
+      case IRP_SIRC12:  pname="SIRC12";    break;
+      case IRP_SIRC15:  pname="SIRC15";    break;
+      case IRP_SIRC20:  pname="SIRC20";    break;
+      case IRP_RC5:     pname="RC5";       break;
+      case IRP_RC6:     pname="RC6";       break;
+      case IRP_LG:      pname="LG";        break;
+      case IRP_JVC:     pname="JVC";       break;
+      default: break;
+    }
+    snprintf(buf, sizeof(buf), "Captured: %s  addr=0x%04lX  cmd=0x%04lX",
+             pname, (unsigned long)irLearnLast.address, (unsigned long)irLearnLast.command);
+  } else {
+    snprintf(buf, sizeof(buf), "Captured: RAW  %d ticks", irLearnLast.rawLen);
+  }
+  serialWritelnAll(buf);
+  serialWritelnAll("  -> tap a button in the UI, or: ir learn bind <label>");
+}
+
+static bool irCustomSave() {
+  if (!irLoadedPath[0]) return false;
+  File f = LittleFS.open(irLoadedPath, "w");
+  if (!f) { serialWritelnAll("ERROR: cannot write file."); return false; }
+
+  f.print("Filetype: IR signals file\nVersion: 1\n");
+  for (int i = 0; i < irBtnCount; i++) {
+    IRButton& b = irBtns[i];
+    if (!b.label[0]) continue;
+    f.print("#\nname: "); f.print(b.label); f.print("\n");
+    if (b.proto == IRP_RAW) {
+      f.print("type: raw\nfrequency: 38000\ndata:");
+      for (int j = 0; j < b.rawLen; j++) { f.print(" "); f.print(b.rawData[j]); }
+      f.print("\n");
+    } else {
+      const char* pname = "NEC";
+      switch (b.proto) {
+        case IRP_SAMSUNG: pname="SAMSUNG32"; break;
+        case IRP_SIRC12:  pname="SIRC12";    break;
+        case IRP_SIRC15:  pname="SIRC15";    break;
+        case IRP_SIRC20:  pname="SIRC20";    break;
+        case IRP_RC5:     pname="RC5";       break;
+        case IRP_RC6:     pname="RC6";       break;
+        case IRP_LG:      pname="LG";        break;
+        case IRP_JVC:     pname="JVC";       break;
+        default: break;
+      }
+      f.print("type: parsed\nprotocol: "); f.print(pname); f.print("\n");
+      char h[24];
+      snprintf(h,sizeof(h),"%02X %02X %02X %02X",
+        (uint8_t)b.address,(uint8_t)(b.address>>8),
+        (uint8_t)(b.address>>16),(uint8_t)(b.address>>24));
+      f.print("address: "); f.print(h); f.print("\n");
+      snprintf(h,sizeof(h),"%02X %02X %02X %02X",
+        (uint8_t)b.command,(uint8_t)(b.command>>8),
+        (uint8_t)(b.command>>16),(uint8_t)(b.command>>24));
+      f.print("command: "); f.print(h); f.print("\n");
+    }
+  }
+  f.close();
+  return true;
+}
+
+static void irCustomNew(const char* name) {
+  // Sanitise name: alphanumeric + _ + -
+  char safe[40]; int j = 0;
+  for (int i = 0; name[i] && j < 38; i++) {
+    char c = name[i];
+    if (c == ' ') c = '_';
+    if (isalnum((uint8_t)c) || c == '_' || c == '-') safe[j++] = c;
+  }
+  if (j == 0) { strcpy(safe, "Custom"); j = 6; }
+  safe[j] = '\0';
+
+  LittleFS.mkdir("/irdb/Custom");
+  char path[80];
+  snprintf(path, sizeof(path), "/irdb/Custom/%s.ir", safe);
+
+  if (!LittleFS.exists(path)) {
+    File f = LittleFS.open(path, "w");
+    if (!f) { serialWritelnAll("ERROR: cannot create file."); return; }
+    f.print("Filetype: IR signals file\nVersion: 1\n");
+    f.close();
+  }
+
+  irScanFiles();
+  irOpenDir("/irdb/Custom");
+  irLoadDevice(path);
+  strlcpy(irSavedPath, path, sizeof(irSavedPath));
+  saveSettings();
+  if (currentFunction == FUNCTION_IR) irLevel = IR_LEVEL_REMOTE;
+
+  char msg[80];
+  snprintf(msg, sizeof(msg), "Custom remote '%s' ready  (%d buttons).", safe, irBtnCount);
+  serialWritelnAll(msg);
+  if (irBtnCount == 0)
+    serialWritelnAll("  Start: ir learn start  then press remote buttons, then: ir learn bind <label>");
+}
+
+static bool irIsCustomFile() {
+  return strncmp(irLoadedPath, "/irdb/Custom/", 13) == 0;
+}
+
+static void irCustomBind(const char* label) {
+  if (!irLearnReady) {
+    serialWritelnAll("No signal captured yet — use 'ir learn start' and press a button.");
+    return;
+  }
+  if (!irLoadedPath[0]) {
+    serialWritelnAll("No device loaded — use 'ir custom new <name>' or 'ir select <N>' to load a custom remote.");
+    return;
+  }
+  if (!irIsCustomFile()) {
+    serialWritelnAll("Cannot bind to a library file.");
+    serialWritelnAll("  Load a custom remote first:  ir select <N>  (check 'ir custom list' for names)");
+    serialWritelnAll("  Or create a new one:          ir custom new <name>");
+    return;
+  }
+
+  // Check for duplicate decoded signal on a different button
+  int dupIdx = -1;
+  if (irLearnLast.hasDecoded) {
+    for (int i = 0; i < irBtnCount; i++) {
+      if (irBtns[i].proto   == irLearnLast.proto   &&
+          irBtns[i].address == irLearnLast.address  &&
+          irBtns[i].command == irLearnLast.command) {
+        dupIdx = i; break;
+      }
+    }
+  }
+
+  // Find existing button with the same label
+  int lblIdx = -1;
+  for (int i = 0; i < irBtnCount; i++) {
+    if (!strcasecmp(irBtns[i].label, label)) { lblIdx = i; break; }
+  }
+
+  if (dupIdx >= 0 && dupIdx != lblIdx) {
+    // Same code already on a different button — rename that one
+    char msg[80];
+    snprintf(msg, sizeof(msg), "Overwriting duplicate on '%s' -> '%s'",
+             irBtns[dupIdx].label, label);
+    serialWritelnAll(msg);
+    strlcpy(irBtns[dupIdx].label, label, sizeof(irBtns[dupIdx].label));
+    // Remove stale button that had the same label (if any)
+    if (lblIdx >= 0 && lblIdx != dupIdx) {
+      for (int i = lblIdx; i < irBtnCount - 1; i++) irBtns[i] = irBtns[i+1];
+      irBtnCount--;
+    }
+    irCustomSave();
+    irLoadDevice(irLoadedPath);
+    irLearnReady = false;
+    if (currentFunction == FUNCTION_IR) irLevel = IR_LEVEL_REMOTE;
+    serialWritelnAll("Saved.");
+    return;
+  }
+
+  // Slot: reuse existing label slot or add new
+  int target;
+  if (lblIdx >= 0) {
+    target = lblIdx;
+  } else if (irBtnCount < IR_MAX_BUTTONS) {
+    target = irBtnCount++;
+    memset(&irBtns[target], 0, sizeof(irBtns[target]));
+  } else {
+    serialWritelnAll("ERROR: button list full (IR_MAX_BUTTONS reached).");
+    return;
+  }
+
+  strlcpy(irBtns[target].label, label, sizeof(irBtns[target].label));
+  if (irLearnLast.hasDecoded) {
+    irBtns[target].proto   = irLearnLast.proto;
+    irBtns[target].address = irLearnLast.address;
+    irBtns[target].command = irLearnLast.command;
+    irBtns[target].rawLen  = 0;
+  } else {
+    irBtns[target].proto   = IRP_RAW;
+    irBtns[target].rawFreq = 38000;
+    irBtns[target].rawLen  = irLearnLast.rawLen;
+    memcpy(irBtns[target].rawData, irLearnLast.rawData,
+           irLearnLast.rawLen * sizeof(uint16_t));
+  }
+
+  irCustomSave();
+  irLoadDevice(irLoadedPath);
+  irLearnReady = false;
+  if (currentFunction == FUNCTION_IR) irLevel = IR_LEVEL_REMOTE;
+
+  char msg[80];
+  snprintf(msg, sizeof(msg), "Bound '%s'. Remote now has %d button(s).", label, irBtnCount);
+  serialWritelnAll(msg);
+}
+
 void initIR() {
   IrSender.begin(IR_SEND_PIN);
   display.fillScreen(BG_COLOR);
@@ -5919,6 +6296,251 @@ void initIR() {
   } else {
     irLevel = IR_LEVEL_LIST;
   }
+}
+
+// ── Button classification helpers ────────────────────────────────
+static bool irLblHas(const char* lbl, const char* needle) {
+  for (int i = 0; lbl[i]; i++) {
+    bool m = true;
+    for (int j = 0; needle[j]; j++)
+      if (tolower((uint8_t)lbl[i+j]) != tolower((uint8_t)needle[j])) { m=false; break; }
+    if (m) return true;
+  }
+  return false;
+}
+
+static BtnType irClassBtn(const char* l) {
+  if (irLblHas(l,"pow")||irLblHas(l,"pwr")||irLblHas(l,"standby")) return BT_POWER;
+  if (irLblHas(l,"mute")||irLblHas(l,"silent"))                     return BT_MUTE;
+  if (irLblHas(l,"vol"))                                             return BT_VOL;
+  if (irLblHas(l,"ch+")||irLblHas(l,"ch-")||irLblHas(l,"chan")||
+      irLblHas(l,"prog")||!strcasecmp(l,"p+")||!strcasecmp(l,"p-")) return BT_CHAN;
+  if (!strcasecmp(l,"ok")||!strcasecmp(l,"enter")||
+      irLblHas(l,"select")||irLblHas(l,"confirm"))                   return BT_NAV_OK;
+  if (irLblHas(l,"up")||irLblHas(l,"down")||irLblHas(l,"left")||
+      irLblHas(l,"right")||irLblHas(l,"menu")||irLblHas(l,"home")||
+      !strcasecmp(l,"back")||!strcasecmp(l,"exit"))                  return BT_NAV_DIR;
+  if (irLblHas(l,"play")||irLblHas(l,"pause")||irLblHas(l,"stop")||
+      irLblHas(l,"rewind")||irLblHas(l,"forward")||
+      !strcasecmp(l,"ff")||!strcasecmp(l,"rew")||!strcasecmp(l,"rw")||
+      irLblHas(l,"next")||irLblHas(l,"prev")||irLblHas(l,"skip"))   return BT_MEDIA;
+  if ((l[0]>='0'&&l[0]<='9')&&(l[1]=='\0'||l[1]==' '))             return BT_NUM;
+  if (irLblHas(l,"source")||irLblHas(l,"input")||
+      irLblHas(l,"hdmi")||irLblHas(l,"mode"))                        return BT_SOURCE;
+  return BT_GENERIC;
+}
+
+static uint16_t irBtnEdgeColor(BtnType t) {
+  switch (t) {
+    case BT_POWER:   return display.color565(220, 40, 20);
+    case BT_MUTE:    return display.color565(200, 60, 10);
+    case BT_VOL:     return display.color565(40, 180, 60);
+    case BT_CHAN:     return display.color565(60, 120, 220);
+    case BT_NAV_OK:  return display.color565(20, 190, 150);
+    case BT_NAV_DIR: return display.color565(20, 160, 140);
+    case BT_MEDIA:   return display.color565(200, 150, 20);
+    case BT_NUM:     return display.color565(130, 130, 150);
+    case BT_SOURCE:  return display.color565(160, 80, 200);
+    default:         return display.color565(150, 70, 10);
+  }
+}
+
+static void irBuildLayout(int sw, bool isLand) {
+  const int pad = 3, usableW = sw - pad * 2;
+
+  // Row heights
+  const int hPow  = isLand ? 30 : 36;
+  const int hHalf = isLand ? 26 : 30;
+  const int hMed  = isLand ? 24 : 28;
+  const int hNum  = isLand ? 22 : 26;
+  const int hGen  = isLand ? 24 : 28;
+
+  // Column widths
+  const int wFull  = usableW;
+  const int wHalf  = (usableW - pad) / 2;
+  const int wThird = (usableW - 2*pad) / 3;
+
+  // Groups — scanned in priority order
+  int8_t powerBtns[8];    int powerCnt  = 0;
+  int8_t muteBtns[4];     int muteCnt   = 0;
+  int8_t menuBtns[8];     int menuCnt   = 0;
+  int8_t mediaBtns[16];   int mediaCnt  = 0;
+  int8_t numMap[10];       memset(numMap, -1, sizeof(numMap));
+  int8_t genericBtns[IR_MAX_BUTTONS]; int genericCnt = 0;
+  int8_t volUp = -1, volDn = -1;
+  int8_t chanUp = -1, chanDn = -1;
+  int8_t navUp = -1, navDn = -1, navLeft = -1, navRight = -1, navOK = -1;
+  bool   placed[IR_MAX_BUTTONS]; memset(placed, 0, sizeof(placed));
+
+  for (int i = 0; i < irBtnCount; i++) {
+    const char* l = irBtns[i].label;
+    // Power
+    if (irLblHas(l,"pow")||irLblHas(l,"pwr")||irLblHas(l,"standby")) {
+      if (powerCnt < 8) powerBtns[powerCnt++] = i; placed[i] = true; continue;
+    }
+    // Mute
+    if (irLblHas(l,"mute")||irLblHas(l,"silent")) {
+      if (muteCnt < 4) muteBtns[muteCnt++] = i; placed[i] = true; continue;
+    }
+    // Volume (detect +/-)
+    if (irLblHas(l,"vol")) {
+      bool up = strstr(l,"+") || irLblHas(l,"up") || irLblHas(l,"inc");
+      if (up  && volUp < 0) { volUp = i; placed[i] = true; }
+      if (!up && volDn < 0) { volDn = i; placed[i] = true; }
+      continue;
+    }
+    // Channel (detect +/-)
+    if (irLblHas(l,"ch")||irLblHas(l,"chan")||irLblHas(l,"prog")) {
+      bool up = strstr(l,"+") || irLblHas(l,"up") || !strcasecmp(l,"p+");
+      if (up  && chanUp < 0) { chanUp = i; placed[i] = true; }
+      if (!up && chanDn < 0) { chanDn = i; placed[i] = true; }
+      continue;
+    }
+    // OK / Select
+    if (!strcasecmp(l,"ok")||irLblHas(l,"enter")||irLblHas(l,"select")) {
+      if (navOK < 0) { navOK = i; placed[i] = true; } continue;
+    }
+    // Directional
+    if (irLblHas(l,"up")    && navUp    < 0) { navUp    = i; placed[i]=true; continue; }
+    if ((irLblHas(l,"down")||irLblHas(l,"dn")) && navDn < 0)
+                                               { navDn    = i; placed[i]=true; continue; }
+    if (irLblHas(l,"left")  && navLeft  < 0) { navLeft  = i; placed[i]=true; continue; }
+    if (irLblHas(l,"right") && navRight < 0) { navRight = i; placed[i]=true; continue; }
+    // Menu / Home / Back
+    if (irLblHas(l,"menu")||irLblHas(l,"home")||!strcasecmp(l,"back")||!strcasecmp(l,"exit")) {
+      if (menuCnt < 8) menuBtns[menuCnt++] = i; placed[i] = true; continue;
+    }
+    // Media
+    BtnType t = irClassBtn(l);
+    if (t == BT_MEDIA) {
+      if (mediaCnt < 16) mediaBtns[mediaCnt++] = i; placed[i] = true; continue;
+    }
+    // Numbers 0-9
+    if (t == BT_NUM && l[0] >= '0' && l[0] <= '9' && numMap[l[0]-'0'] < 0) {
+      numMap[l[0]-'0'] = i; placed[i] = true; continue;
+    }
+  }
+  for (int i = 0; i < irBtnCount; i++)
+    if (!placed[i] && genericCnt < IR_MAX_BUTTONS) genericBtns[genericCnt++] = i;
+
+  int curY = pad;
+
+  // Helper: place a single button
+  auto put = [&](int8_t idx, int x, int w, int h) {
+    if (idx >= 0 && idx < irBtnCount)
+      irLayout[idx] = {(int16_t)x, (int16_t)curY, (int16_t)w, (int16_t)h};
+  };
+
+  // ── 1. Power ──────────────────────────────────────────────────────
+  for (int i = 0; i < powerCnt; i++) {
+    put(powerBtns[i], pad, wFull, hPow);
+    curY += hPow + pad;
+  }
+
+  // ── 2. Vol | Chan side-by-side, + on top / - on bottom ───────────
+  bool hasVol = volUp >= 0 || volDn >= 0;
+  bool hasChan = chanUp >= 0 || chanDn >= 0;
+  if (hasVol && hasChan) {
+    put(volUp,  pad,          wHalf, hHalf);
+    put(chanUp, pad+wHalf+pad, wHalf, hHalf);
+    curY += hHalf + pad;
+    put(volDn,  pad,          wHalf, hHalf);
+    put(chanDn, pad+wHalf+pad, wHalf, hHalf);
+    curY += hHalf + pad;
+  } else if (hasVol) {
+    if (volUp >= 0) { put(volUp,  pad, wFull, hHalf); curY += hHalf + pad; }
+    if (volDn >= 0) { put(volDn,  pad, wFull, hHalf); curY += hHalf + pad; }
+  } else if (hasChan) {
+    if (chanUp >= 0) { put(chanUp, pad, wFull, hHalf); curY += hHalf + pad; }
+    if (chanDn >= 0) { put(chanDn, pad, wFull, hHalf); curY += hHalf + pad; }
+  }
+
+  // ── 3. Mute ───────────────────────────────────────────────────────
+  for (int i = 0; i < muteCnt; i += 2) {
+    if (i+1 < muteCnt) {
+      put(muteBtns[i],   pad,          wHalf, hHalf);
+      put(muteBtns[i+1], pad+wHalf+pad, wHalf, hHalf);
+    } else {
+      put(muteBtns[i], pad, wFull, hHalf);
+    }
+    curY += hHalf + pad;
+  }
+
+  // ── 4. D-pad cross  (blank corners, up/ok/dn in centre col) ──────
+  bool hasNav = navUp>=0||navDn>=0||navLeft>=0||navRight>=0||navOK>=0;
+  if (hasNav) {
+    // Top row: only Up (centred)
+    put(navUp,   pad + wThird + pad, wThird, hHalf);
+    curY += hHalf + pad;
+    // Middle row: Left | OK | Right
+    put(navLeft,  pad,                  wThird, hHalf);
+    put(navOK,    pad + wThird + pad,   wThird, hHalf);
+    put(navRight, pad + 2*(wThird+pad), wThird, hHalf);
+    curY += hHalf + pad;
+    // Bottom row: only Down (centred)
+    put(navDn,   pad + wThird + pad, wThird, hHalf);
+    curY += hHalf + pad;
+  }
+
+  // ── 5. Menu / Home / Back ─────────────────────────────────────────
+  for (int i = 0; i < menuCnt; i += 2) {
+    if (i+1 < menuCnt) {
+      put(menuBtns[i],   pad,          wHalf, hHalf);
+      put(menuBtns[i+1], pad+wHalf+pad, wHalf, hHalf);
+    } else {
+      put(menuBtns[i], pad, wFull, hHalf);
+    }
+    curY += hHalf + pad;
+  }
+
+  // ── 6. Media controls (3-per-row) ────────────────────────────────
+  for (int i = 0; i < mediaCnt; ) {
+    int rem = mediaCnt - i;
+    if (rem >= 3) {
+      put(mediaBtns[i],   pad,                  wThird, hMed);
+      put(mediaBtns[i+1], pad+wThird+pad,       wThird, hMed);
+      put(mediaBtns[i+2], pad+2*(wThird+pad),   wThird, hMed);
+      i += 3;
+    } else if (rem == 2) {
+      put(mediaBtns[i],   pad,          wHalf, hMed);
+      put(mediaBtns[i+1], pad+wHalf+pad, wHalf, hMed);
+      i += 2;
+    } else {
+      put(mediaBtns[i], pad, wFull, hMed); i++;
+    }
+    curY += hMed + pad;
+  }
+
+  // ── 7. Numbers (7-8-9 / 4-5-6 / 1-2-3 / 0-centred) ─────────────
+  const int numOrder[10] = {7,8,9, 4,5,6, 1,2,3, 0};
+  for (int r = 0; r < 4; r++) {
+    int base = r * 3;
+    bool hasAny = false;
+    int cnt = (r < 3) ? 3 : 1;
+    for (int j = 0; j < cnt; j++) if (numMap[numOrder[base+j]] >= 0) hasAny = true;
+    if (!hasAny) continue;
+    if (r < 3) {
+      for (int j = 0; j < 3; j++)
+        put(numMap[numOrder[base+j]], pad + j*(wThird+pad), wThird, hNum);
+    } else {
+      // 0 — centred in 3-col grid
+      put(numMap[0], pad + wThird + pad, wThird, hNum);
+    }
+    curY += hNum + pad;
+  }
+
+  // ── 8. Generic (2-per-row) ────────────────────────────────────────
+  for (int i = 0; i < genericCnt; i += 2) {
+    if (i+1 < genericCnt) {
+      put(genericBtns[i],   pad,          wHalf, hGen);
+      put(genericBtns[i+1], pad+wHalf+pad, wHalf, hGen);
+    } else {
+      put(genericBtns[i], pad, wFull, hGen);
+    }
+    curY += hGen + pad;
+  }
+
+  irLayoutH = (int16_t)curY;
 }
 
 // ── Shared: draw a list title bar with optional back arrow ────────
@@ -5940,18 +6562,30 @@ static void irDrawTitle(const char* title, bool showBack, int sw, int titleH, bo
 
 
 // ── Draw one button cell ──────────────────────────────────────────
-static void irDrawBtn(int bx, int by, int bw, int bh, const char* label, uint16_t col) {
-  bool flashing = irFlashMs > 0 && (millis() - irFlashMs) < 200 &&
-                  irFlashX >= bx && irFlashX < bx+bw &&
-                  irFlashY >= by && irFlashY < by+bh;
-  uint16_t bg   = flashing ? display.color565(60,30,5) : display.color565(12,6,0);
-  uint16_t edge = flashing ? display.color565(255,220,100) : col;
-  statusSprite.fillRoundRect(bx, by, bw, bh, 3, bg);
-  statusSprite.drawRoundRect(bx, by, bw, bh, 3, edge);
+static void irDrawBtn(int idx, int bx, int by, int bw, int bh) {
+  const char* label = irBtns[idx].label;
+  BtnType t = irClassBtn(label);
+  bool flashing = (irFlashIdx == idx) && irFlashMs > 0 &&
+                  (millis() - irFlashMs) < 200;
+  uint16_t edge = flashing ? display.color565(255,230,120) : irBtnEdgeColor(t);
+  uint16_t bg;
+  int radius;
+  switch (t) {
+    case BT_POWER:   bg=display.color565(28,4,2);  radius=6; break;
+    case BT_NAV_OK:  bg=display.color565(2,18,14); radius=6; break;
+    case BT_VOL:     bg=display.color565(2,14,4);  radius=4; break;
+    case BT_CHAN:     bg=display.color565(3,8,20);  radius=4; break;
+    case BT_NAV_DIR: bg=display.color565(2,14,12); radius=4; break;
+    case BT_NUM:     bg=display.color565(10,10,12); radius=2; break;
+    default:         bg=display.color565(12,6,0);  radius=4; break;
+  }
+  if (flashing) bg = display.color565(50,28,4);
+  statusSprite.fillRoundRect(bx, by, bw, bh, radius, bg);
+  statusSprite.drawRoundRect(bx, by, bw, bh, radius, edge);
   if (label && *label) {
     statusSprite.setTextDatum(MC_DATUM);
     statusSprite.setTextSize(1);
-    statusSprite.setTextColor(flashing ? display.color565(255,220,100) : col);
+    statusSprite.setTextColor(edge);
     statusSprite.drawString(label, bx+bw/2, by+bh/2);
   }
 }
@@ -6026,7 +6660,9 @@ static void renderIRDir() {
 
 // ── Level 1: Remote button grid ──────────────────────────────────
 static void renderIRRemote() {
-  if (!irLoadedPath[0] || irBtnCount == 0) { irLevel = IR_LEVEL_LIST; return; }
+  if (!irLoadedPath[0]) { irLevel = IR_LEVEL_LIST; return; }
+  // Empty remote in learn mode: keep the view open and show a hint
+  if (irBtnCount == 0 && !irLearnMode) { irLevel = IR_LEVEL_LIST; return; }
 
   int sw = statusSprite.width(), sh = statusSprite.height();
   bool isLand = sw > sh;
@@ -6041,38 +6677,56 @@ static void renderIRRemote() {
   if (txAge < 500 && (txAge / 100) % 2 == 0)
     statusSprite.fillCircle(sw - 8, titleH/2, 4, display.color565(220,0,0));
 
-  int pad   = 3;
-  int areaY = titleH + pad;
-  int cols  = 2;
-  int btnH  = isLand ? 22 : 24;
-  int btnW  = (sw - pad * (cols + 1)) / cols;
-  int areaH = sh - areaY - pad;
-  int visRows   = max(1, areaH / (btnH + pad));
-  int totalRows = (irBtnCount + cols - 1) / cols;
-  irBtnPageOff  = constrain(irBtnPageOff, 0, max(0, totalRows - visRows));
+  // Learn mode indicator (left side of title bar)
+  if (irLearnMode) {
+    bool pulse = (millis() / 400) % 2 == 0;
+    uint16_t dotCol = irLearnReady
+      ? display.color565(50, 220, 50)                        // green = ready to bind
+      : (pulse ? display.color565(220,180,0) : display.color565(70,55,0)); // amber blink
+    statusSprite.fillCircle(9, titleH/2, 4, dotCol);
+    statusSprite.setTextDatum(TL_DATUM);
+    statusSprite.setTextSize(1);
+    statusSprite.setTextColor(dotCol);
+    statusSprite.drawString(irLearnReady ? "BIND" : "LEARN", 16, (titleH - 8) / 2);
+  }
 
-  if (totalRows > visRows) {
-    int barH = max(6, areaH * visRows / totalRows);
-    int barY = areaY + (areaH - barH) * irBtnPageOff / max(1, totalRows - visRows);
-    statusSprite.fillRect(sw-3, areaY, 2, areaH, display.color565(20,20,20));
+  int areaY = titleH + 3;
+  int areaH = sh - areaY - 2;
+
+  // Empty custom remote: show hint while waiting for first bind
+  if (irBtnCount == 0) {
+    statusSprite.setTextDatum(MC_DATUM);
+    statusSprite.setTextSize(1);
+    statusSprite.setTextColor(display.color565(80, 60, 0));
+    statusSprite.drawString("No buttons yet.", sw/2, areaY + areaH/2 - 8);
+    statusSprite.setTextColor(display.color565(55, 40, 0));
+    statusSprite.drawString("ir learn bind <label>", sw/2, areaY + areaH/2 + 4);
+    return;
+  }
+
+  // Rebuild layout if needed (sprite size may have changed on orientation flip)
+  if (irLayoutH == 0) irBuildLayout(sw, isLand);
+  irBtnPageOff = constrain(irBtnPageOff, 0, max(0, (int)irLayoutH - areaH));
+
+  // Scroll bar
+  if (irLayoutH > areaH) {
+    int barH = max(8, areaH * areaH / irLayoutH);
+    int barY = areaY + (areaH - barH) * irBtnPageOff / max(1, (int)irLayoutH - areaH);
+    statusSprite.fillRect(sw-3, areaY, 2, areaH, display.color565(18,18,18));
     statusSprite.fillRect(sw-3, barY,  2, barH,  display.color565(180,70,0));
   }
 
-  uint16_t btnCol = display.color565(150,70,10);
-  for (int row = irBtnPageOff; row < irBtnPageOff + visRows && row < totalRows; row++) {
-    int rowY = areaY + (row - irBtnPageOff) * (btnH + pad);
-    for (int col = 0; col < cols; col++) {
-      int idx = row * cols + col;
-      if (idx >= irBtnCount) break;
-      int bx = pad + col * (btnW + pad);
-      irDrawBtn(bx, rowY, btnW, btnH, irBtns[idx].label, btnCol);
-    }
+  // Clip to content area
+  statusSprite.setClipRect(0, areaY, sw, areaH);
+
+  for (int i = 0; i < irBtnCount; i++) {
+    int ly = irLayout[i].y - irBtnPageOff + areaY;
+    if (ly + irLayout[i].h <= areaY) continue;   // above viewport
+    if (ly >= areaY + areaH)         continue;    // below viewport
+    irDrawBtn(i, irLayout[i].x, ly, irLayout[i].w, irLayout[i].h);
   }
 
-  statusSprite.setTextDatum(BL_DATUM);
-  statusSprite.setTextSize(1);
-  statusSprite.setTextColor(display.color565(30,15,0));
-  statusSprite.drawString("tap title=list", 4, sh-1);
+  statusSprite.clearClipRect();
 }
 
 void renderIR() {
