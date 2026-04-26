@@ -130,10 +130,14 @@ Navigation uses KEY1 (forward) and KEY2 (backward) with 500ms debounce. Modes ar
 | Value | Mode | Description |
 |---|---|---|
 | 0 | `FUNCTION_MAIN` | Clock + WiFi status via NTP (UTC+3) |
-| 1 | `FUNCTION_MATRIX` | Matrix rain animation |
-| 2 | `FUNCTION_BATTERY` | Battery voltage, charge %, uptime |
-| 3 | `FUNCTION_CONTROLLER` | Gamepad → UDP motor commands |
-| 4 | `FUNCTION_IR` | IR remote control |
+| 1 | `FUNCTION_CONTROLLER` | Gamepad → UDP motor commands |
+| 2 | `FUNCTION_BT` | Bluetooth scanner |
+| 3 | `FUNCTION_WIFI` | WiFi network scanner |
+| 4 | `FUNCTION_LORA` | LoRa / Meshtastic |
+| 5 | `FUNCTION_IR` | IR remote control |
+| 6 | `FUNCTION_RF433` | 433 MHz RF remote — enabled in device settings (disabled by default) |
+| 7 | `FUNCTION_MEDIA` | Matrix rain / Vader / Obi-Wan |
+| 8 | `FUNCTION_BATTERY` | Battery + device settings (long-press KEY1) |
 
 ### IR Remote System
 
@@ -291,6 +295,87 @@ ir learn stop
 ```
 
 > **Arduino preprocessor note:** `enum IRFileProto`, `struct IRButton`, `struct IRFileEntry`, `enum BtnType`, `struct IRBtnPos`, and `struct IRLearnData` are all defined *before* `#include <ArduinoJson.h>` (the last `#include` in the sketch). This is required so the auto-generated function prototypes that Arduino inserts after the last `#include` can reference these types. Do not move them below that include.
+
+### RF433 Remote System
+
+433 MHz OOK ASK remote control using M5Stack Unit RF433T (SYN115 transmitter) and RF433R (SYN531R receiver) connected via a Y-cable to the GROVE port.
+
+**GROVE wiring:**
+
+| GROVE signal | GPIO | Firmware constant | Module |
+|---|---|---|---|
+| G4 (Yellow) | GPIO 4 | `RF433_RX_PIN` | RF433R — demodulated RX output |
+| G5 (White) | GPIO 5 | `RF433_TX_PIN` | RF433T — TX data input |
+
+GROVE 5V power (`GROVE_POWER_EN`) is enabled only during learn mode and briefly during transmission.
+
+**Feature enable:** RF433 is **disabled by default** and hidden from navigation. Enable it from the Battery/Device settings screen (long-press KEY1 on battery screen → RF433 item) or via `rf433 enable` serial command.
+
+**File format:** `.433` files stored in `/rf433db/` hierarchy. Format mirrors `.ir`:
+
+```
+Filetype: RF433 signals file
+Version: 1
+#
+name: Button1
+type: raw
+data: 450 1350 450 450 1350 450 ...
+```
+
+Only `type: raw` is used — all captures are stored as raw OOK pulse timings in microseconds. Alternating HIGH/LOW durations starting from the first mark.
+
+**UI:** Two-level browser identical to IR — file list → remote button grid (2 columns, green accent). Tap title bar to go back to list.
+
+**Learn workflow:**
+
+```
+rf433 custom new Garage          # creates /rf433db/Custom/Garage.433
+rf433 learn start                # powers GROVE, arms ISR on GPIO 4
+<press button on remote>
+# serial prints: [RF433] Captured: 68 pulses
+rf433 learn bind Open            # saves button, updates file
+rf433 learn stop                 # cuts GROVE power
+```
+
+**Signal capture details:**
+- ISR fires on every edge of GPIO 4 (CHANGE interrupt), records microsecond durations.
+- `rf433LearnPoll()` detects end-of-packet by 30 ms silence after last edge.
+- Leading pre-signal silence (> 10 ms) and trailing gap (> 15 ms) are trimmed automatically.
+- Minimum valid capture: 8 pulses.
+- Signal is transmitted 3 × with 10 ms inter-frame gap.
+
+**IR / RF433 mutual exclusion:** `irLearnStart()` refuses if `rf433LearnMode` is active, and `rf433LearnStart()` refuses if `irLearnMode` is active. Both use GPIO 4 via different ISR handlers.
+
+**Key constants:**
+
+```cpp
+#define RF433_MAX_FILES   64
+#define RF433_MAX_BUTTONS 32
+#define RF433_MAX_RAW_LEN 256
+#define RF433_RX_PIN      4    // GROVE G4
+#define RF433_TX_PIN      5    // GROVE G5
+```
+
+**NVS keys:** `rf433On` (bool), `rf433Path` (string — last loaded remote path).
+
+#### RF433 serial commands (`rf433`)
+
+| Command | Description |
+|---|---|
+| `rf433 list` | List all scanned `.433` files |
+| `rf433 select <N>` | Load remote N and open UI |
+| `rf433 send <N> <label>` | Transmit button from remote N |
+| `rf433 reload` | Re-scan `/rf433db/` |
+| `rf433 custom new [name]` | Create new custom remote |
+| `rf433 custom list` | List custom remotes |
+| `rf433 learn start` | Power GROVE and arm SYN531R receiver |
+| `rf433 learn stop` | Stop capture, cut GROVE power |
+| `rf433 learn bind <label>` | Bind last capture to button label |
+| `rf433 learn show` | Print last captured signal info |
+| `rf433 enable` | Enable RF433 function |
+| `rf433 disable` | Disable RF433 function |
+
+**Touch-to-bind:** While learn mode is active and a signal has been captured (green `BIND` indicator in title bar), tapping an existing button in the remote UI **rebinds** that button to the captured signal.
 
 ### Serial Command Reference
 
