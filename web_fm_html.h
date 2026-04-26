@@ -109,6 +109,9 @@ tr.sel td{background:#1e293b}
     <div class="sr"><label>UI Clicks</label>
       <select id="s_click"><option value="1">ON</option><option value="0">OFF</option></select>
     </div>
+    <div class="sr"><label>RF433 Module</label>
+      <select id="s_rf433"><option value="1">ON</option><option value="0">OFF</option></select>
+    </div>
   </div>
   <div style="display:flex;gap:8px;align-items:center">
     <button onclick="saveDevSettings()" style="background:#1e3a5f;border-color:#38bdf8;color:#38bdf8">Save</button>
@@ -223,6 +226,7 @@ function loadDevSettings(){
     $('s_sleep').value=d.sleep_timeout||0;
     $('s_lowbat').value=d.low_bat||0;
     $('s_click').value=d.ui_click?'1':'0';
+    $('s_rf433').value=d.rf433_on?'1':'0';
   }).catch(function(e){$('sst').textContent='Load failed: '+e;$('sst').className='st err';});
 }
 function loadSysInfo(){
@@ -249,7 +253,8 @@ function saveDevSettings(){
     dim_timeout:parseInt($('s_dim').value),
     sleep_timeout:parseInt($('s_sleep').value),
     low_bat:parseInt($('s_lowbat').value),
-    ui_click:$('s_click').value==='1'
+    ui_click:$('s_click').value==='1',
+    rf433_on:$('s_rf433').value==='1'
   };
   $('sst').textContent='Saving...';$('sst').className='st';
   fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)})
