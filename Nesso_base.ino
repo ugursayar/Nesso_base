@@ -934,6 +934,7 @@ void serialHandleRF433(const char* arg);
 void rf433LearnStart();
 void rf433LearnStop();
 void rf433LearnPoll();
+static bool rf433ValidateSignal(const uint16_t* pulses, uint16_t len);
 static void rf433CustomNew(const char* name);
 static bool rf433CustomSave();
 static void rf433CustomBind(const char* label);
@@ -7239,6 +7240,40 @@ void rf433LearnStop() {
   serialWritelnAll("[RF433] Learn mode OFF.");
 }
 
+// Validate that a captured pulse train looks like a real OOK signal.
+// Real 433 MHz OOK has two distinct pulse groups (short T and long 2T/3T)
+// with a consistent ratio. Pure noise produces random, unclustered widths.
+static bool rf433ValidateSignal(const uint16_t* pulses, uint16_t len) {
+  // Collect pulses in the valid OOK range (100 µs – 10 ms)
+  uint16_t minP = 65000, maxP = 0;
+  int valid = 0;
+  for (int i = 0; i < len; i++) {
+    uint16_t p = pulses[i];
+    if (p >= 100 && p < 10000) {
+      if (p < minP) minP = p;
+      if (p > maxP) maxP = p;
+      valid++;
+    }
+  }
+  if (valid < 20) return false;
+
+  // Short-to-long ratio must be 1.5× – 6× (typical OOK: 1:2 or 1:3)
+  if ((uint32_t)maxP * 2 < (uint32_t)minP * 3) return false;  // ratio < 1.5
+  if (maxP > minP * 6)                          return false;  // ratio > 6
+
+  // Both pulse groups must be populated — bimodal distribution check.
+  // Each group must make up at least 15 % of valid pulses.
+  uint16_t boundary = (minP + maxP) / 2;
+  int shortCnt = 0, longCnt = 0;
+  for (int i = 0; i < len; i++) {
+    uint16_t p = pulses[i];
+    if (p >= 100 && p < 10000) {
+      if (p <= boundary) shortCnt++; else longCnt++;
+    }
+  }
+  return (shortCnt * 100 / valid >= 15) && (longCnt * 100 / valid >= 15);
+}
+
 void rf433LearnPoll() {
   if (!rf433LearnMode || rf433LearnReady) return;
 
@@ -7276,6 +7311,11 @@ void rf433LearnPoll() {
     rf433LearnLast.rawLen--;
 
   if (rf433LearnLast.rawLen < 8) return;
+
+  if (!rf433ValidateSignal(rf433LearnLast.rawData, rf433LearnLast.rawLen)) {
+    serialWritelnAll("[RF433] Rejected (noise) — waiting for next press...");
+    return;
+  }
 
   rf433LearnReady = true;
   char buf[72];
