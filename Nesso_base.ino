@@ -630,6 +630,7 @@ static int        rf433FlashIdx = -1;
 bool           rf433LearnMode  = false;
 bool           rf433LearnReady = false;
 RF433LearnData rf433LearnLast  = {};
+static uint32_t rf433LearnStartMs = 0;
 
 // ISR capture buffer — written from interrupt, read from main loop
 static volatile uint16_t rf433RawBuf[RF433_MAX_RAW_LEN];
@@ -1800,8 +1801,7 @@ void onKey1Short() {
   if (navState == NAV_NORMAL) {
     do {
       currentFunction = static_cast<MainFunctions>((currentFunction + 1) % mainFunctionCount);
-    } while ((currentFunction == FUNCTION_CONTROLLER && !joystickAvailable) ||
-             (currentFunction == FUNCTION_RF433      && !rf433Enabled));
+    } while (currentFunction == FUNCTION_CONTROLLER && !joystickAvailable);
     debugln("KEY1 short: next function");
   } else if (navState == NAV_SETTINGS) {
     // RESET item is always the last entry in each function's list — navigate to reset page
@@ -1854,8 +1854,7 @@ void onKey2Short() {
   if (navState == NAV_NORMAL) {
     do {
       currentFunction = static_cast<MainFunctions>((currentFunction - 1 + mainFunctionCount) % mainFunctionCount);
-    } while ((currentFunction == FUNCTION_CONTROLLER && !joystickAvailable) ||
-             (currentFunction == FUNCTION_RF433      && !rf433Enabled));
+    } while (currentFunction == FUNCTION_CONTROLLER && !joystickAvailable);
     debugln("KEY2 short: prev function");
   } else if (navState == NAV_SETTINGS) {
     if (currentFunction == FUNCTION_WIFI)
@@ -7224,8 +7223,9 @@ void rf433LearnStart() {
   rf433LastEdgeUs = micros();
   interrupts();
   attachInterrupt(digitalPinToInterrupt(RF433_RX_PIN), rf433RxISR, CHANGE);
-  rf433LearnMode  = true;
-  rf433LearnReady = false;
+  rf433LearnMode    = true;
+  rf433LearnReady   = false;
+  rf433LearnStartMs = millis();
   serialWritelnAll("[RF433] Learn mode ON — point remote at the RF433R unit and press a button.");
   serialWritelnAll("  Then: rf433 learn bind <label>  (or tap an existing button in the UI).");
 }
@@ -7241,6 +7241,12 @@ void rf433LearnStop() {
 
 void rf433LearnPoll() {
   if (!rf433LearnMode || rf433LearnReady) return;
+
+  // Discard noise accumulated while GROVE rail and SYN531R were stabilizing
+  if ((uint32_t)(millis() - rf433LearnStartMs) < 500) {
+    noInterrupts(); rf433RawLen = 0; rf433LastEdgeUs = micros(); interrupts();
+    return;
+  }
 
   noInterrupts();
   int len = rf433RawLen;
@@ -7306,6 +7312,7 @@ static void rf433CustomNew(const char* name) {
   if (j == 0) { strcpy(safe, "Custom"); j = 6; }
   safe[j] = '\0';
 
+  LittleFS.mkdir("/rf433db");
   LittleFS.mkdir("/rf433db/Custom");
   char path[80];
   snprintf(path, sizeof(path), "/rf433db/Custom/%s.433", safe);
@@ -7508,6 +7515,16 @@ static void renderRF433Dir() {
 
   int titleH = isLand ? 20 : 24;
   rf433DrawTitle("RF 433", false, sw, titleH, isLand);
+
+  if (!rf433Enabled) {
+    statusSprite.setTextDatum(MC_DATUM);
+    statusSprite.setTextSize(1);
+    statusSprite.setTextColor(COLOR_GRAY);
+    statusSprite.drawString("RF433 DISABLED", sw / 2, sh / 2 - 10);
+    statusSprite.setTextColor(display.color565(0, 100, 40));
+    statusSprite.drawString("Long-press KEY1 to enable", sw / 2, sh / 2 + 4);
+    return;
+  }
 
   if (rf433FileCount == 0) {
     statusSprite.setTextDatum(MC_DATUM);
