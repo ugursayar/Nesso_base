@@ -1723,12 +1723,15 @@ void onSwipe(int16_t dx, int16_t dy) {
     // Vertical swipe
     if (navState == NAV_SETTINGS &&
         (currentFunction == FUNCTION_LORA || currentFunction == FUNCTION_BT ||
-         currentFunction == FUNCTION_WIFI  || currentFunction == FUNCTION_BATTERY ||
-         currentFunction == FUNCTION_RF433)) {
-      if (dy < 0) settingsScrollOffset++;
-      else        settingsScrollOffset--;
-      int settingsMax = (currentFunction == FUNCTION_BATTERY) ? 5 : 4;
-      settingsScrollOffset = constrain(settingsScrollOffset, 0, settingsMax);
+         currentFunction == FUNCTION_WIFI  || currentFunction == FUNCTION_BATTERY)) {
+      // Move the cursor — the render function will update settingsScrollOffset to track it
+      int maxCursor;
+      if      (currentFunction == FUNCTION_WIFI)    maxCursor = 2;  // 3 items
+      else if (currentFunction == FUNCTION_LORA)    maxCursor = 4;  // 5 items
+      else if (currentFunction == FUNCTION_BT)      maxCursor = 5;  // 6 items
+      else /* BATTERY */                            maxCursor = 5;  // 6 items
+      if (dy < 0) settingsCursor = min(settingsCursor + 1, maxCursor);
+      else        settingsCursor = max(settingsCursor - 1, 0);
     } else if (currentFunction == FUNCTION_MEDIA && navState == NAV_NORMAL) {
       // Vertical swipe inside media screen → change sub-screen
       if (dy < 0) mediaSubScreen = (mediaSubScreen + 1) % 3;
@@ -1823,7 +1826,8 @@ void onKey1Short() {
   if (navState == NAV_NORMAL) {
     do {
       currentFunction = static_cast<MainFunctions>((currentFunction + 1) % mainFunctionCount);
-    } while (currentFunction == FUNCTION_CONTROLLER && !joystickAvailable);
+    } while ((currentFunction == FUNCTION_CONTROLLER && !joystickAvailable) ||
+             (currentFunction == FUNCTION_RF433      && !rf433Enabled));
     debugln("KEY1 short: next function");
   } else if (navState == NAV_SETTINGS) {
     // RESET item is always the last entry in each function's list — navigate to reset page
@@ -1873,7 +1877,8 @@ void onKey2Short() {
   if (navState == NAV_NORMAL) {
     do {
       currentFunction = static_cast<MainFunctions>((currentFunction - 1 + mainFunctionCount) % mainFunctionCount);
-    } while (currentFunction == FUNCTION_CONTROLLER && !joystickAvailable);
+    } while ((currentFunction == FUNCTION_CONTROLLER && !joystickAvailable) ||
+             (currentFunction == FUNCTION_RF433      && !rf433Enabled));
     debugln("KEY2 short: prev function");
   } else if (navState == NAV_SETTINGS) {
     if (currentFunction == FUNCTION_WIFI)
