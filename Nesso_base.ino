@@ -1566,6 +1566,7 @@ void onTap(int16_t sx, int16_t sy) {
 }
 
 void onSwipe(int16_t dx, int16_t dy) {
+  resetActivity();
   if (abs(dx) >= abs(dy)) {
     // Horizontal swipe → screen navigation (blocked inside settings)
     if (navState != NAV_NORMAL) return;
@@ -3504,15 +3505,19 @@ void readGamePad() {
   joyDisplayY = powery;
 
   if (powerx < 0) {
+    resetActivity();
     int16_t p = map(powerx, 0, -515, 0, -255);
     transmitRemoteCommand(p, p);
   } else if (powerx > 0) {
+    resetActivity();
     int16_t p = map(powerx, 0, 515, 0, 255);
     transmitRemoteCommand(p, p);
   } else if (powery < 0) {
+    resetActivity();
     int16_t p = map(powery, 0, -515, 0, -255);
     transmitRemoteCommand(p, -p);
   } else if (powery > 0) {
+    resetActivity();
     int16_t p = map(powery, 0, 515, 0, 255);
     transmitRemoteCommand(p, -p);
   } else {
@@ -3522,6 +3527,7 @@ void readGamePad() {
 
 void readGamePadButtons() {
   uint32_t buttons = ss.digitalReadBulk(button_mask);
+  if (buttons != button_mask) resetActivity();  // any button pressed
   gamepadButtons = buttons;  // snapshot for renderController()
 
   if (!(buttons & (1UL << BUTTON_A))) debugln("Button A pressed");
