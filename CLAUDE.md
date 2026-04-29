@@ -198,7 +198,7 @@ Groups with no matching buttons are omitted entirely (no blank rows). The D-pad 
 | Numbers | single digit `0`–`9` | third | Grey |
 | Generic | everything else | half | Amber |
 
-**Pixel-based scrolling:** `irBtnPageOff` is a pixel offset (not a row index). Swipe magnitude scales at `dy × 8` pixels. Maximum scroll = `irLayoutH − areaH`.
+**Pixel-based scrolling:** `irBtnPageOff` is a pixel offset (not a row index). Swipe displacement maps 1:1 — a `dy`-pixel swipe scrolls `dy` pixels of content. Maximum scroll = `irLayoutH − areaH`.
 
 **Flash highlight:** stored as `irFlashIdx` (button index); the glow tracks the button correctly during scroll.
 
@@ -223,11 +223,15 @@ Address and command values in parsed files are **little-endian hex bytes**, e.g.
 |---|---|
 | `ir list` | Print all scanned `.ir` files (`*` = currently loaded) |
 | `ir select <N>` | Load device N and open the remote UI |
-| `ir reload` | Re-scan `/irdb/` without reboot |
 | `ir send <N> <label>` | Load device N and send the named button (exact label) |
-| `ir pin` | Show IR TX / RX GPIO numbers |
 | `ir custom new [name]` | Create a new custom remote at `/irdb/Custom/<name>.ir` |
 | `ir custom list` | List all custom remotes |
+| `ir rename <new name>` | Rename the currently loaded custom remote file |
+| `ir del` | Delete the currently loaded remote file |
+| `ir reload` | Re-scan `/irdb/` without reboot |
+| `ir pin` | Show IR TX / RX GPIO numbers |
+| `ir btn del <label>` | Delete a button from the loaded custom remote |
+| `ir btn rename <old> <new>` | Rename a button in the loaded custom remote |
 | `ir learn start` | Power up GROVE port and arm M5 IR Unit receiver |
 | `ir learn stop` | Stop capture, cut GROVE power |
 | `ir learn bind <label>` | Bind last captured signal to a button label |
@@ -273,10 +277,16 @@ ir learn bind <label>
 ir learn stop
 ```
 
+**IR Actions settings overlay (long-press KEY1):** same 7-item menu as RF433 — NEW REMOTE, SELECT REMOTE, DEL REMOTE, CAPTURE BUTTON, AUTO BIND, DELETE BUTTON, RESET — in the same contextual order (remote management first, button management second).
+
 **Touch-to-bind:** while learn mode is active and a signal has been captured (green `BIND` indicator), tapping an existing button in the remote UI **rebinds** that button to the captured signal instead of transmitting.
 
+**Delete mode:** in DELETE BUTTON mode a pulsing red `DEL` dot appears in the title bar and all buttons glow red — tapping any button removes it from the custom remote immediately.
+
+**Auto-bind:** AUTO BIND mode auto-names each captured signal Btn_01, Btn_02, … without requiring a `bind` command. A learn bar at the bottom shows LISTENING… / RETRY / NEW BUTTON states.
+
 **Duplicate detection (decoded signals only):**
-- Same IR code on a different button → that button is renamed to the new label.
+- Same IR code on a different button → a warning is printed (`[IR] Note: same code already assigned to '...'`); the existing button is left unchanged and the new label is added/updated normally.
 - Same label → existing button's code is overwritten.
 - Library files (outside `/irdb/Custom/`) are write-protected; `ir learn bind` refuses with an error.
 
@@ -384,17 +394,17 @@ rf433 learn stop                 # cuts GROVE power
 | `rf433 list` | List all scanned `.sub` / `.433` files |
 | `rf433 select <N>` | Load remote N and open UI |
 | `rf433 send <N> <label>` | Transmit button from remote N |
-| `rf433 reload` | Re-scan `/rf433db/` |
-| `rf433 rename <new name>` | Rename the loaded custom remote file |
-| `rf433 del` | Delete the currently loaded remote file |
 | `rf433 custom new [name]` | Create new custom remote (`.sub`) |
 | `rf433 custom list` | List custom remotes |
+| `rf433 rename <new name>` | Rename the loaded custom remote file |
+| `rf433 del` | Delete the currently loaded remote file |
+| `rf433 reload` | Re-scan `/rf433db/` |
+| `rf433 btn del <label>` | Delete a button from the loaded custom remote |
+| `rf433 btn rename <old> <new>` | Rename a button in the loaded custom remote |
 | `rf433 learn start` | Drive TX LOW, power GROVE, arm SYN531R receiver |
 | `rf433 learn stop` | Stop capture, cut GROVE power |
 | `rf433 learn bind <label>` | Bind last capture to button label |
 | `rf433 learn show` | Print last captured signal info |
-| `rf433 btn del <label>` | Delete a button from the loaded custom remote |
-| `rf433 btn rename <old> <new>` | Rename a button in the loaded custom remote |
 | `rf433 enable` | Enable RF433 function |
 | `rf433 disable` | Disable RF433 function |
 
@@ -434,11 +444,15 @@ The device prints byte count and auto-rescans `/irdb` on success.
 |---|---|
 | `ir list` | Print all scanned `.ir` files (`*` = currently loaded) |
 | `ir select <N>` | Load device N and open the remote UI |
-| `ir reload` | Re-scan `/irdb/` without reboot |
 | `ir send <N> <label>` | Load device N and send the named button (exact label) |
-| `ir pin` | Show IR TX / RX GPIO numbers |
 | `ir custom new [name]` | Create a new custom remote at `/irdb/Custom/<name>.ir` |
 | `ir custom list` | List all custom remotes |
+| `ir rename <new name>` | Rename the currently loaded custom remote file |
+| `ir del` | Delete the currently loaded remote file |
+| `ir reload` | Re-scan `/irdb/` without reboot |
+| `ir pin` | Show IR TX / RX GPIO numbers |
+| `ir btn del <label>` | Delete a button from the loaded custom remote |
+| `ir btn rename <old> <new>` | Rename a button in the loaded custom remote |
 | `ir learn start` | Power GROVE port and arm M5 IR Unit receiver |
 | `ir learn stop` | Stop capture, cut GROVE power |
 | `ir learn bind <label>` | Bind last captured signal to a button label |
@@ -477,6 +491,18 @@ The controller mode reads an **Adafruit seesaw mini gamepad** (I2C address `0x50
 - `NessoBattery` — battery voltage, charge %, and charge state management
 - `NessoDisplay` / `LGFX_Sprite` — display rendering; sprite used for battery and controller modes for efficiency
 - `WiFiEvent` callback runs on a FreeRTOS task for async WiFi state handling
+
+### Sprite / Header Architecture
+
+Most screens push `statusSprite` at `y = SPRITE_Y` (22 px), leaving the top 22 px for the battery/WiFi/BT header drawn directly on `display` by `renderHeader()`.
+
+**IR and RF433 use the full display height** — no header bar. This is managed by `g_spriteY` (an `int` global, initialised to `SPRITE_Y`):
+
+- `createStatusSprite()` creates the sprite as `display.width() × (display.height() − g_spriteY)`.
+- At the top of `renderFunction()` every frame, the desired value is computed: `0` for IR/RF433, `SPRITE_Y` for all other functions. If it differs from the current `g_spriteY`, the sprite is resized immediately and `irLayoutH` is reset to force a button-layout rebuild.
+- This check runs unconditionally — it does **not** depend on `lastFunction` — so it is immune to `updateOrientation()` setting `lastFunction = −1` mid-navigation.
+- `initIR()` and `initRF433()` call `display.fillScreen()` to clear the display including the header area; the sprite is then pushed at `y = 0`, covering the full screen.
+- All touch coordinate transforms in IR/RF433 handlers use `sy − g_spriteY` (which equals `sy` when `g_spriteY = 0`).
 
 ### Battery Percentage Calculation
 

@@ -116,6 +116,8 @@ NessoTouch   touch;
 
 // Y-offset where statusSprite is pushed; area above holds the WiFi icon
 const int SPRITE_Y = 22;
+// Runtime sprite Y offset — set to 0 for IR/RF433 (no header bar), SPRITE_Y otherwise
+int g_spriteY = SPRITE_Y;
 
 const uint16_t COLOR_TEAL   = 0x0410;
 const uint16_t COLOR_BLACK  = 0x0000;
@@ -606,6 +608,8 @@ uint32_t irTxMs       = 0;
 // ── IR learn mode (M5Stack IR Unit U002) ──────────────────────────
 bool         irLearnMode  = false;   // receiver active, capture in progress
 bool         irLearnReady = false;   // last received signal ready to bind
+bool         irDeleteMode = false;   // tap-to-delete button mode
+bool         irAutoMode   = false;   // auto-bind: each capture → Btn_XX
 IRLearnData  irLearnLast  = {};      // most recently captured signal
 
 // ── RF433 (SYN115 TX + SYN531R RX on GROVE Y-cable) ──────────────
@@ -914,6 +918,8 @@ void serialHandleFS(const char* arg);
 // Forward declarations for IR remote helpers
 void initIR();
 void renderIR();
+void renderIRSettings();
+void handleIRSettingsTap(int16_t sx, int16_t sy);
 void irScanFiles();
 void irOpenDir(const char* path);
 void irLoadDevice(const char* path);
@@ -925,6 +931,8 @@ void irLearnPoll();
 static void irCustomNew(const char* name);
 static bool irCustomSave();
 static void irCustomBind(const char* label);
+static void irAutoNew();
+static void irAutoBind();
 
 // Forward declarations for RF433 helpers
 void initRF433();
@@ -1102,6 +1110,14 @@ void loop() {
 
   serialCheckInput();
   irLearnPoll();
+  if (irAutoMode && irLearnReady) {
+    if (irBtnCount < IR_MAX_BUTTONS) {
+      irAutoBind();
+    } else {
+      serialWritelnAll("[IR] Auto-bind: button limit reached.");
+      irLearnStop();
+    }
+  }
   rf433LearnPoll();
   if (rf433AutoMode && rf433LearnReady) {
     if (rf433BtnCount < RF433_MAX_BUTTONS) {
@@ -1133,7 +1149,7 @@ void loop() {
 
 void createStatusSprite() {
   statusSprite.deleteSprite();
-  statusSprite.createSprite(display.width(), display.height() - SPRITE_Y);
+  statusSprite.createSprite(display.width(), display.height() - g_spriteY);
 }
 
 void updateOrientation() {
@@ -1464,6 +1480,8 @@ void onTap(int16_t sx, int16_t sy) {
     handleBatterySettingsTap(sx, sy);
   } else if (navState == NAV_SETTINGS && currentFunction == FUNCTION_RF433) {
     handleRF433SettingsTap(sx, sy);
+  } else if (navState == NAV_SETTINGS && currentFunction == FUNCTION_IR) {
+    handleIRSettingsTap(sx, sy);
   } else if (currentFunction == FUNCTION_BT && navState == NAV_NORMAL) {
     if (btSelectedAddr[0] != '\0') {
       btSelectedAddr[0] = '\0';   // tap in detail view → back to list
@@ -1473,7 +1491,7 @@ void onTap(int16_t sx, int16_t sy) {
       btStartScan();
     } else if (!btScanning && btLogCount > 0) {
       // Tap the scan-dot area at top to restart scan
-      int sprite_y = sy - SPRITE_Y;
+      int sprite_y = sy - g_spriteY;
       bool isLand  = statusSprite.width() > statusSprite.height();
       int dotHitY  = isLand ? 10 : 29;
       if (sprite_y < dotHitY + 16) {
@@ -1498,7 +1516,7 @@ void onTap(int16_t sx, int16_t sy) {
       }
     } else if (btScanning) {
       // Tap the scan-dot to stop
-      int sprite_y = sy - SPRITE_Y;
+      int sprite_y = sy - g_spriteY;
       bool isLand  = statusSprite.width() > statusSprite.height();
       int dotHitY  = isLand ? 10 : 29;
       if (sprite_y < dotHitY + 16) {
@@ -1525,7 +1543,7 @@ void onTap(int16_t sx, int16_t sy) {
       }
     }
   } else if (currentFunction == FUNCTION_IR && navState == NAV_NORMAL) {
-    int sprite_y = sy - SPRITE_Y;
+    int sprite_y = sy - g_spriteY;
     int sw = statusSprite.width(), sh = statusSprite.height();
     bool isLand = sw > sh;
 
@@ -1568,13 +1586,41 @@ void onTap(int16_t sx, int16_t sy) {
       // ── Level 1: Remote buttons ─────────────────────────────────
       int titleH = isLand ? 22 : 26;
       if (sprite_y < titleH) { irLevel = IR_LEVEL_LIST; return; }
+
+      // Learn mode bar tap (shown at bottom when learn mode active)
+      if (irLearnMode) {
+        int learnH = isLand ? 28 : 36;
+        int learnY = sh - learnH - 2;
+        if (sprite_y >= learnY && sprite_y < learnY + learnH) {
+          if (irLearnReady) {
+            if (sx < sw / 2) {
+              // RETRY: discard captured, back to listening
+              irLearnReady = false;
+            } else {
+              // NEW BUTTON: auto-name and stop
+              irAutoBind();
+              irLearnStop();
+            }
+          } else if (sx < sw / 2) {
+            irLearnStop();  // CANCEL
+          }
+          return;
+        }
+      }
+
       int areaY = titleH + 3;
       int contentY = sprite_y - areaY + irBtnPageOff; // position in layout space
       for (int i = 0; i < irBtnCount; i++) {
         if (sx >= irLayout[i].x && sx < irLayout[i].x + irLayout[i].w &&
             contentY >= irLayout[i].y && contentY < irLayout[i].y + irLayout[i].h) {
           irFlashIdx = i; irFlashMs = millis();
-          if (irLearnMode && irLearnReady) {
+          if (irDeleteMode) {
+            for (int j = i; j < irBtnCount - 1; j++) irBtns[j] = irBtns[j + 1];
+            irBtnCount--;
+            irDeleteMode = false;
+            irLayoutH = 0;  // force layout rebuild
+            if (irIsCustomFile()) irCustomSave();
+          } else if (irLearnMode && irLearnReady) {
             // Learn mode: tap binds the captured signal to this button
             irCustomBind(irBtns[i].label);
           } else {
@@ -1585,7 +1631,7 @@ void onTap(int16_t sx, int16_t sy) {
       }
     }
   } else if (currentFunction == FUNCTION_RF433 && navState == NAV_NORMAL) {
-    int sprite_y = sy - SPRITE_Y;
+    int sprite_y = sy - g_spriteY;
     int sw = statusSprite.width(), sh = statusSprite.height();
     bool isLand = sw > sh;
 
@@ -1628,7 +1674,7 @@ void onTap(int16_t sx, int16_t sy) {
       //   LISTENING + right → ignored
       //   WARMING UP → ignored
       if (rf433LearnMode) {
-        int learnH = isLand ? 22 : 28;
+        int learnH = isLand ? 28 : 36;
         int learnY = sh - learnH - 2;
         if (sprite_y >= learnY && sprite_y < learnY + learnH) {
           bool inGrace = (uint32_t)(millis() - rf433LearnStartMs) < 500;
@@ -1676,7 +1722,7 @@ void onTap(int16_t sx, int16_t sy) {
       }
     }
   } else if (currentFunction == FUNCTION_WIFI && navState == NAV_NORMAL) {
-    int sprite_y = sy - SPRITE_Y;
+    int sprite_y = sy - g_spriteY;
     bool isLand  = statusSprite.width() > statusSprite.height();
     int dotHitY  = isLand ? 10 : 29;
     if (!wifiScanning && wifiScanCount == 0) {
@@ -1727,7 +1773,7 @@ void onTap(int16_t sx, int16_t sy) {
     }
   } else if (currentFunction == FUNCTION_LORA && navState == NAV_NORMAL) {
     // Tap on LISTEN button or scan-dot to toggle listening
-    int sprite_y = sy - SPRITE_Y;
+    int sprite_y = sy - g_spriteY;
     bool isLand  = statusSprite.width() > statusSprite.height();
     int dotHitY  = isLand ? 10 : 29;
     if (!loraListening) {
@@ -1763,13 +1809,14 @@ void onSwipe(int16_t dx, int16_t dy) {
     if (navState == NAV_SETTINGS &&
         (currentFunction == FUNCTION_LORA || currentFunction == FUNCTION_BT ||
          currentFunction == FUNCTION_WIFI  || currentFunction == FUNCTION_BATTERY ||
-         currentFunction == FUNCTION_RF433)) {
+         currentFunction == FUNCTION_RF433 || currentFunction == FUNCTION_IR)) {
       // Move the cursor — the render function will update settingsScrollOffset to track it
       int maxCursor;
       if      (currentFunction == FUNCTION_WIFI)    maxCursor = 2;  // 3 items
       else if (currentFunction == FUNCTION_LORA)    maxCursor = 4;  // 5 items
       else if (currentFunction == FUNCTION_BT)      maxCursor = 5;  // 6 items
       else if (currentFunction == FUNCTION_RF433)   maxCursor = 6;  // 7 items
+      else if (currentFunction == FUNCTION_IR)      maxCursor = 6;  // 7 items
       else /* BATTERY */                            maxCursor = 5;  // 6 items
       if (dy < 0) settingsCursor = min(settingsCursor + 1, maxCursor);
       else        settingsCursor = max(settingsCursor - 1, 0);
@@ -1800,7 +1847,7 @@ void onSwipe(int16_t dx, int16_t dy) {
         int titleH = isLandScroll ? 22 : 26;
         int areaH  = statusSprite.height() - titleH - 5;
         int maxOff = max(0, (int)irLayoutH - areaH);
-        irBtnPageOff = constrain(irBtnPageOff - dy * 8, 0, maxOff);
+        irBtnPageOff = constrain(irBtnPageOff - dy, 0, maxOff);
       }
     } else if (currentFunction == FUNCTION_RF433 && navState == NAV_NORMAL) {
       if (rf433Level == RF433_LEVEL_LIST) {
@@ -1876,7 +1923,8 @@ void onKey1Short() {
         (currentFunction == FUNCTION_LORA    && settingsCursor == 4) ||
         (currentFunction == FUNCTION_BT      && settingsCursor == 5) ||
         (currentFunction == FUNCTION_BATTERY && settingsCursor == 5) ||
-        (currentFunction == FUNCTION_RF433   && settingsCursor == 6)) {
+        (currentFunction == FUNCTION_RF433   && settingsCursor == 6) ||
+        (currentFunction == FUNCTION_IR      && settingsCursor == 6)) {
       navState = NAV_RESET;
       resetFeedbackMs = 0; resetFeedbackBtn = -1;
       return;
@@ -1915,30 +1963,11 @@ void onKey1Short() {
           rf433AutoNew();
           navState = NAV_NORMAL;
           break;
-        case 1:  // CAPTURE BUTTON — start learn mode; user taps button to bind
-          if (!rf433LoadedPath[0] || !rf433IsCustomFile()) rf433AutoNew();
-          rf433LearnStart();
-          navState = NAV_NORMAL;
-          break;
-        case 2:  // SELECT REMOTE — go to file list
+        case 1:  // SELECT REMOTE — go to file list
           navState = NAV_NORMAL;
           rf433Level = RF433_LEVEL_LIST;
           break;
-        case 3:  // DELETE BUTTON — enter delete mode; user taps a button to remove it
-          if (rf433BtnCount > 0 && rf433LoadedPath[0]) {
-            rf433DeleteMode = true;
-            rf433Level = RF433_LEVEL_REMOTE;
-            navState = NAV_NORMAL;
-          }
-          break;
-        case 4:  // AUTO BIND — learn mode that auto-names each capture Btn_01, Btn_02…
-          if (!rf433LoadedPath[0] || !rf433IsCustomFile()) rf433AutoNew();
-          rf433AutoMode = true;
-          rf433LearnStart();
-          navState = NAV_NORMAL;
-          rf433Level = RF433_LEVEL_REMOTE;
-          break;
-        case 5: {  // DEL REMOTE — delete currently loaded remote file
+        case 2: {  // DEL REMOTE — delete currently loaded remote file
           if (!rf433LoadedPath[0]) break;
           if (rf433LearnMode) rf433LearnStop();
           if (!strcmp(rf433SavedPath, rf433LoadedPath)) {
@@ -1958,6 +1987,77 @@ void onKey1Short() {
           navState = NAV_NORMAL;
           break;
         }
+        case 3:  // CAPTURE BUTTON — start learn mode; user taps button to bind
+          if (!rf433LoadedPath[0] || !rf433IsCustomFile()) rf433AutoNew();
+          rf433LearnStart();
+          navState = NAV_NORMAL;
+          break;
+        case 4:  // AUTO BIND — learn mode that auto-names each capture Btn_01, Btn_02…
+          if (!rf433LoadedPath[0] || !rf433IsCustomFile()) rf433AutoNew();
+          rf433AutoMode = true;
+          rf433LearnStart();
+          navState = NAV_NORMAL;
+          rf433Level = RF433_LEVEL_REMOTE;
+          break;
+        case 5:  // DELETE BUTTON — enter delete mode; user taps a button to remove it
+          if (rf433BtnCount > 0 && rf433LoadedPath[0]) {
+            rf433DeleteMode = true;
+            rf433Level = RF433_LEVEL_REMOTE;
+            navState = NAV_NORMAL;
+          }
+          break;
+        // case 6 = RESET — handled above
+      }
+    } else if (currentFunction == FUNCTION_IR) {
+      switch (settingsCursor) {
+        case 0:  // NEW REMOTE
+          irAutoNew();
+          navState = NAV_NORMAL;
+          break;
+        case 1:  // SELECT REMOTE — go to file list
+          navState = NAV_NORMAL;
+          irLevel = IR_LEVEL_LIST;
+          break;
+        case 2: {  // DEL REMOTE — delete currently loaded remote file
+          if (!irLoadedPath[0]) break;
+          if (irLearnMode) irLearnStop();
+          if (!strcmp(irSavedPath, irLoadedPath)) {
+            irSavedPath[0] = '\0';
+            saveSettings();
+          }
+          char delMsg[80];
+          snprintf(delMsg, sizeof(delMsg), "[IR] Deleted '%s'.", irLoadedName);
+          LittleFS.remove(irLoadedPath);
+          irLoadedPath[0] = '\0';
+          irLoadedName[0] = '\0';
+          irSelectedIdx = -1;
+          irBtnCount = 0;
+          irScanFiles();
+          irOpenDir("/irdb");
+          serialWritelnAll(delMsg);
+          irLevel = IR_LEVEL_LIST;
+          navState = NAV_NORMAL;
+          break;
+        }
+        case 3:  // CAPTURE BUTTON — start learn mode; user taps button to bind
+          if (!irLoadedPath[0] || !irIsCustomFile()) irAutoNew();
+          irLearnStart();
+          navState = NAV_NORMAL;
+          break;
+        case 4:  // AUTO BIND — auto-names each capture Btn_01, Btn_02…
+          if (!irLoadedPath[0] || !irIsCustomFile()) irAutoNew();
+          irAutoMode = true;
+          irLearnStart();
+          navState = NAV_NORMAL;
+          irLevel = IR_LEVEL_REMOTE;
+          break;
+        case 5:  // DELETE BUTTON — enter delete mode; user taps a button to remove it
+          if (irBtnCount > 0 && irLoadedPath[0]) {
+            irDeleteMode = true;
+            irLevel = IR_LEVEL_REMOTE;
+            navState = NAV_NORMAL;
+          }
+          break;
         // case 6 = RESET — handled above
       }
     }
@@ -1983,7 +2083,9 @@ void onKey2Short() {
     else if (currentFunction == FUNCTION_BATTERY)
       settingsCursor = (settingsCursor + 1) % 6;  // 5 items + RESET
     else if (currentFunction == FUNCTION_RF433)
-      settingsCursor = (settingsCursor + 1) % 7;  // NEW / CAPTURE / SELECT / DELETE / AUTO / DEL REMOTE / RESET
+      settingsCursor = (settingsCursor + 1) % 7;  // NEW / SELECT / DEL REMOTE / CAPTURE / AUTO / DELETE / RESET
+    else if (currentFunction == FUNCTION_IR)
+      settingsCursor = (settingsCursor + 1) % 7;  // NEW / SELECT / DEL REMOTE / CAPTURE / AUTO / DELETE / RESET
   }
 }
 
@@ -1998,7 +2100,7 @@ void onKey1Long() {
   if (navState == NAV_NORMAL) {
     if (currentFunction == FUNCTION_LORA || currentFunction == FUNCTION_BT ||
         currentFunction == FUNCTION_WIFI  || currentFunction == FUNCTION_BATTERY ||
-        currentFunction == FUNCTION_RF433) {
+        currentFunction == FUNCTION_RF433 || currentFunction == FUNCTION_IR) {
       navState             = NAV_SETTINGS;
       settingsCursor       = 0;
       settingsScrollOffset = 0;
@@ -2141,37 +2243,46 @@ static void printHelpFS() {
 
 static void printHelpIR() {
   serialWritelnAll("IR Remote:");
+  serialWritelnAll("  -- Remote management --");
   serialWritelnAll("  ir list                       list all .ir files in /irdb/");
   serialWritelnAll("  ir select <N>                 load device N and open remote UI");
   serialWritelnAll("  ir send <N> <label>           send one button from device N");
-  serialWritelnAll("  ir reload                     re-scan /irdb/ for new files");
-  serialWritelnAll("  ir pin                        show IR blaster GPIO");
   serialWritelnAll("  ir custom new [name]          create new custom remote");
   serialWritelnAll("  ir custom list                list custom remotes");
+  serialWritelnAll("  ir rename <new name>          rename the loaded custom remote");
+  serialWritelnAll("  ir del                        delete the loaded remote file");
+  serialWritelnAll("  ir reload                     re-scan /irdb/ for new files");
+  serialWritelnAll("  ir pin                        show IR blaster GPIO");
+  serialWritelnAll("  -- Button management --");
+  serialWritelnAll("  ir btn del <label>            delete a button from the loaded remote");
+  serialWritelnAll("  ir btn rename <old> <new>     rename a button in the loaded remote");
+  serialWritelnAll("  -- Learn mode --");
   serialWritelnAll("  ir learn start                start M5 IR Unit capture mode");
   serialWritelnAll("  ir learn stop                 stop capture mode");
   serialWritelnAll("  ir learn bind <label>         bind last capture to button label");
   serialWritelnAll("  ir learn show                 print last captured signal");
-  serialWritelnAll("  -- to add buttons to existing custom remote: --");
-  serialWritelnAll("  ir select <N>  +  ir learn start  +  ir learn bind <label>");
 }
 
 static void printHelpRF433() {
   serialWritelnAll("RF 433 MHz:");
+  serialWritelnAll("  -- Remote management --");
   serialWritelnAll("  rf433 list                      list all .sub remotes in /rf433db/");
   serialWritelnAll("  rf433 select <N>                load remote N and open UI");
   serialWritelnAll("  rf433 send <N> <label>          transmit button from remote N");
-  serialWritelnAll("  rf433 reload                    re-scan /rf433db/ for new files");
-  serialWritelnAll("  rf433 rename <new name>         rename the loaded custom remote file");
   serialWritelnAll("  rf433 custom new [name]         create new custom remote");
   serialWritelnAll("  rf433 custom list               list custom remotes");
+  serialWritelnAll("  rf433 rename <new name>         rename the loaded custom remote file");
+  serialWritelnAll("  rf433 del                       delete the currently loaded remote file");
+  serialWritelnAll("  rf433 reload                    re-scan /rf433db/ for new files");
+  serialWritelnAll("  -- Button management --");
+  serialWritelnAll("  rf433 btn del <label>           delete a button from the loaded remote");
+  serialWritelnAll("  rf433 btn rename <old> <new>    rename a button in the loaded remote");
+  serialWritelnAll("  -- Learn mode --");
   serialWritelnAll("  rf433 learn start               arm SYN531R receiver (GROVE G4)");
   serialWritelnAll("  rf433 learn stop                stop capture, cut GROVE power");
   serialWritelnAll("  rf433 learn bind <label>        bind last capture to button label");
   serialWritelnAll("  rf433 learn show                print last captured signal info");
-  serialWritelnAll("  rf433 btn del <label>           delete a button from the loaded remote");
-  serialWritelnAll("  rf433 btn rename <old> <new>    rename a button in the loaded remote");
-  serialWritelnAll("  rf433 del                       delete the currently loaded remote file");
+  serialWritelnAll("  -- Feature toggle --");
   serialWritelnAll("  rf433 enable / rf433 disable    toggle RF433 function (also in device settings)");
 }
 
@@ -2459,7 +2570,7 @@ void serialHandleImu(const char* arg) {
 
 void serialHandleIR(const char* arg) {
   if (!*arg) {
-    serialWritelnAll("ir list|select <N>|send <N> <btn>|reload|pin");
+    serialWritelnAll("ir list|select <N>|send <N> <btn>|custom|rename|del|reload|pin|btn|learn");
     return;
   }
   if (cmdIs(arg,"list")) {
@@ -2588,6 +2699,99 @@ void serialHandleIR(const char* arg) {
       serialWritelnAll(buf);
     } else {
       serialWritelnAll("Usage: ir learn start | stop | bind <label> | show");
+    }
+  } else if (cmdIs(arg,"rename")) {
+    const char* newName = cmdArg(arg,"rename");
+    if (!*newName) {
+      serialWritelnAll("Usage: ir rename <new name>  (renames the currently loaded custom remote)");
+      return;
+    }
+    if (!irLoadedPath[0]) { serialWritelnAll("[IR] No remote loaded."); return; }
+    if (!irIsCustomFile()) { serialWritelnAll("[IR] Only custom remotes can be renamed."); return; }
+    char safeName[40];
+    strlcpy(safeName, newName, sizeof(safeName));
+    for (char* p = safeName; *p; p++) if (*p == ' ') *p = '_';
+    char newPath[80];
+    snprintf(newPath, sizeof(newPath), "/irdb/Custom/%s.ir", safeName);
+    if (LittleFS.exists(newPath)) { serialWritelnAll("[IR] ERROR: a remote with that name already exists."); return; }
+    if (!LittleFS.rename(irLoadedPath, newPath)) { serialWritelnAll("[IR] ERROR: rename failed."); return; }
+    if (!strcmp(irSavedPath, irLoadedPath)) {
+      strlcpy(irSavedPath, newPath, sizeof(irSavedPath));
+      saveSettings();
+    }
+    strlcpy(irLoadedPath, newPath, sizeof(irLoadedPath));
+    strlcpy(irLoadedName, safeName, sizeof(irLoadedName));
+    irScanFiles();
+    irSelectedIdx = -1;
+    for (int i = 0; i < irFileCount; i++)
+      if (!strcmp(irFiles[i].path, newPath)) { irSelectedIdx = i; break; }
+    char buf[80];
+    snprintf(buf, sizeof(buf), "[IR] Renamed to '%s'.", safeName);
+    serialWritelnAll(buf);
+  } else if (cmdIs(arg,"del")) {
+    if (!irLoadedPath[0]) { serialWritelnAll("[IR] No remote loaded."); return; }
+    if (irLearnMode) irLearnStop();
+    if (!strcmp(irSavedPath, irLoadedPath)) {
+      irSavedPath[0] = '\0';
+      saveSettings();
+    }
+    char delMsg[80];
+    snprintf(delMsg, sizeof(delMsg), "[IR] Deleted '%s'.", irLoadedName);
+    LittleFS.remove(irLoadedPath);
+    irLoadedPath[0] = '\0';
+    irLoadedName[0] = '\0';
+    irSelectedIdx = -1;
+    irBtnCount = 0;
+    irScanFiles();
+    irOpenDir("/irdb");
+    if (currentFunction == FUNCTION_IR) irLevel = IR_LEVEL_LIST;
+    serialWritelnAll(delMsg);
+  } else if (cmdIs(arg,"btn")) {
+    const char* sub = cmdArg(arg,"btn");
+    if (cmdIs(sub,"del")) {
+      const char* label = cmdArg(sub,"del");
+      while (*label == ' ') label++;
+      if (!*label) { serialWritelnAll("Usage: ir btn del <label>"); return; }
+      if (!irLoadedPath[0]) { serialWritelnAll("[IR] No remote loaded."); return; }
+      if (!irIsCustomFile()) { serialWritelnAll("[IR] Only custom remotes can be edited."); return; }
+      int found = -1;
+      for (int i = 0; i < irBtnCount; i++)
+        if (!strcasecmp(irBtns[i].label, label)) { found = i; break; }
+      if (found < 0) { serialWritelnAll("[IR] Button not found."); return; }
+      for (int j = found; j < irBtnCount - 1; j++) irBtns[j] = irBtns[j + 1];
+      irBtnCount--;
+      irLayoutH = 0;  // force layout rebuild
+      irCustomSave();
+      char msg[80];
+      snprintf(msg, sizeof(msg), "[IR] Button '%s' deleted. %d button(s) remain.", label, irBtnCount);
+      serialWritelnAll(msg);
+    } else if (cmdIs(sub,"rename")) {
+      const char* rest = cmdArg(sub,"rename");
+      const char* sp = strchr(rest, ' ');
+      if (!sp || !*(sp + 1)) {
+        serialWritelnAll("Usage: ir btn rename <old_label> <new_label>");
+        return;
+      }
+      char oldLabel[20] = {};
+      int oldLen = min((int)(sp - rest), 19);
+      memcpy(oldLabel, rest, oldLen);
+      const char* newLabel = sp + 1;
+      while (*newLabel == ' ') newLabel++;
+      if (!*newLabel) { serialWritelnAll("Usage: ir btn rename <old_label> <new_label>"); return; }
+      if (!irLoadedPath[0]) { serialWritelnAll("[IR] No remote loaded."); return; }
+      if (!irIsCustomFile()) { serialWritelnAll("[IR] Only custom remotes can be edited."); return; }
+      int found = -1;
+      for (int i = 0; i < irBtnCount; i++)
+        if (!strcasecmp(irBtns[i].label, oldLabel)) { found = i; break; }
+      if (found < 0) { serialWritelnAll("[IR] Button not found."); return; }
+      strlcpy(irBtns[found].label, newLabel, sizeof(irBtns[found].label));
+      irLayoutH = 0;  // force layout rebuild
+      irCustomSave();
+      char msg[80];
+      snprintf(msg, sizeof(msg), "[IR] Button '%s' renamed to '%s'.", oldLabel, newLabel);
+      serialWritelnAll(msg);
+    } else {
+      serialWritelnAll("Usage: ir btn del <label> | ir btn rename <old> <new>");
     }
   } else {
     serialWritelnAll("Unknown ir subcommand. Type 'help'.");
@@ -3216,6 +3420,17 @@ void serialCheckInput() {
 }
 
 void renderFunction() {
+  // Resize sprite every frame based on current function — avoids lastFunction=-1 race
+  // with updateOrientation() leaving g_spriteY stuck at 0 for non-IR/RF433 screens.
+  {
+    int desired = (currentFunction == FUNCTION_IR || currentFunction == FUNCTION_RF433) ? 0 : SPRITE_Y;
+    if (desired != g_spriteY) {
+      g_spriteY = desired;
+      createStatusSprite();
+      irLayoutH = 0;  // force IR button layout rebuild on next render
+    }
+  }
+
   if (lastFunction == (int)FUNCTION_LORA && currentFunction != FUNCTION_LORA && loraInitialized) {
     lora.standby();
     digitalWrite(LORA_LNA_ENABLE, LOW);
@@ -3232,6 +3447,10 @@ void renderFunction() {
   }
   if (lastFunction == (int)FUNCTION_MEDIA && currentFunction != FUNCTION_MEDIA)
     stopBuzzer();
+  if (lastFunction == (int)FUNCTION_IR && currentFunction != FUNCTION_IR) {
+    irDeleteMode = false;
+    irAutoMode   = false;
+  }
   if (lastFunction == (int)FUNCTION_RF433 && currentFunction != FUNCTION_RF433) {
     if (rf433LearnMode) rf433LearnStop();
     rf433DeleteMode = false;
@@ -3258,15 +3477,16 @@ void renderFunction() {
 
     case FUNCTION_IR:
       if (lastFunction != (int)FUNCTION_IR) initIR();
-      renderIR();
-      statusSprite.pushSprite(0, SPRITE_Y);
+      if (navState == NAV_SETTINGS) renderIRSettings();
+      else                          renderIR();
+      statusSprite.pushSprite(0, g_spriteY);
       break;
 
     case FUNCTION_RF433:
       if (lastFunction != (int)FUNCTION_RF433) initRF433();
       if (navState == NAV_SETTINGS) renderRF433Settings();
       else                          renderRF433();
-      statusSprite.pushSprite(0, SPRITE_Y);
+      statusSprite.pushSprite(0, g_spriteY);
       break;
 
     case FUNCTION_MAIN:
@@ -6267,7 +6487,7 @@ static void handleResetPageTap(int16_t sx, int16_t sy, int btnCount,
   int sw = statusSprite.width(), sh = statusSprite.height();
   bool isLand = sw > sh;
   int titleH = isLand ? 22 : 28;
-  int sprite_y = sy - SPRITE_Y;
+  int sprite_y = sy - g_spriteY;
 
   if (sprite_y < titleH) { navState = NAV_SETTINGS; resetFeedbackMs = 0; resetFeedbackBtn = -1; return; }
 
@@ -6368,12 +6588,47 @@ void handleRF433SettingsTap(int16_t sx, int16_t sy) {
   int  sw          = statusSprite.width();
   int  sh          = statusSprite.height();
   bool isLandscape = sw > sh;
-  int  sprite_y    = sy - SPRITE_Y;
+  int  sprite_y    = sy - g_spriteY;
 
   static const int ITEM_COUNT = 7;
   int divY     = isLandscape ? 22 : 26;
   int startY   = divY + 4;
-  int btnH     = isLandscape ? 14 : 22;
+  int btnH     = isLandscape ? 20 : 30;
+  int btnY     = sh - 6 - btnH;
+  int sepY     = btnY - 6;
+  int rowH     = isLandscape ? 20 : 26;
+  int rowsArea = sepY - startY;
+  int visRows  = constrain(rowsArea / rowH, 1, ITEM_COUNT);
+
+  // Row item taps — tap once to select, tap selected item to execute
+  for (int i = 0; i < visRows; i++) {
+    int idx  = i + settingsScrollOffset;
+    if (idx >= ITEM_COUNT) break;
+    int rowY = startY + i * rowH;
+    if (sprite_y >= rowY && sprite_y < rowY + rowH) {
+      if (settingsCursor == idx) onKey1Short();  // already selected → execute action
+      else                       settingsCursor = idx;
+      return;
+    }
+  }
+  // APPLY / CANCEL buttons
+  if (sprite_y >= btnY && sprite_y < btnY + btnH) {
+    if (sx < sw / 2) onKey1Long();   // APPLY (close)
+    else             onKey2Long();   // CANCEL
+  }
+}
+
+// ── IR settings tap handler ───────────────────────────────────────
+void handleIRSettingsTap(int16_t sx, int16_t sy) {
+  int  sw          = statusSprite.width();
+  int  sh          = statusSprite.height();
+  bool isLandscape = sw > sh;
+  int  sprite_y    = sy - g_spriteY;
+
+  static const int ITEM_COUNT = 7;
+  int divY     = isLandscape ? 22 : 26;
+  int startY   = divY + 4;
+  int btnH     = isLandscape ? 20 : 30;
   int btnY     = sh - 6 - btnH;
   int sepY     = btnY - 6;
   int rowH     = isLandscape ? 20 : 26;
@@ -6633,9 +6888,10 @@ void irLearnStart() {
 void irLearnStop() {
   if (!irLearnMode) { serialWritelnAll("Learn mode not active."); return; }
   IrReceiver.stop();
-  digitalWrite(GROVE_POWER_EN, LOW);  // cut GROVE power — unit no longer needed
+  if (!rf433LearnMode) digitalWrite(GROVE_POWER_EN, LOW);
   irLearnMode  = false;
   irLearnReady = false;
+  irAutoMode   = false;
   serialWritelnAll("IR learn mode OFF.");
 }
 
@@ -6823,23 +7079,11 @@ static void irCustomBind(const char* label) {
   }
 
   if (dupIdx >= 0 && dupIdx != lblIdx) {
-    // Same code already on a different button — rename that one
+    // Same code already on a different button — warn only, don't rename or delete
     char msg[80];
-    snprintf(msg, sizeof(msg), "Overwriting duplicate on '%s' -> '%s'",
-             irBtns[dupIdx].label, label);
+    snprintf(msg, sizeof(msg), "[IR] Note: same code already assigned to '%s'.",
+             irBtns[dupIdx].label);
     serialWritelnAll(msg);
-    strlcpy(irBtns[dupIdx].label, label, sizeof(irBtns[dupIdx].label));
-    // Remove stale button that had the same label (if any)
-    if (lblIdx >= 0 && lblIdx != dupIdx) {
-      for (int i = lblIdx; i < irBtnCount - 1; i++) irBtns[i] = irBtns[i+1];
-      irBtnCount--;
-    }
-    irCustomSave();
-    irLoadDevice(irLoadedPath);
-    irLearnReady = false;
-    if (currentFunction == FUNCTION_IR) irLevel = IR_LEVEL_REMOTE;
-    serialWritelnAll("Saved.");
-    return;
   }
 
   // Slot: reuse existing label slot or add new
@@ -6878,10 +7122,33 @@ static void irCustomBind(const char* label) {
   serialWritelnAll(msg);
 }
 
+static void irAutoNew() {
+  LittleFS.mkdir("/irdb/Custom");
+  char name[16], path[80];
+  for (int n = 1; n <= 99; n++) {
+    snprintf(name, sizeof(name), "Remote_%02d", n);
+    snprintf(path, sizeof(path), "/irdb/Custom/%s.ir", name);
+    if (!LittleFS.exists(path)) { irCustomNew(name); return; }
+  }
+  irCustomNew("Remote");
+}
+
+static void irAutoBind() {
+  if (!irLearnReady) return;
+  char label[12];
+  for (int n = 1; n <= 99; n++) {
+    snprintf(label, sizeof(label), "Btn_%02d", n);
+    bool dup = false;
+    for (int i = 0; i < irBtnCount; i++)
+      if (!strcasecmp(irBtns[i].label, label)) { dup = true; break; }
+    if (!dup) { irCustomBind(label); return; }
+  }
+  irCustomBind("Btn");
+}
+
 void initIR() {
   IrSender.begin(IR_SEND_PIN);
   display.fillScreen(BG_COLOR);
-  renderHeader();
   irBtnPageOff = 0;
   irOpenDir("/irdb");
   if (irSavedPath[0] != '\0') {
@@ -7161,19 +7428,26 @@ static void irDrawBtn(int idx, int bx, int by, int bw, int bh) {
   BtnType t = irClassBtn(label);
   bool flashing = (irFlashIdx == idx) && irFlashMs > 0 &&
                   (millis() - irFlashMs) < 200;
-  uint16_t edge = flashing ? display.color565(255,230,120) : irBtnEdgeColor(t);
-  uint16_t bg;
-  int radius;
-  switch (t) {
-    case BT_POWER:   bg=display.color565(28,4,2);  radius=6; break;
-    case BT_NAV_OK:  bg=display.color565(2,18,14); radius=6; break;
-    case BT_VOL:     bg=display.color565(2,14,4);  radius=4; break;
-    case BT_CHAN:     bg=display.color565(3,8,20);  radius=4; break;
-    case BT_NAV_DIR: bg=display.color565(2,14,12); radius=4; break;
-    case BT_NUM:     bg=display.color565(10,10,12); radius=2; break;
-    default:         bg=display.color565(12,6,0);  radius=4; break;
+  uint16_t edge, bg;
+  int radius = 4;
+  if (irDeleteMode) {
+    bool pulse = (millis() / 500) % 2 == 0;
+    edge   = pulse ? display.color565(255, 60, 60) : display.color565(140, 30, 30);
+    bg     = display.color565(30, 5, 5);
+    radius = 4;
+  } else {
+    edge = flashing ? display.color565(255,230,120) : irBtnEdgeColor(t);
+    switch (t) {
+      case BT_POWER:   bg=display.color565(28,4,2);  radius=6; break;
+      case BT_NAV_OK:  bg=display.color565(2,18,14); radius=6; break;
+      case BT_VOL:     bg=display.color565(2,14,4);  radius=4; break;
+      case BT_CHAN:     bg=display.color565(3,8,20);  radius=4; break;
+      case BT_NAV_DIR: bg=display.color565(2,14,12); radius=4; break;
+      case BT_NUM:     bg=display.color565(10,10,12); radius=2; break;
+      default:         bg=display.color565(12,6,0);  radius=4; break;
+    }
+    if (flashing) bg = display.color565(50,28,4);
   }
-  if (flashing) bg = display.color565(50,28,4);
   statusSprite.fillRoundRect(bx, by, bw, bh, radius, bg);
   statusSprite.drawRoundRect(bx, by, bw, bh, radius, edge);
   if (label && *label) {
@@ -7181,6 +7455,91 @@ static void irDrawBtn(int idx, int bx, int by, int bw, int bh) {
     statusSprite.setTextSize(1);
     statusSprite.setTextColor(edge);
     statusSprite.drawString(label, bx+bw/2, by+bh/2);
+  }
+}
+
+void renderIRSettings() {
+  int sw = statusSprite.width();
+  int sh = statusSprite.height();
+  bool isLandscape = sw > sh;
+
+  statusSprite.fillSprite(COLOR_BLACK);
+  statusSprite.setFont(&fonts::Font0);
+
+  static const int ITEM_COUNT = 7;
+  const char* labels[ITEM_COUNT] = { "NEW REMOTE", "SELECT REMOTE", "DEL REMOTE", "CAPTURE BUTTON", "AUTO BIND", "DELETE BUTTON", "RESET" };
+  const char* values[ITEM_COUNT] = { "CREATE", "LIST", "REMOVE", "LEARN", "AUTO", "DEL", "\x10" };
+
+  int titleY = isLandscape ? 4 : 6;
+  int divY   = isLandscape ? 22 : 26;
+  statusSprite.setTextDatum(TC_DATUM);
+  statusSprite.setTextSize(2);
+  statusSprite.setTextColor(display.color565(180, 70, 0));
+  statusSprite.drawString("IR ACTIONS", sw / 2, titleY);
+  statusSprite.drawFastHLine(8, divY, sw - 16, display.color565(80, 30, 0));
+
+  int btnH = isLandscape ? 20 : 30;
+  int btnY = sh - 6 - btnH;
+  int sepY = btnY - 6;
+  statusSprite.drawFastHLine(8, sepY, sw - 16, display.color565(40, 40, 40));
+  int bw = (sw - 24) / 2;
+  statusSprite.fillRect(8,       btnY, bw, btnH, display.color565(0, 60, 0));
+  statusSprite.fillRect(16 + bw, btnY, bw, btnH, display.color565(60, 0, 0));
+  statusSprite.drawRect(8,       btnY, bw, btnH, COLOR_GREEN);
+  statusSprite.drawRect(16 + bw, btnY, bw, btnH, COLOR_RED);
+  statusSprite.setTextSize(1);
+  statusSprite.setTextDatum(MC_DATUM);
+  statusSprite.setTextColor(COLOR_GREEN);
+  statusSprite.drawString("APPLY",  8  + bw / 2,       btnY + btnH / 2);
+  statusSprite.setTextColor(COLOR_RED);
+  statusSprite.drawString("CANCEL", 16 + bw + bw / 2,  btnY + btnH / 2);
+
+  int startY   = divY + 4;
+  int rowH     = isLandscape ? 20 : 26;
+  int rowsArea = sepY - startY;
+  int visRows  = constrain(rowsArea / rowH, 1, ITEM_COUNT);
+
+  settingsScrollOffset = constrain(settingsScrollOffset, 0, ITEM_COUNT - visRows);
+  if (settingsCursor < settingsScrollOffset)
+    settingsScrollOffset = settingsCursor;
+  if (settingsCursor >= settingsScrollOffset + visRows)
+    settingsScrollOffset = settingsCursor - visRows + 1;
+
+  if (ITEM_COUNT > visRows) {
+    int barH = max(6, rowsArea * visRows / ITEM_COUNT);
+    int barY = startY + (rowsArea - barH) * settingsScrollOffset / max(1, ITEM_COUNT - visRows);
+    statusSprite.fillRect(sw - 4, startY, 3, rowsArea, display.color565(20, 20, 20));
+    statusSprite.fillRect(sw - 4, barY,   3, barH,     display.color565(80, 30, 0));
+  }
+
+  for (int i = 0; i < visRows; i++) {
+    int idx     = i + settingsScrollOffset;
+    if (idx >= ITEM_COUNT) break;
+    int y       = startY + i * rowH;
+    bool sel    = (idx == settingsCursor);
+    bool isReset = (idx == ITEM_COUNT - 1);
+    int textY   = y + (rowH - 8) / 2;
+
+    if (isReset && sel)
+      statusSprite.fillRect(4, y, sw - 8, rowH - 2, display.color565(60, 15, 15));
+    else if (sel)
+      statusSprite.fillRect(4, y, sw - 8, rowH - 2, display.color565(25, 10, 0));
+
+    statusSprite.setTextDatum(TL_DATUM);
+    statusSprite.setTextSize(1);
+    statusSprite.setTextColor(sel ? (isReset ? display.color565(255, 80, 80) : display.color565(200, 90, 0))
+                                  : display.color565(60, 60, 60));
+    statusSprite.drawString(sel ? ">" : " ", 6, textY);
+
+    statusSprite.setTextColor(sel ? COLOR_WHITE : (isReset ? display.color565(100, 40, 40) : COLOR_GRAY));
+    statusSprite.drawString(labels[idx], 14, textY);
+
+    statusSprite.setTextDatum(TR_DATUM);
+    statusSprite.setTextColor(sel ? display.color565(220, 100, 0) : display.color565(80, 50, 20));
+    statusSprite.drawString(values[idx], sw - 10, textY);
+
+    if (i < visRows - 1)
+      statusSprite.drawFastHLine(4, y + rowH - 1, sw - 8, display.color565(20, 20, 20));
   }
 }
 
@@ -7271,21 +7630,82 @@ static void renderIRRemote() {
   if (txAge < 500 && (txAge / 100) % 2 == 0)
     statusSprite.fillCircle(sw - 8, titleH/2, 4, display.color565(220,0,0));
 
-  // Learn mode indicator (left side of title bar)
-  if (irLearnMode) {
+  // Delete mode indicator (left side of title bar)
+  if (irDeleteMode) {
     bool pulse = (millis() / 400) % 2 == 0;
-    uint16_t dotCol = irLearnReady
-      ? display.color565(50, 220, 50)                        // green = ready to bind
-      : (pulse ? display.color565(220,180,0) : display.color565(70,55,0)); // amber blink
+    uint16_t dotCol = pulse ? display.color565(255, 60, 60) : display.color565(100, 20, 20);
     statusSprite.fillCircle(9, titleH/2, 4, dotCol);
     statusSprite.setTextDatum(TL_DATUM);
     statusSprite.setTextSize(1);
     statusSprite.setTextColor(dotCol);
-    statusSprite.drawString(irLearnReady ? "BIND" : "LEARN", 16, (titleH - 8) / 2);
+    statusSprite.drawString("DEL", 16, (titleH - 8) / 2);
+  }
+
+  // Learn mode indicator (left side of title bar)
+  if (irLearnMode) {
+    bool pulse = (millis() / 400) % 2 == 0;
+    uint16_t dotCol;
+    const char* modeLabel;
+    if (irAutoMode) {
+      dotCol    = pulse ? display.color565(220, 140, 0) : display.color565(90, 55, 0);
+      modeLabel = "AUTO";
+    } else if (irLearnReady) {
+      dotCol    = display.color565(50, 220, 50);
+      modeLabel = "BIND";
+    } else {
+      dotCol    = pulse ? display.color565(220, 180, 0) : display.color565(70, 55, 0);
+      modeLabel = "LEARN";
+    }
+    statusSprite.fillCircle(9, titleH/2, 4, dotCol);
+    statusSprite.setTextDatum(TL_DATUM);
+    statusSprite.setTextSize(1);
+    statusSprite.setTextColor(dotCol);
+    statusSprite.drawString(modeLabel, 16, (titleH - 8) / 2);
+  }
+
+  // Learn mode status/stop bar — only shown while learn mode is active
+  int learnH = irLearnMode ? (isLand ? 28 : 36) : 0;
+  int learnY = sh - learnH - 2;
+
+  if (irLearnMode) {
+    statusSprite.setTextSize(1);
+    if (irLearnReady) {
+      uint16_t bgL  = display.color565(25, 10, 0);
+      uint16_t bgR  = display.color565(0, 35, 12);
+      uint16_t colL = display.color565(180, 100, 40);
+      uint16_t colR = display.color565(80, 255, 120);
+      int mid = sw / 2;
+      statusSprite.fillRect(4,   learnY, mid - 6,      learnH, bgL);
+      statusSprite.fillRect(mid, learnY, sw - mid - 4, learnH, bgR);
+      statusSprite.drawRect(4,   learnY, sw - 8,       learnH, colR);
+      statusSprite.drawFastVLine(mid - 1, learnY + 1, learnH - 2, display.color565(60, 60, 60));
+      statusSprite.setTextDatum(MC_DATUM);
+      statusSprite.setTextColor(colL);
+      statusSprite.drawString("< RETRY", 4 + (mid - 10) / 2, learnY + learnH / 2);
+      statusSprite.setTextColor(colR);
+      statusSprite.drawString("NEW BUTTON >", mid + (sw - mid - 4) / 2, learnY + learnH / 2);
+    } else {
+      bool pulse = (millis() / 400) % 2 == 0;
+      int mid = sw / 3;
+      uint16_t lBg     = irAutoMode ? display.color565(20, 12, 0) : display.color565(20, 10, 0);
+      uint16_t colCanc = display.color565(120, 40, 40);
+      uint16_t lCol    = irAutoMode
+                           ? (pulse ? display.color565(220, 140, 0) : display.color565(90, 55, 0))
+                           : (pulse ? display.color565(220, 180, 0) : display.color565(70, 55, 0));
+      statusSprite.fillRect(4, learnY, sw - 8, learnH, lBg);
+      statusSprite.drawRect(4, learnY, sw - 8, learnH, lCol);
+      statusSprite.drawFastVLine(mid - 1, learnY + 1, learnH - 2, display.color565(50, 30, 30));
+      statusSprite.setTextDatum(MC_DATUM);
+      statusSprite.setTextColor(colCanc);
+      statusSprite.drawString("CANCEL", 4 + (mid - 6) / 2, learnY + learnH / 2);
+      statusSprite.setTextColor(lCol);
+      statusSprite.drawString(irAutoMode ? "AUTO BIND..." : "LISTENING...",
+                              mid + (sw - mid - 4) / 2, learnY + learnH / 2);
+    }
   }
 
   int areaY = titleH + 3;
-  int areaH = sh - areaY - 2;
+  int areaH = (irLearnMode ? learnY - 4 : sh - 2) - areaY;
 
   // Empty custom remote: show hint while waiting for first bind
   if (irBtnCount == 0) {
@@ -7991,8 +8411,8 @@ void renderRF433Settings() {
   statusSprite.setFont(&fonts::Font0);
 
   static const int ITEM_COUNT = 7;
-  const char* labels[ITEM_COUNT]  = { "NEW REMOTE", "CAPTURE BUTTON", "SELECT REMOTE", "DELETE BUTTON", "AUTO BIND", "DEL REMOTE", "RESET" };
-  const char* values[ITEM_COUNT]  = { "CREATE", "LEARN", "LIST", "DEL", "AUTO", "REMOVE", "\x10" };
+  const char* labels[ITEM_COUNT]  = { "NEW REMOTE", "SELECT REMOTE", "DEL REMOTE", "CAPTURE BUTTON", "AUTO BIND", "DELETE BUTTON", "RESET" };
+  const char* values[ITEM_COUNT]  = { "CREATE", "LIST", "REMOVE", "LEARN", "AUTO", "DEL", "\x10" };
 
   int titleY = isLandscape ? 4 : 6;
   int divY   = isLandscape ? 22 : 26;
@@ -8002,7 +8422,7 @@ void renderRF433Settings() {
   statusSprite.drawString("RF433 ACTIONS", sw / 2, titleY);
   statusSprite.drawFastHLine(8, divY, sw - 16, display.color565(0, 80, 40));
 
-  int btnH = isLandscape ? 14 : 22;
+  int btnH = isLandscape ? 20 : 30;
   int btnY = sh - 6 - btnH;
   int sepY = btnY - 6;
   statusSprite.drawFastHLine(8, sepY, sw - 16, display.color565(40, 40, 40));
@@ -8200,7 +8620,7 @@ static void renderRF433Remote() {
   }
 
   // Learn mode status/stop bar — only shown while learn mode is active
-  int learnH = rf433LearnMode ? (isLand ? 22 : 28) : 0;
+  int learnH = rf433LearnMode ? (isLand ? 28 : 36) : 0;
   int learnY = sh - learnH - 2;
 
   if (rf433LearnMode) {
@@ -8314,7 +8734,6 @@ void renderRF433() {
 
 void initRF433() {
   display.fillScreen(BG_COLOR);
-  renderHeader();
   rf433BtnOff  = 0;
   rf433ListOff = 0;
   if (rf433SavedPath[0] != '\0') {
