@@ -21,7 +21,7 @@ arduino-cli compile --fqbn "esp32:esp32:arduino_nesso_n1" --build-path "D:/Nesso
 ### Upload firmware
 
 ```powershell
-arduino-cli upload --fqbn "esp32:esp32:arduino_nesso_n1" --port COM3 Nesso_base.ino
+arduino-cli upload --fqbn "esp32:esp32:arduino_nesso_n1" --port COM3 --build-path "D:/Nesso_base/build" Nesso_base.ino
 ```
 
 ### Build & flash LittleFS image
@@ -309,39 +309,45 @@ ir learn stop
 
 GROVE 5V power (`GROVE_POWER_EN`) is enabled only during learn mode and briefly during transmission.
 
+> **TX pin must be LOW before GROVE power-on.** The SYN115 transmitter keys its 433 MHz carrier whenever its DATA pin is high or floating. With TX and RX on a Y-cable, a floating GPIO 5 causes severe self-interference on the SYN531R. `rf433LearnStart()` drives `RF433_TX_PIN` LOW before enabling GROVE power to prevent this.
+
 **Feature enable:** RF433 is **disabled by default** and hidden from navigation. Enable it from the Battery/Device settings screen (long-press KEY1 on battery screen → RF433 item) or via `rf433 enable` serial command.
 
-**File format:** `.433` files stored in `/rf433db/` hierarchy. Format mirrors `.ir`:
+**File format:** Custom remotes are saved as `.sub` files in `/rf433db/Custom/`. Legacy `.433` files are also read. Format:
 
 ```
-Filetype: RF433 signals file
+Filetype: Nesso SubGhz Remote
 Version: 1
+Frequency: 433920000
 #
 name: Button1
 type: raw
-data: 450 1350 450 450 1350 450 ...
+RAW_Data: 450 -1350 450 -450 1350 -450 ...
 ```
 
-Only `type: raw` is used — all captures are stored as raw OOK pulse timings in microseconds. Alternating HIGH/LOW durations starting from the first mark.
+Only `type: raw` is used. `RAW_Data` values follow Flipper SubGhz convention: positive = HIGH pulse duration (µs), negative = LOW pulse duration. Values alternate HIGH/LOW starting from the first mark. The reader also accepts the legacy `data:` field (all-positive, unsigned).
 
 **UI:** Two-level browser identical to IR — file list → remote button grid (2 columns, green accent). Tap title bar to go back to list.
 
 **Learn workflow:**
 
 ```
-rf433 custom new Garage          # creates /rf433db/Custom/Garage.433
-rf433 learn start                # powers GROVE, arms ISR on GPIO 4
+rf433 custom new Garage          # creates /rf433db/Custom/Garage.sub, loads it
+rf433 learn start                # drives TX LOW, powers GROVE, arms ISR on GPIO 4
 <press button on remote>
-# serial prints: [RF433] Captured: 68 pulses
+# serial prints: [RF433] Captured: 512 pulses T=300us (sync gap)
+#                [RF433] Decoded: 0x555503 (24-bit, T=300 us, ratio 1:3)
 rf433 learn bind Open            # saves button, updates file
 rf433 learn stop                 # cuts GROVE power
 ```
 
 **Signal capture details:**
-- ISR fires on every edge of GPIO 4 (CHANGE interrupt), records microsecond durations.
-- `rf433LearnPoll()` detects end-of-packet by 30 ms silence after last edge.
+- ISR fires on every edge of GPIO 4 (CHANGE interrupt), records µs edge durations into a 512-entry ISR buffer (`RF433_MAX_ISR_LEN`).
+- Buffer processes immediately when full; otherwise waits for 30 ms silence (end-of-packet gap).
+- PT2262/EV1527 remotes are identified by a sync gap pulse in the 9 500–11 500 µs range; this is the primary accept criterion for T=300 µs remotes (e.g. fans, gate openers) that share T with ambient ISM traffic.
+- If the remote signal arrived after ambient ISM already filled the first half of the buffer, the firmware falls back to storing the last 256 entries and re-checks for a decodable code.
 - Leading pre-signal silence (> 10 ms) and trailing gap (> 15 ms) are trimmed automatically.
-- Minimum valid capture: 8 pulses.
+- Minimum valid capture: 8 pulses after trim.
 - Signal is transmitted 3 × with 10 ms inter-frame gap.
 
 **IR / RF433 mutual exclusion:** `irLearnStart()` refuses if `rf433LearnMode` is active, and `rf433LearnStart()` refuses if `irLearnMode` is active. Both use GPIO 4 via different ISR handlers.
@@ -351,7 +357,8 @@ rf433 learn stop                 # cuts GROVE power
 ```cpp
 #define RF433_MAX_FILES   64
 #define RF433_MAX_BUTTONS 32
-#define RF433_MAX_RAW_LEN 256
+#define RF433_MAX_RAW_LEN 256  // max pulses stored per button / learn capture
+#define RF433_MAX_ISR_LEN 512  // ISR capture window (learn mode only — wider to outlast ambient fill)
 #define RF433_RX_PIN      4    // GROVE G4
 #define RF433_TX_PIN      5    // GROVE G5
 ```
@@ -362,13 +369,13 @@ rf433 learn stop                 # cuts GROVE power
 
 | Command | Description |
 |---|---|
-| `rf433 list` | List all scanned `.433` files |
+| `rf433 list` | List all scanned `.sub` / `.433` files |
 | `rf433 select <N>` | Load remote N and open UI |
 | `rf433 send <N> <label>` | Transmit button from remote N |
 | `rf433 reload` | Re-scan `/rf433db/` |
-| `rf433 custom new [name]` | Create new custom remote |
+| `rf433 custom new [name]` | Create new custom remote (`.sub`) |
 | `rf433 custom list` | List custom remotes |
-| `rf433 learn start` | Power GROVE and arm SYN531R receiver |
+| `rf433 learn start` | Drive TX LOW, power GROVE, arm SYN531R receiver |
 | `rf433 learn stop` | Stop capture, cut GROVE power |
 | `rf433 learn bind <label>` | Bind last capture to button label |
 | `rf433 learn show` | Print last captured signal info |

@@ -82,7 +82,8 @@ struct IRLearnData {
 // RF433 type definitions (before ArduinoJson so prototypes can reference them)
 #define RF433_MAX_FILES   64
 #define RF433_MAX_BUTTONS 32
-#define RF433_MAX_RAW_LEN 256
+#define RF433_MAX_RAW_LEN 256  // max pulses stored per button / learn capture
+#define RF433_MAX_ISR_LEN 512  // ISR capture window (learn mode only — 2× wider to outlast ambient fill)
 #define RF433_RX_PIN      4    // GROVE G4 — SYN531R demodulated output
 #define RF433_TX_PIN      5    // GROVE G5 — SYN115 data input
 
@@ -630,10 +631,11 @@ static int        rf433FlashIdx = -1;
 bool           rf433LearnMode  = false;
 bool           rf433LearnReady = false;
 RF433LearnData rf433LearnLast  = {};
-static uint32_t rf433LearnStartMs = 0;
+static uint32_t rf433LearnStartMs  = 0;
+static uint32_t       rf433BindMs      = 0;     // timestamp of last bind, for 2s post-bind pause
 
 // ISR capture buffer — written from interrupt, read from main loop
-static volatile uint16_t rf433RawBuf[RF433_MAX_RAW_LEN];
+static volatile uint16_t rf433RawBuf[RF433_MAX_ISR_LEN];
 static volatile int      rf433RawLen     = 0;
 static volatile uint32_t rf433LastEdgeUs = 0;
 
@@ -925,6 +927,8 @@ static void irCustomBind(const char* label);
 // Forward declarations for RF433 helpers
 void initRF433();
 void renderRF433();
+void renderRF433Settings();
+void handleRF433SettingsTap(int16_t sx, int16_t sy);
 void rf433ScanFiles();
 void rf433LoadDevice(const char* path);
 void rf433SendButton(int btnIdx);
@@ -932,8 +936,10 @@ void serialHandleRF433(const char* arg);
 void rf433LearnStart();
 void rf433LearnStop();
 void rf433LearnPoll();
-static bool rf433ValidateSignal(const uint16_t* pulses, uint16_t len);
-static void rf433TryDecode(const uint16_t* pulses, uint16_t len);
+static uint16_t rf433FindT(const uint16_t* pulses, int len);
+static int      rf433CleanQuantize(uint16_t* pulses, int len, uint16_t T);
+static bool     rf433ValidateSignal(const uint16_t* pulses, int len, char* dbg = nullptr, int dbgLen = 0);
+static uint32_t rf433TryDecode(const uint16_t* pulses, int len, bool printResult = true);
 static void rf433CustomNew(const char* name);
 static bool rf433CustomSave();
 static void rf433CustomBind(const char* label);
@@ -1446,6 +1452,8 @@ void onTap(int16_t sx, int16_t sy) {
     handleWiFiSettingsTap(sx, sy);
   } else if (navState == NAV_SETTINGS && currentFunction == FUNCTION_BATTERY) {
     handleBatterySettingsTap(sx, sy);
+  } else if (navState == NAV_SETTINGS && currentFunction == FUNCTION_RF433) {
+    handleRF433SettingsTap(sx, sy);
   } else if (currentFunction == FUNCTION_BT && navState == NAV_NORMAL) {
     if (btSelectedAddr[0] != '\0') {
       btSelectedAddr[0] = '\0';   // tap in detail view → back to list
@@ -1599,22 +1607,35 @@ void onTap(int16_t sx, int16_t sy) {
       }
     } else if (rf433Level == RF433_LEVEL_REMOTE) {
       int titleH  = isLand ? 22 : 26;
-      bool isCustom = rf433IsCustomFile();
-      int learnH  = isCustom ? (isLand ? 16 : 20) : 0;
-      int learnY  = sh - learnH - 2;
       if (sprite_y < titleH) { rf433Level = RF433_LEVEL_LIST; return; }
 
-      // LEARN bar tap
-      if (isCustom && sprite_y >= learnY && sprite_y < learnY + learnH) {
-        if (!rf433LearnMode) {
-          rf433LearnStart();
-        } else if (rf433LearnReady) {
-          // "ADD NEW" section — auto-bind with a generated name
-          rf433AutoBind();
-        } else {
-          rf433LearnStop();
+      // Learn mode bar tap:
+      //   CAPTURED  + left  → RETRY  (discard, back to LISTENING)
+      //   CAPTURED  + right → NEW    (auto-name + stop)
+      //   CONFIRMING + left → DISCARD first capture, back to LISTENING
+      //   CONFIRMING + right → no action (just UI info)
+      //   LISTENING + left  → CANCEL (stop learn mode)
+      //   LISTENING + right → ignored
+      //   WARMING UP → ignored
+      if (rf433LearnMode) {
+        int learnH = isLand ? 16 : 20;
+        int learnY = sh - learnH - 2;
+        if (sprite_y >= learnY && sprite_y < learnY + learnH) {
+          bool inGrace = (uint32_t)(millis() - rf433LearnStartMs) < 500;
+          if (rf433LearnReady) {
+            if (sx < sw / 2) {
+              // RETRY: discard CAPTURED, back to LISTENING
+              rf433LearnReady = false;
+              noInterrupts(); rf433RawLen = 0; rf433LastEdgeUs = micros(); interrupts();
+            } else {
+              rf433AutoBind();
+              rf433LearnStop();
+            }
+          } else if (!inGrace && sx < sw / 2) {
+            rf433LearnStop();  // CANCEL
+          }
+          return;
         }
-        return;
       }
 
       int areaY = titleH + 3;
@@ -1723,12 +1744,14 @@ void onSwipe(int16_t dx, int16_t dy) {
     // Vertical swipe
     if (navState == NAV_SETTINGS &&
         (currentFunction == FUNCTION_LORA || currentFunction == FUNCTION_BT ||
-         currentFunction == FUNCTION_WIFI  || currentFunction == FUNCTION_BATTERY)) {
+         currentFunction == FUNCTION_WIFI  || currentFunction == FUNCTION_BATTERY ||
+         currentFunction == FUNCTION_RF433)) {
       // Move the cursor — the render function will update settingsScrollOffset to track it
       int maxCursor;
       if      (currentFunction == FUNCTION_WIFI)    maxCursor = 2;  // 3 items
       else if (currentFunction == FUNCTION_LORA)    maxCursor = 4;  // 5 items
       else if (currentFunction == FUNCTION_BT)      maxCursor = 5;  // 6 items
+      else if (currentFunction == FUNCTION_RF433)   maxCursor = 3;  // 4 items
       else /* BATTERY */                            maxCursor = 5;  // 6 items
       if (dy < 0) settingsCursor = min(settingsCursor + 1, maxCursor);
       else        settingsCursor = max(settingsCursor - 1, 0);
@@ -1834,7 +1857,8 @@ void onKey1Short() {
     if ((currentFunction == FUNCTION_WIFI    && settingsCursor == 2) ||
         (currentFunction == FUNCTION_LORA    && settingsCursor == 4) ||
         (currentFunction == FUNCTION_BT      && settingsCursor == 5) ||
-        (currentFunction == FUNCTION_BATTERY && settingsCursor == 5)) {
+        (currentFunction == FUNCTION_BATTERY && settingsCursor == 5) ||
+        (currentFunction == FUNCTION_RF433   && settingsCursor == 3)) {
       navState = NAV_RESET;
       resetFeedbackMs = 0; resetFeedbackBtn = -1;
       return;
@@ -1867,6 +1891,23 @@ void onKey1Short() {
         case 3: uiClickEnabled  = !uiClickEnabled;                              break;
         case 4: rf433Enabled    = !rf433Enabled;                                break;
       }
+    } else if (currentFunction == FUNCTION_RF433) {
+      switch (settingsCursor) {
+        case 0:  // NEW REMOTE — create and navigate to it
+          rf433AutoNew();
+          navState = NAV_NORMAL;
+          break;
+        case 1:  // CAPTURE BUTTON — start learn mode; user taps button to bind
+          if (!rf433LoadedPath[0] || !rf433IsCustomFile()) rf433AutoNew();
+          rf433LearnStart();
+          navState = NAV_NORMAL;
+          break;
+        case 2:  // SELECT REMOTE — go to file list
+          navState = NAV_NORMAL;
+          rf433Level = RF433_LEVEL_LIST;
+          break;
+        // case 3 = RESET — handled above
+      }
     }
   }
 }
@@ -1889,15 +1930,23 @@ void onKey2Short() {
       settingsCursor = (settingsCursor + 1) % 6;  // 5 items + RESET
     else if (currentFunction == FUNCTION_BATTERY)
       settingsCursor = (settingsCursor + 1) % 6;  // 5 items + RESET
+    else if (currentFunction == FUNCTION_RF433)
+      settingsCursor = (settingsCursor + 1) % 4;  // NEW / CAPTURE / SELECT / RESET
   }
 }
 
 // KEY1 long — enter settings / apply settings
 void onKey1Long() {
   uiClick(500, 35);
+  // Special case: long-press cancels RF433 learn mode from the remote view
+  if (navState == NAV_NORMAL && currentFunction == FUNCTION_RF433 && rf433LearnMode) {
+    rf433LearnStop();
+    return;
+  }
   if (navState == NAV_NORMAL) {
     if (currentFunction == FUNCTION_LORA || currentFunction == FUNCTION_BT ||
-        currentFunction == FUNCTION_WIFI  || currentFunction == FUNCTION_BATTERY) {
+        currentFunction == FUNCTION_WIFI  || currentFunction == FUNCTION_BATTERY ||
+        currentFunction == FUNCTION_RF433) {
       navState             = NAV_SETTINGS;
       settingsCursor       = 0;
       settingsScrollOffset = 0;
@@ -1908,6 +1957,7 @@ void onKey1Long() {
     else if (currentFunction == FUNCTION_LORA) applyLoraSettings();
     else if (currentFunction == FUNCTION_BT) applyBTSettings();
     else if (currentFunction == FUNCTION_BATTERY) applyDeviceSettings();
+    // RF433: no persistent settings to apply, just close
     navState = NAV_NORMAL;
     // No lastFunction = -1 here: the sprite-based screens redraw every frame
     // without needing a full display.fillScreen() call, so clearing lastFunction
@@ -2494,12 +2544,16 @@ void serialHandleRF433(const char* arg) {
     return;
   }
   if (cmdIs(arg,"list")) {
+    // Show * for the currently loaded path (rf433LoadedPath) or, if nothing is
+    // loaded yet this session, fall back to the NVS-saved path (rf433SavedPath).
+    const char* curPath = rf433LoadedPath[0] ? rf433LoadedPath : rf433SavedPath;
     char buf[80];
     for (int i = 0; i < rf433FileCount; i++) {
-      snprintf(buf, sizeof(buf), "%2d: [%c] %s", i, i == rf433SelectedIdx ? '*' : ' ', rf433Files[i].name);
+      bool sel = curPath[0] && !strcmp(rf433Files[i].path, curPath);
+      snprintf(buf, sizeof(buf), "%2d: [%c] %s", i, sel ? '*' : ' ', rf433Files[i].name);
       serialWritelnAll(buf);
     }
-    if (rf433FileCount == 0) serialWritelnAll("No .sub files found in /rf433db/");
+    if (rf433FileCount == 0) serialWritelnAll("No remotes found in /rf433db/ (.sub or .433)");
   } else if (cmdIs(arg,"reload")) {
     rf433ScanFiles();
     char buf[40]; snprintf(buf, sizeof(buf), "Found %d remote(s).", rf433FileCount);
@@ -2551,14 +2605,20 @@ void serialHandleRF433(const char* arg) {
         rf433CustomNew(name);
       }
     } else if (cmdIs(sub,"list")) {
+      const char* curPath = rf433LoadedPath[0] ? rf433LoadedPath : rf433SavedPath;
       File dir = LittleFS.open("/rf433db/Custom");
       if (!dir || !dir.isDirectory()) {
         serialWritelnAll("No custom remotes found.");
       } else {
         int cnt = 0; File entry;
         while ((entry = dir.openNextFile())) {
-          String n = entry.name(); entry.close();
-          if (n.endsWith(".sub")) { serialWritelnAll(n.c_str()); cnt++; }
+          String fname = entry.name(); entry.close();
+          if (!fname.endsWith(".sub") && !fname.endsWith(".433")) continue;
+          char fullPath[80];
+          snprintf(fullPath, sizeof(fullPath), "/rf433db/Custom/%s", fname.c_str());
+          bool sel = curPath[0] && !strcmp(fullPath, curPath);
+          char line[96]; snprintf(line, sizeof(line), "[%c] %s", sel ? '*' : ' ', fname.c_str());
+          serialWritelnAll(line); cnt++;
         }
         if (cnt == 0) serialWritelnAll("No custom remotes found.");
       }
@@ -2587,6 +2647,40 @@ void serialHandleRF433(const char* arg) {
     } else {
       serialWritelnAll("Usage: rf433 learn start | stop | bind <label> | show");
     }
+  } else if (cmdIs(arg,"rename")) {
+    const char* newName = cmdArg(arg,"rename");
+    if (!*newName) {
+      serialWritelnAll("Usage: rf433 rename <new name>  (renames the currently loaded custom remote)");
+      return;
+    }
+    if (!rf433LoadedPath[0]) { serialWritelnAll("[RF433] No remote loaded."); return; }
+    if (!rf433IsCustomFile()) { serialWritelnAll("[RF433] Only custom remotes can be renamed."); return; }
+    // Build new filename — replace spaces with underscores
+    char safeName[40];
+    strlcpy(safeName, newName, sizeof(safeName));
+    for (char* p = safeName; *p; p++) if (*p == ' ') *p = '_';
+    char newPath[80];
+    snprintf(newPath, sizeof(newPath), "/rf433db/Custom/%s.sub", safeName);
+    if (LittleFS.exists(newPath)) { serialWritelnAll("[RF433] ERROR: a remote with that name already exists."); return; }
+    if (!LittleFS.rename(rf433LoadedPath, newPath)) {
+      serialWritelnAll("[RF433] ERROR: rename failed.");
+      return;
+    }
+    // Update NVS path if this was the saved remote
+    if (!strcmp(rf433SavedPath, rf433LoadedPath)) {
+      strlcpy(rf433SavedPath, newPath, sizeof(rf433SavedPath));
+      saveSettings();
+    }
+    strlcpy(rf433LoadedPath, newPath, sizeof(rf433LoadedPath));
+    strlcpy(rf433LoadedName, safeName, sizeof(rf433LoadedName));
+    rf433ScanFiles();
+    // Update selected index
+    rf433SelectedIdx = -1;
+    for (int i = 0; i < rf433FileCount; i++)
+      if (!strcmp(rf433Files[i].path, newPath)) { rf433SelectedIdx = i; break; }
+    char buf[80];
+    snprintf(buf, sizeof(buf), "[RF433] Renamed to '%s'.", safeName);
+    serialWritelnAll(buf);
   } else if (cmdIs(arg,"enable")) {
     rf433Enabled = true;
     saveSettings();
@@ -3050,7 +3144,8 @@ void renderFunction() {
 
     case FUNCTION_RF433:
       if (lastFunction != (int)FUNCTION_RF433) initRF433();
-      renderRF433();
+      if (navState == NAV_SETTINGS) renderRF433Settings();
+      else                          renderRF433();
       statusSprite.pushSprite(0, SPRITE_Y);
       break;
 
@@ -6147,6 +6242,41 @@ void handleBatteryResetTap(int16_t sx, int16_t sy) {
   handleResetPageTap(sx, sy, 1, doBatteryReset);
 }
 
+// ── RF433 settings tap handler ────────────────────────────────────
+void handleRF433SettingsTap(int16_t sx, int16_t sy) {
+  int  sw          = statusSprite.width();
+  int  sh          = statusSprite.height();
+  bool isLandscape = sw > sh;
+  int  sprite_y    = sy - SPRITE_Y;
+
+  static const int ITEM_COUNT = 4;
+  int divY     = isLandscape ? 22 : 26;
+  int startY   = divY + 4;
+  int btnH     = isLandscape ? 14 : 22;
+  int btnY     = sh - 6 - btnH;
+  int sepY     = btnY - 6;
+  int rowH     = isLandscape ? 20 : 26;
+  int rowsArea = sepY - startY;
+  int visRows  = constrain(rowsArea / rowH, 1, ITEM_COUNT);
+
+  // Row item taps — tap once to select, tap selected item to execute
+  for (int i = 0; i < visRows; i++) {
+    int idx  = i + settingsScrollOffset;
+    if (idx >= ITEM_COUNT) break;
+    int rowY = startY + i * rowH;
+    if (sprite_y >= rowY && sprite_y < rowY + rowH) {
+      if (settingsCursor == idx) onKey1Short();  // already selected → execute action
+      else                       settingsCursor = idx;
+      return;
+    }
+  }
+  // APPLY / CANCEL buttons
+  if (sprite_y >= btnY && sprite_y < btnY + btnH) {
+    if (sx < sw / 2) onKey1Long();   // APPLY (close)
+    else             onKey2Long();   // CANCEL
+  }
+}
+
 // ================================================================
 // FUNCTION_IR — IR Remote Control (LittleFS .ir file based)
 // ================================================================
@@ -7086,7 +7216,7 @@ static void IRAM_ATTR rf433RxISR() {
   uint32_t now = micros();
   uint32_t dt  = now - rf433LastEdgeUs;
   rf433LastEdgeUs = now;
-  if (rf433RawLen < RF433_MAX_RAW_LEN)
+  if (rf433RawLen < RF433_MAX_ISR_LEN)
     rf433RawBuf[rf433RawLen++] = (uint16_t)(dt > 65000u ? 65000u : dt);
 }
 
@@ -7107,7 +7237,9 @@ static void rf433ScanDir(const char* dirPath) {
       const char* slash    = strrchr(pathBuf, '/');
       const char* fileName = slash ? slash + 1 : pathBuf;
       int len = strlen(fileName);
-      if (len > 4 && !strcasecmp(fileName + len - 4, ".sub")) {
+      bool isSub = len > 4 && !strcasecmp(fileName + len - 4, ".sub");
+      bool is433 = len > 4 && !strcasecmp(fileName + len - 4, ".433");
+      if (isSub || is433) {
         strlcpy(rf433Files[rf433FileCount].path, pathBuf, 64);
         strlcpy(rf433Files[rf433FileCount].name, fileName, 40);
         int nlen = strlen(rf433Files[rf433FileCount].name);
@@ -7134,7 +7266,8 @@ void rf433LoadDevice(const char* path) {
   const char* sl = strrchr(path, '/');
   strlcpy(rf433LoadedName, sl ? sl + 1 : path, sizeof(rf433LoadedName));
   int nl = strlen(rf433LoadedName);
-  if (nl > 4 && !strcasecmp(rf433LoadedName + nl - 4, ".sub")) rf433LoadedName[nl - 4] = '\0';
+  if (nl > 4 && (!strcasecmp(rf433LoadedName+nl-4,".sub") || !strcasecmp(rf433LoadedName+nl-4,".433")))
+    rf433LoadedName[nl - 4] = '\0';
   rf433SelectedIdx = -1;
   for (int i = 0; i < rf433FileCount; i++)
     if (!strcmp(rf433Files[i].path, path)) { rf433SelectedIdx = i; break; }
@@ -7232,6 +7365,10 @@ void rf433LearnStart() {
   if (rf433LearnMode) { serialWritelnAll("[RF433] Already in learn mode."); return; }
   if (irLearnMode)    { serialWritelnAll("[RF433] IR learn mode active — stop it first."); return; }
 
+  // Drive TX pin LOW before powering GROVE — SYN115 transmits whenever DATA is high/floating.
+  pinMode(RF433_TX_PIN, OUTPUT);
+  digitalWrite(RF433_TX_PIN, LOW);
+
   pinMode(GROVE_POWER_EN, OUTPUT);
   digitalWrite(GROVE_POWER_EN, HIGH);
   delay(80);
@@ -7244,9 +7381,9 @@ void rf433LearnStart() {
   attachInterrupt(digitalPinToInterrupt(RF433_RX_PIN), rf433RxISR, CHANGE);
   rf433LearnMode    = true;
   rf433LearnReady   = false;
+  rf433BindMs       = 0;
   rf433LearnStartMs = millis();
-  serialWritelnAll("[RF433] Learn mode ON — point remote at the RF433R unit and press a button.");
-  serialWritelnAll("  Then: rf433 learn bind <label>  (or tap an existing button in the UI).");
+  serialWritelnAll("[RF433] Learn mode ON — press a button on your remote.");
 }
 
 void rf433LearnStop() {
@@ -7258,66 +7395,184 @@ void rf433LearnStop() {
   serialWritelnAll("[RF433] Learn mode OFF.");
 }
 
-// Validate that a captured pulse train looks like a real OOK signal.
-// Rejects pure noise (all sub-100 µs spikes) while accepting any real remote.
-static bool rf433ValidateSignal(const uint16_t* pulses, uint16_t len) {
-  if (len < 20) return false;
-  int valid = 0, tooShort = 0;
+// Returns the dominant short pulse width T in µs (bin center of the histogram
+// peak), or 0 if no dominant bin (< 15% concentration).
+// 400µs-wide bins absorb SYN531R hardware jitter without splitting one T across
+// two adjacent buckets.  Sub-100µs ringing spikes are excluded from the count.
+static uint16_t rf433FindT(const uint16_t* pulses, int len) {
+  uint8_t hist[74] = {};
+  int valid = 0;
   for (int i = 0; i < len; i++) {
-    if (pulses[i] >= 100 && pulses[i] < 30000) valid++;
-    else if (pulses[i] < 100)                  tooShort++;
+    if (pulses[i] >= 100 && pulses[i] < 30000) {
+      int b = (pulses[i] - 100) / 400;
+      if (b < 74) { hist[b]++; valid++; }
+    }
   }
-  // Require at least 20 OOK-range pulses; reject if >40% are noise spikes
-  return valid >= 20 && (tooShort * 100 / (int)len < 40);
+  if (!valid) return 0;
+  int peak = 0, peakBin = 0;
+  for (int i = 0; i < 74; i++) if (hist[i] > peak) { peak = hist[i]; peakBin = i; }
+  if (peak * 100 / valid < 15) return 0;
+  return (uint16_t)(100 + peakBin * 400 + 200);  // centre of dominant bin
 }
 
-// After a successful capture, attempt to decode the OOK timing pattern and
-// print the decoded info to serial (informational only — always stored as RAW).
-static void rf433TryDecode(const uint16_t* pulses, uint16_t len) {
-  // Find the smallest pulse (timing unit T candidate)
-  uint16_t T = 65000;
-  for (int i = 0; i < len; i++)
-    if (pulses[i] >= 100 && pulses[i] < 10000 && pulses[i] < T) T = pulses[i];
-  if (T >= 10000) return;
+// Clean a captured pulse array in-place:
+//   1. Merge sub-100µs SYN531R ringing spikes into their neighbours
+//      (removes 2 elements per spike, preserving HIGH/LOW polarity alignment).
+//   2. Quantize remaining pulses to the nearest integer multiple of T
+//      (tolerance ±40% of the quantised value; very long sync pulses > 50T
+//      are left unchanged).
+// Returns the new array length.
+static int rf433CleanQuantize(uint16_t* pulses, int len, uint16_t T) {
+  if (T < 50) return len;
+  // Pass 1: spike merge
+  int i = 0;
+  while (i < len) {
+    if (pulses[i] < 100) {
+      if (i > 0 && i + 1 < len) {
+        // merge [i-1, spike, i+1] → [i-1 + spike + i+1], remove 2 elements
+        pulses[i-1] += pulses[i] + pulses[i+1];
+        memmove(&pulses[i], &pulses[i+2], (len - i - 2) * sizeof(uint16_t));
+        len -= 2;
+        if (i > 0) i--;
+      } else {
+        // leading or trailing spike — just drop it
+        memmove(&pulses[i], &pulses[i+1], (len - i - 1) * sizeof(uint16_t));
+        len--;
+      }
+    } else {
+      i++;
+    }
+  }
+  // Pass 2: quantise to N*T
+  for (i = 0; i < len; i++) {
+    uint16_t p = pulses[i];
+    if (p < 100 || p >= 30000) continue;
+    int n = (p + T/2) / T;
+    if (n < 1) n = 1;
+    if (n > 50) continue;  // keep long sync pulses as-is
+    uint16_t q = (uint16_t)(n * T);
+    if (abs((int)p - (int)q) * 100 / q <= 40) pulses[i] = q;
+  }
+  return len;
+}
 
-  // Group pulses: "short" ≈ T, "long" ≈ nT; check that long ≈ 2T, 3T, or 4T
+// Validate that a captured pulse train looks like a real OOK remote signal.
+// Requires ≥ 16 valid (100–30000µs) pulses AND a dominant histogram bin.
+static bool rf433ValidateSignal(const uint16_t* pulses, int len,
+                                 char* dbgBuf, int dbgLen) {
+  if (len < 16) {
+    if (dbgBuf) snprintf(dbgBuf, dbgLen, "too few pulses (%d)", len);
+    return false;
+  }
+  int valid = 0;
+  for (int i = 0; i < len; i++)
+    if (pulses[i] >= 100 && pulses[i] < 30000) valid++;
+  if (valid < 16) {
+    if (dbgBuf) snprintf(dbgBuf, dbgLen, "only %d OOK-range pulses (of %d)", valid, len);
+    return false;
+  }
+  uint16_t T = rf433FindT(pulses, len);
+  if (!T) {
+    if (dbgBuf) {
+      // recompute peak% for the diagnostic message
+      uint8_t hist[74] = {};
+      for (int i = 0; i < len; i++) {
+        if (pulses[i] >= 100 && pulses[i] < 30000) {
+          int b = (pulses[i]-100)/400; if (b < 74) hist[b]++;
+        }
+      }
+      int pk = 0, pkBin = 0;
+      for (int i = 0; i < 74; i++) if (hist[i]>pk) { pk=hist[i]; pkBin=i; }
+      snprintf(dbgBuf, dbgLen, "no dominant bin (peak=%d%% at ~%dus)",
+               pk*100/valid, 100+pkBin*400);
+    }
+    return false;
+  }
+  return true;
+}
+
+// Attempt to decode a cleaned OOK pulse array.  Returns the decoded code value,
+// or 0 on failure (can't find T, too few long data pulses, non-integer ratio,
+// or not enough clean decoded bits).
+// Uses histogram-based T (rf433FindT) so stray unquantizable pulses in the
+// 100-300µs range don't corrupt the T estimate the way min-pulse detection does.
+// Protocol 1 (PT2262/EV1527): varying mark and space — mark(1T)+space(3T)=0, mark(3T)+space(1T)=1
+// Protocol 2 (pulse-interval): constant short mark, varying space — space(T)=0, space(2T)=1
+// Both tried from 'start'; best result (most bits) stored in bestBits/bestVal.
+static void rf433DecodeFrom(const uint16_t* pulses, int len, int start,
+                             uint16_t T, uint32_t syncThresh,
+                             uint32_t& bestVal, int& bestBits) {
+  // Protocol 1
+  {
+    uint32_t val = 0; int bits = 0;
+    for (int i = start; i + 1 < len && bits < 32; i += 2) {
+      uint16_t mark  = pulses[i];
+      uint16_t space = pulses[i + 1];
+      if (mark >= syncThresh || space >= syncThresh) break;
+      bool ms = mark  < T * 3 / 2;
+      bool ss = space < T * 3 / 2;
+      if      ( ms && !ss) { val = (val << 1);     bits++; }
+      else if (!ms &&  ss) { val = (val << 1) | 1; bits++; }
+      else break;
+    }
+    if (bits > bestBits) { bestBits = bits; bestVal = val; }
+  }
+  // Protocol 2: mark always short (~T/2 to T); space T=bit-0, 2T=bit-1
+  {
+    uint32_t val = 0; int bits = 0;
+    for (int i = start; i + 1 < len && bits < 32; i += 2) {
+      uint16_t mark  = pulses[i];
+      uint16_t space = pulses[i + 1];
+      if (mark >= syncThresh || space >= syncThresh) break;
+      if (mark >= T * 3 / 2) break;  // mark must stay short
+      val = (val << 1) | (space < T * 3 / 2 ? 0 : 1);
+      bits++;
+    }
+    if (bits > bestBits) { bestBits = bits; bestVal = val; }
+  }
+}
+
+static uint32_t rf433TryDecode(const uint16_t* pulses, int len, bool printResult) {
+  uint16_t T = rf433FindT(pulses, len);
+  if (!T) return 0;
+
   uint32_t longSum = 0; int longCnt = 0;
   for (int i = 0; i < len; i++) {
     uint16_t p = pulses[i];
-    if (p >= 100 && p < 10000 && p > T * 3 / 2) { longSum += p; longCnt++; }
+    if (p > T * 3 / 2 && p < (uint32_t)T * 8) { longSum += p; longCnt++; }
   }
-  if (longCnt < 4) return;
+  if (longCnt < 4) return 0;
 
   uint16_t avgLong = (uint16_t)(longSum / longCnt);
-  int ratio = (avgLong * 10 + T / 2) / T;  // ×10 to get one decimal
+  int ratio = ((int)avgLong * 10 + T / 2) / T;
   int ratioWhole = ratio / 10;
+  if (ratioWhole < 2 || ratioWhole > 5 || (ratio % 10) > 3) return 0;
 
-  // Only accept clean integer ratios 2–5
-  if (ratioWhole < 2 || ratioWhole > 5 || (ratio % 10) > 3) return;
+  // Use 6T as sync threshold: catches EV1527's 31T and this fan remote's 8T sync.
+  uint32_t syncThresh = (uint32_t)T * 6;
+  uint32_t bestVal = 0; int bestBits = 0;
 
-  // Try to reconstruct bits (mark-space PWM encoding)
-  // Bit 0 = short mark + long space, Bit 1 = long mark + short space (or inverse)
-  uint32_t value = 0; int bits = 0;
-  for (int i = 0; i + 1 < len && bits < 32; i += 2) {
-    uint16_t mark = pulses[i], space = pulses[i + 1];
-    if (mark < 30000 && space < 30000) {
-      bool markShort  = mark  < T * 3 / 2;
-      bool spaceShort = space < T * 3 / 2;
-      if (markShort && !spaceShort)       { value = (value << 1) | 0; bits++; }
-      else if (!markShort && spaceShort)  { value = (value << 1) | 1; bits++; }
-      else break;
+  for (int i = 0; i < len && bestBits < 24; i++) {
+    if (pulses[i] >= syncThresh) {
+      if (i + 1 < len) rf433DecodeFrom(pulses, len, i + 1, T, syncThresh, bestVal, bestBits);
+      if (i + 2 < len) rf433DecodeFrom(pulses, len, i + 2, T, syncThresh, bestVal, bestBits);
     }
   }
-  if (bits < 8) return;
+  if (bestBits < 8) rf433DecodeFrom(pulses, len, 0, T, syncThresh, bestVal, bestBits);
 
-  char buf[80];
-  snprintf(buf, sizeof(buf), "[RF433] Decoded: 0x%0*lX (%d-bit, T=%d us, ratio 1:%d)",
-           (bits + 3) / 4, (unsigned long)value, bits, (int)T, ratioWhole);
-  serialWritelnAll(buf);
+  if (bestBits < 8) return 0;
+
+  if (printResult) {
+    char buf[80];
+    snprintf(buf, sizeof(buf), "[RF433] Decoded: 0x%0*lX (%d-bit, T=%d us, ratio 1:%d)",
+             (bestBits + 3) / 4, (unsigned long)bestVal, bestBits, (int)T, ratioWhole);
+    serialWritelnAll(buf);
+  }
+  return bestVal ? bestVal : 0xFFFFFFFF;
 }
 
 void rf433LearnPoll() {
-  if (!rf433LearnMode || rf433LearnReady) return;
+  if (!rf433LearnMode) return;
 
   // Discard noise accumulated while GROVE rail and SYN531R were stabilizing
   if ((uint32_t)(millis() - rf433LearnStartMs) < 500) {
@@ -7331,40 +7586,112 @@ void rf433LearnPoll() {
 
   if (len < 8) return;
 
-  if ((uint32_t)(micros() - rf433LastEdgeUs) < 30000UL) return;
+  // CAPTURED: hold state until user explicitly acts (RETRY tap or bind)
+  if (rf433LearnReady) return;
 
+  // Post-bind pause: 2s silence after a bind before accepting new captures
+  if ((uint32_t)(millis() - rf433BindMs) < 2000) {
+    noInterrupts(); rf433RawLen = 0; rf433LastEdgeUs = micros(); interrupts();
+    return;
+  }
+
+  // Process immediately when buffer is full (ISR has been dropping edges — no point waiting).
+  // Otherwise require 30ms silence (end-of-packet gap).
+  bool bufFull = (len >= RF433_MAX_ISR_LEN);
+  if (!bufFull && (uint32_t)(micros() - rf433LastEdgeUs) < 30000UL) return;
+
+  // Copy ISR buffer
   noInterrupts();
-  int n = min((int)rf433RawLen, RF433_MAX_RAW_LEN);
-  memcpy((void*)rf433LearnLast.rawData, (void*)rf433RawBuf, n * sizeof(uint16_t));
-  rf433LearnLast.rawLen = (uint16_t)n;
+  int n = min((int)rf433RawLen, RF433_MAX_ISR_LEN);
+  uint16_t tmp[RF433_MAX_ISR_LEN];
+  memcpy(tmp, (void*)rf433RawBuf, n * sizeof(uint16_t));
+  uint16_t tmpLen = (uint16_t)n;
   rf433RawLen     = 0;
   rf433LastEdgeUs = micros();
   interrupts();
 
-  // Trim leading pre-signal silence (first entry is ISR-attach-to-first-edge gap)
-  while (rf433LearnLast.rawLen > 1 && rf433LearnLast.rawData[0] > 10000) {
-    memmove(&rf433LearnLast.rawData[0], &rf433LearnLast.rawData[1],
-            (rf433LearnLast.rawLen - 1) * sizeof(uint16_t));
-    rf433LearnLast.rawLen--;
+  // Trim leading pre-signal silence and trailing gap
+  while (tmpLen > 1 && tmp[0] > 10000) {
+    memmove(&tmp[0], &tmp[1], (tmpLen - 1) * sizeof(uint16_t)); tmpLen--;
   }
-  // Trim trailing silence
-  while (rf433LearnLast.rawLen > 0 &&
-         rf433LearnLast.rawData[rf433LearnLast.rawLen - 1] > 15000)
-    rf433LearnLast.rawLen--;
+  while (tmpLen > 0 && tmp[tmpLen - 1] > 15000) tmpLen--;
 
-  if (rf433LearnLast.rawLen < 8) return;
-
-  if (!rf433ValidateSignal(rf433LearnLast.rawData, rf433LearnLast.rawLen)) {
-    serialWritelnAll("[RF433] Rejected (noise) — waiting for next press...");
+  char dbg[80] = "";
+  if (tmpLen < 16) return;
+  if (!rf433ValidateSignal(tmp, (int)tmpLen, dbg, sizeof(dbg))) {
     return;
   }
 
-  rf433LearnReady = true;
-  char buf[72];
-  snprintf(buf, sizeof(buf), "[RF433] Captured: %d pulses", rf433LearnLast.rawLen);
-  serialWritelnAll(buf);
-  rf433TryDecode(rf433LearnLast.rawData, rf433LearnLast.rawLen);
-  serialWritelnAll("  -> tap a button in UI, or: rf433 learn bind <label>");
+  uint16_t T = rf433FindT(tmp, (int)tmpLen);
+  if (!T) T = 500;
+
+  uint16_t cleaned[RF433_MAX_ISR_LEN];
+  memcpy(cleaned, tmp, tmpLen * sizeof(uint16_t));
+  int cleanedLen = rf433CleanQuantize(cleaned, (int)tmpLen, T);
+
+  uint32_t code  = cleanedLen >= 8 ? rf433TryDecode(cleaned, cleanedLen, false) : 0;
+
+  // Helper: store raw (pre-quantization) timing into dst — preserves exact measured widths
+  // for accurate replay, same as how the working Toggle button was originally captured.
+  auto storeRaw = [&](RF433LearnData& dst) {
+    int n = min((int)tmpLen, RF433_MAX_RAW_LEN);
+    memcpy(dst.rawData, tmp, n * sizeof(uint16_t));
+    dst.rawLen = (uint16_t)n;
+  };
+
+  // PT2262/EV1527 sync gap: any raw pulse 8000-15000µs proves a real OOK remote packet.
+  // Fan remote has ~10300µs inter-repeat gap — accept single press, no double-confirm needed.
+  {
+    bool hasSyncGap = false;
+    for (int i = 0; i < (int)tmpLen; i++) {
+      if (tmp[i] >= 9500 && tmp[i] <= 11500) { hasSyncGap = true; break; }
+    }
+    if (hasSyncGap && cleanedLen >= 60) {
+      storeRaw(rf433LearnLast);
+      // If the first 256 entries don't decode, try the last 256 —
+      // the fan remote may have arrived after ambient ISM already filled the buffer start.
+      if (tmpLen > RF433_MAX_RAW_LEN
+          && !rf433TryDecode(rf433LearnLast.rawData, (int)rf433LearnLast.rawLen, false)) {
+        int startLast = (int)tmpLen - RF433_MAX_RAW_LEN;
+        memcpy(rf433LearnLast.rawData, tmp + startLast, RF433_MAX_RAW_LEN * sizeof(uint16_t));
+        rf433LearnLast.rawLen = (uint16_t)RF433_MAX_RAW_LEN;
+      }
+      rf433LearnReady = true;
+      char buf[80];
+      snprintf(buf, sizeof(buf), "[RF433] Captured: %d pulses T=%dus (sync gap)", (int)tmpLen, (int)T);
+      serialWritelnAll(buf);
+      if (!rf433TryDecode(rf433LearnLast.rawData, (int)rf433LearnLast.rawLen, true))
+        serialWritelnAll("  (raw protocol)");
+      serialWritelnAll("  -> tap a button in UI to bind, or: rf433 learn bind <label>");
+      return;
+    }
+  }
+
+  // High-T signal: T≥600µs is not ambient ISM 433 MHz noise — accept immediately.
+  if (T >= 600 && cleanedLen >= 16) {
+    storeRaw(rf433LearnLast);
+    rf433LearnReady = true;
+    char buf[80];
+    snprintf(buf, sizeof(buf), "[RF433] Captured: %d pulses T=%dus", (int)tmpLen, (int)T);
+    serialWritelnAll(buf);
+    if (!rf433TryDecode(rf433LearnLast.rawData, (int)rf433LearnLast.rawLen, true))
+      serialWritelnAll("  (raw protocol)");
+    serialWritelnAll("  -> tap a button in UI to bind, or: rf433 learn bind <label>");
+    return;
+  }
+
+  if (code) {
+    storeRaw(rf433LearnLast);
+    rf433LearnReady = true;
+    char buf[96];
+    snprintf(buf, sizeof(buf), "[RF433] Captured: %d pulses T=%dus", (int)tmpLen, (int)T);
+    serialWritelnAll(buf);
+    rf433TryDecode(rf433LearnLast.rawData, (int)rf433LearnLast.rawLen, true);
+    serialWritelnAll("  -> tap a button in UI to bind, or: rf433 learn bind <label>");
+    return;
+  }
+
+  // No sync gap, no decodable code, no high-T signal — ambient ISM noise, discard silently.
 }
 
 // ── Custom remote save / bind ─────────────────────────────────────
@@ -7492,6 +7819,7 @@ static void rf433CustomBind(const char* label) {
   rf433CustomSave();
   rf433LoadDevice(rf433LoadedPath);
   rf433LearnReady = false;
+  rf433BindMs     = millis();  // 2s pause before accepting next capture
   if (currentFunction == FUNCTION_RF433) rf433Level = RF433_LEVEL_REMOTE;
 
   char msg[80];
@@ -7500,6 +7828,15 @@ static void rf433CustomBind(const char* label) {
 }
 
 // ── UI rendering ──────────────────────────────────────────────────
+
+// Returns a display-friendly copy of a remote name with underscores replaced by spaces.
+static const char* rf433DisplayName(const char* src) {
+  static char buf[40];
+  strlcpy(buf, src, sizeof(buf));
+  for (char* p = buf; *p; p++) if (*p == '_') *p = ' ';
+  return buf;
+}
+
 static void rf433DrawTitle(const char* title, bool showBack, int sw, int titleH, bool isLand) {
   uint16_t green = display.color565(0, 180, 80);
   statusSprite.fillRect(0, 0, sw, titleH, display.color565(0, 20, 8));
@@ -7514,6 +7851,91 @@ static void rf433DrawTitle(const char* title, bool showBack, int sw, int titleH,
   statusSprite.setTextSize(2);
   statusSprite.setTextColor(green);
   statusSprite.drawString(title, sw / 2, isLand ? 3 : 4);
+}
+
+void renderRF433Settings() {
+  int sw = statusSprite.width();
+  int sh = statusSprite.height();
+  bool isLandscape = sw > sh;
+
+  statusSprite.fillSprite(COLOR_BLACK);
+  statusSprite.setFont(&fonts::Font0);
+
+  static const int ITEM_COUNT = 4;
+  const char* labels[ITEM_COUNT]  = { "NEW REMOTE", "CAPTURE BUTTON", "SELECT REMOTE", "RESET" };
+  const char* values[ITEM_COUNT]  = { "CREATE", "LEARN", "LIST", "\x10" };
+
+  int titleY = isLandscape ? 4 : 6;
+  int divY   = isLandscape ? 22 : 26;
+  statusSprite.setTextDatum(TC_DATUM);
+  statusSprite.setTextSize(2);
+  statusSprite.setTextColor(display.color565(0, 180, 80));
+  statusSprite.drawString("RF433 ACTIONS", sw / 2, titleY);
+  statusSprite.drawFastHLine(8, divY, sw - 16, display.color565(0, 80, 40));
+
+  int btnH = isLandscape ? 14 : 22;
+  int btnY = sh - 6 - btnH;
+  int sepY = btnY - 6;
+  statusSprite.drawFastHLine(8, sepY, sw - 16, display.color565(40, 40, 40));
+  int bw = (sw - 24) / 2;
+  statusSprite.fillRect(8,       btnY, bw, btnH, display.color565(0, 60, 0));
+  statusSprite.fillRect(16 + bw, btnY, bw, btnH, display.color565(60, 0, 0));
+  statusSprite.drawRect(8,       btnY, bw, btnH, COLOR_GREEN);
+  statusSprite.drawRect(16 + bw, btnY, bw, btnH, COLOR_RED);
+  statusSprite.setTextSize(1);
+  statusSprite.setTextDatum(MC_DATUM);
+  statusSprite.setTextColor(COLOR_GREEN);
+  statusSprite.drawString("APPLY",  8  + bw / 2,       btnY + btnH / 2);
+  statusSprite.setTextColor(COLOR_RED);
+  statusSprite.drawString("CANCEL", 16 + bw + bw / 2,  btnY + btnH / 2);
+
+  int startY   = divY + 4;
+  int rowH     = isLandscape ? 20 : 26;
+  int rowsArea = sepY - startY;
+  int visRows  = constrain(rowsArea / rowH, 1, ITEM_COUNT);
+
+  settingsScrollOffset = constrain(settingsScrollOffset, 0, ITEM_COUNT - visRows);
+  if (settingsCursor < settingsScrollOffset)
+    settingsScrollOffset = settingsCursor;
+  if (settingsCursor >= settingsScrollOffset + visRows)
+    settingsScrollOffset = settingsCursor - visRows + 1;
+
+  if (ITEM_COUNT > visRows) {
+    int barH = max(6, rowsArea * visRows / ITEM_COUNT);
+    int barY = startY + (rowsArea - barH) * settingsScrollOffset / max(1, ITEM_COUNT - visRows);
+    statusSprite.fillRect(sw - 4, startY, 3, rowsArea, display.color565(20, 20, 20));
+    statusSprite.fillRect(sw - 4, barY,   3, barH,     display.color565(0, 80, 40));
+  }
+
+  for (int i = 0; i < visRows; i++) {
+    int idx     = i + settingsScrollOffset;
+    if (idx >= ITEM_COUNT) break;
+    int y       = startY + i * rowH;
+    bool sel    = (idx == settingsCursor);
+    bool isReset = (idx == ITEM_COUNT - 1);
+    int textY   = y + (rowH - 8) / 2;
+
+    if (isReset && sel)
+      statusSprite.fillRect(4, y, sw - 8, rowH - 2, display.color565(60, 15, 15));
+    else if (sel)
+      statusSprite.fillRect(4, y, sw - 8, rowH - 2, display.color565(0, 25, 10));
+
+    statusSprite.setTextDatum(TL_DATUM);
+    statusSprite.setTextSize(1);
+    statusSprite.setTextColor(sel ? (isReset ? display.color565(255, 80, 80) : display.color565(0, 200, 90))
+                                  : display.color565(60, 60, 60));
+    statusSprite.drawString(sel ? ">" : " ", 6, textY);
+
+    statusSprite.setTextColor(sel ? COLOR_WHITE : (isReset ? display.color565(100, 40, 40) : COLOR_GRAY));
+    statusSprite.drawString(labels[idx], 14, textY);
+
+    statusSprite.setTextDatum(TR_DATUM);
+    statusSprite.setTextColor(sel ? display.color565(0, 220, 100) : display.color565(40, 80, 50));
+    statusSprite.drawString(values[idx], sw - 10, textY);
+
+    if (i < visRows - 1)
+      statusSprite.drawFastHLine(4, y + rowH - 1, sw - 8, display.color565(20, 20, 20));
+  }
 }
 
 static void renderRF433Dir() {
@@ -7584,7 +8006,7 @@ static void renderRF433Dir() {
     statusSprite.setTextDatum(TL_DATUM);
     statusSprite.setTextSize(1);
     statusSprite.setTextColor(isSel ? colSel : colFile);
-    statusSprite.drawString(rf433Files[n].name, 8, textY);
+    statusSprite.drawString(rf433DisplayName(rf433Files[n].name), 8, textY);
     statusSprite.setTextDatum(TR_DATUM);
     statusSprite.setTextColor(isSel ? display.color565(0, 200, 80) : colArrow);
     statusSprite.drawString(isSel ? "OPEN>" : ">", sw - 6, textY);
@@ -7604,7 +8026,7 @@ static void renderRF433Remote() {
   statusSprite.setFont(&fonts::Font0);
 
   int titleH = isLand ? 22 : 26;
-  rf433DrawTitle(rf433LoadedName, true, sw, titleH, isLand);
+  rf433DrawTitle(rf433DisplayName(rf433LoadedName), true, sw, titleH, isLand);
 
   // TX indicator: blinking green dot for 500 ms
   uint32_t txAge = rf433TxMs ? (uint32_t)(millis() - rf433TxMs) : 0xFFFFFFFFu;
@@ -7613,46 +8035,79 @@ static void renderRF433Remote() {
 
   // Learn mode indicator (left side of title bar)
   if (rf433LearnMode) {
+    bool inGrace = (uint32_t)(millis() - rf433LearnStartMs) < 500;
     bool pulse = (millis() / 400) % 2 == 0;
-    uint16_t dotCol = rf433LearnReady
-      ? display.color565(50, 220, 50)
-      : (pulse ? display.color565(0, 220, 80) : display.color565(0, 60, 25));
+    uint16_t dotCol;
+    const char* modeLabel;
+    if (rf433LearnReady) {
+      dotCol    = display.color565(50, 220, 50);
+      modeLabel = "BIND";
+    } else if (inGrace) {
+      dotCol    = pulse ? display.color565(200, 140, 0) : display.color565(80, 55, 0);
+      modeLabel = "WAIT";
+    } else {
+      dotCol    = pulse ? display.color565(0, 220, 80) : display.color565(0, 60, 25);
+      modeLabel = "LEARN";
+    }
     statusSprite.fillCircle(9, titleH / 2, 4, dotCol);
     statusSprite.setTextDatum(TL_DATUM);
     statusSprite.setTextSize(1);
     statusSprite.setTextColor(dotCol);
-    statusSprite.drawString(rf433LearnReady ? "BIND" : "LEARN", 16, (titleH - 8) / 2);
+    statusSprite.drawString(modeLabel, 16, (titleH - 8) / 2);
   }
 
-  // LEARN bar at the bottom (custom remotes only)
-  int learnH = isCustom ? (isLand ? 16 : 20) : 0;
+  // Learn mode status/stop bar — only shown while learn mode is active
+  int learnH = rf433LearnMode ? (isLand ? 16 : 20) : 0;
   int learnY = sh - learnH - 2;
 
-  if (isCustom) {
-    uint16_t lCol, lBg;
-    const char* lLabel;
-    if (rf433LearnMode && rf433LearnReady) {
-      lBg = display.color565(0, 35, 12); lCol = display.color565(80, 255, 120);
-      lLabel = "TAP BTN TO BIND  |  [+ ADD NEW]  |  STOP";
-    } else if (rf433LearnMode) {
-      bool pulse = (millis() / 400) % 2 == 0;
-      lBg  = display.color565(0, 20, 6);
-      lCol = pulse ? display.color565(0, 200, 80) : display.color565(0, 60, 25);
-      lLabel = "LISTENING...  |  TAP TO STOP";
-    } else {
-      lBg = display.color565(0, 12, 4); lCol = display.color565(0, 130, 55);
-      lLabel = "[+ CAPTURE NEW BUTTON]";
-    }
-    statusSprite.fillRect(4, learnY, sw - 8, learnH, lBg);
-    statusSprite.drawRect(4, learnY, sw - 8, learnH, lCol);
-    statusSprite.setTextDatum(MC_DATUM);
+  if (rf433LearnMode) {
     statusSprite.setTextSize(1);
-    statusSprite.setTextColor(lCol);
-    statusSprite.drawString(lLabel, sw / 2, learnY + learnH / 2);
+    bool inGrace = (uint32_t)(millis() - rf433LearnStartMs) < 500;
+    if (rf433LearnReady) {
+      // Two-zone bar: left = RETRY, right = NEW BUTTON
+      uint16_t bgL  = display.color565(25, 10, 0);
+      uint16_t bgR  = display.color565(0, 35, 12);
+      uint16_t colL = display.color565(180, 100, 40);
+      uint16_t colR = display.color565(80, 255, 120);
+      int mid = sw / 2;
+      statusSprite.fillRect(4,   learnY, mid - 6,      learnH, bgL);
+      statusSprite.fillRect(mid, learnY, sw - mid - 4, learnH, bgR);
+      statusSprite.drawRect(4,   learnY, sw - 8,       learnH, colR);
+      statusSprite.drawFastVLine(mid - 1, learnY + 1, learnH - 2, display.color565(60, 60, 60));
+      statusSprite.setTextDatum(MC_DATUM);
+      statusSprite.setTextColor(colL);
+      statusSprite.drawString("< RETRY", 4 + (mid - 10) / 2, learnY + learnH / 2);
+      statusSprite.setTextColor(colR);
+      statusSprite.drawString("NEW BUTTON >", mid + (sw - mid - 4) / 2, learnY + learnH / 2);
+    } else if (inGrace) {
+      bool pulse = (millis() / 200) % 2 == 0;
+      uint16_t lBg  = display.color565(18, 12, 0);
+      uint16_t lCol = pulse ? display.color565(200, 140, 0) : display.color565(80, 55, 0);
+      statusSprite.fillRect(4, learnY, sw - 8, learnH, lBg);
+      statusSprite.drawRect(4, learnY, sw - 8, learnH, lCol);
+      statusSprite.setTextDatum(MC_DATUM);
+      statusSprite.setTextColor(lCol);
+      statusSprite.drawString("WARMING UP...", sw / 2, learnY + learnH / 2);
+    } else {
+      bool pulse = (millis() / 400) % 2 == 0;
+      int mid = sw / 3;  // cancel takes left third
+      uint16_t lBg     = display.color565(0, 20, 6);
+      uint16_t colCanc = display.color565(120, 40, 40);
+      uint16_t lCol    = pulse ? display.color565(0, 200, 80) : display.color565(0, 60, 25);
+      statusSprite.fillRect(4, learnY, sw - 8, learnH, lBg);
+      statusSprite.drawRect(4, learnY, sw - 8, learnH, lCol);
+      statusSprite.drawFastVLine(mid - 1, learnY + 1, learnH - 2, display.color565(50, 30, 30));
+      statusSprite.setTextSize(1);
+      statusSprite.setTextDatum(MC_DATUM);
+      statusSprite.setTextColor(colCanc);
+      statusSprite.drawString("CANCEL", 4 + (mid - 6) / 2, learnY + learnH / 2);
+      statusSprite.setTextColor(lCol);
+      statusSprite.drawString("LISTENING...", mid + (sw - mid - 4) / 2, learnY + learnH / 2);
+    }
   }
 
   int areaY = titleH + 3;
-  int areaH = learnY - 4 - areaY;
+  int areaH = (rf433LearnMode ? learnY - 4 : sh - 2) - areaY;
 
   if (rf433BtnCount == 0) {
     statusSprite.setTextDatum(MC_DATUM);
