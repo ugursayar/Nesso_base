@@ -329,7 +329,7 @@ Only `type: raw` is used. `RAW_Data` values follow Flipper SubGhz convention: po
 
 **UI:** Two-level browser identical to IR — file list → remote button grid (2 columns, green accent). Tap title bar to go back to list.
 
-**Learn workflow:**
+**Learn workflow (manual):**
 
 ```
 rf433 custom new Garage          # creates /rf433db/Custom/Garage.sub, loads it
@@ -341,11 +341,17 @@ rf433 learn bind Open            # saves button, updates file
 rf433 learn stop                 # cuts GROVE power
 ```
 
+**Auto-bind workflow (UI):** Long-press KEY1 → RF433 settings → AUTO BIND. Each captured signal is automatically named Btn_01, Btn_02, … without requiring a `bind` command. After each bind a 2-second pause discards edges before the next capture. Stop with `rf433 learn stop` or long-press KEY1.
+
 **Signal capture details:**
 - ISR fires on every edge of GPIO 4 (CHANGE interrupt), records µs edge durations into a 512-entry ISR buffer (`RF433_MAX_ISR_LEN`).
 - Buffer processes immediately when full; otherwise waits for 30 ms silence (end-of-packet gap).
-- PT2262/EV1527 remotes are identified by a sync gap pulse in the 9 500–11 500 µs range; this is the primary accept criterion for T=300 µs remotes (e.g. fans, gate openers) that share T with ambient ISM traffic.
+- Two acceptance criteria, checked in order:
+  1. **Sync gap** (8 000–15 000 µs): a pulse of this duration anywhere in the capture proves a real OOK packet (PT2262/EV1527 ~10 300 µs; NEC ~9 000 µs). Required `cleanedLen ≥ 60` after quantization.
+  2. **High-T** (T ≥ 600 µs): protocols with slow bit-clock (e.g. some garage openers) are accepted even without a sync gap. Required `cleanedLen ≥ 16`.
+  - Signals that satisfy neither criterion are silently discarded as ambient ISM noise — important because quantized noise data at T≈300 µs can coincidentally decode as OOK bits and must not be accepted.
 - If the remote signal arrived after ambient ISM already filled the first half of the buffer, the firmware falls back to storing the last 256 entries and re-checks for a decodable code.
+- **Polarity normalization:** the ISR CHANGE interrupt captures both edges, so the first edge may be falling (inverted polarity). The firmware finds the first gap > 5 000 µs; if it sits at an even index (even = HIGH carrier in transmit), the array is shifted left by one to correct polarity.
 - Leading pre-signal silence (> 10 ms) and trailing gap (> 15 ms) are trimmed automatically.
 - Minimum valid capture: 8 pulses after trim.
 - Signal is transmitted 3 × with 10 ms inter-frame gap.
@@ -365,6 +371,12 @@ rf433 learn stop                 # cuts GROVE power
 
 **NVS keys:** `rf433On` (bool), `rf433Path` (string — last loaded remote path).
 
+**Touch-to-bind:** While learn mode is active and a signal has been captured (green `BIND` indicator in title bar), tapping an existing button in the remote UI **rebinds** that button to the captured signal.
+
+**Delete button (UI):** Long-press KEY1 → RF433 settings → DELETE BUTTON → returns to the remote view; tapping any button deletes it.
+
+**Delete remote (UI):** Long-press KEY1 → RF433 settings → DEL REMOTE → deletes the loaded remote file immediately and returns to the file list.
+
 #### RF433 serial commands (`rf433`)
 
 | Command | Description |
@@ -373,16 +385,18 @@ rf433 learn stop                 # cuts GROVE power
 | `rf433 select <N>` | Load remote N and open UI |
 | `rf433 send <N> <label>` | Transmit button from remote N |
 | `rf433 reload` | Re-scan `/rf433db/` |
+| `rf433 rename <new name>` | Rename the loaded custom remote file |
+| `rf433 del` | Delete the currently loaded remote file |
 | `rf433 custom new [name]` | Create new custom remote (`.sub`) |
 | `rf433 custom list` | List custom remotes |
 | `rf433 learn start` | Drive TX LOW, power GROVE, arm SYN531R receiver |
 | `rf433 learn stop` | Stop capture, cut GROVE power |
 | `rf433 learn bind <label>` | Bind last capture to button label |
 | `rf433 learn show` | Print last captured signal info |
+| `rf433 btn del <label>` | Delete a button from the loaded custom remote |
+| `rf433 btn rename <old> <new>` | Rename a button in the loaded custom remote |
 | `rf433 enable` | Enable RF433 function |
 | `rf433 disable` | Disable RF433 function |
-
-**Touch-to-bind:** While learn mode is active and a signal has been captured (green `BIND` indicator in title bar), tapping an existing button in the remote UI **rebinds** that button to the captured signal.
 
 ### Serial Command Reference
 

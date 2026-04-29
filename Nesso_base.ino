@@ -628,8 +628,10 @@ static int        rf433BtnOff   = 0;  // row scroll offset — remote grid
 static uint32_t   rf433TxMs     = 0;
 static int        rf433FlashIdx = -1;
 
-bool           rf433LearnMode  = false;
-bool           rf433LearnReady = false;
+bool           rf433LearnMode   = false;
+bool           rf433LearnReady  = false;
+bool           rf433DeleteMode  = false;
+bool           rf433AutoMode    = false;  // auto-bind: each capture → Btn_XX, no confirmation
 RF433LearnData rf433LearnLast  = {};
 static uint32_t rf433LearnStartMs  = 0;
 static uint32_t       rf433BindMs      = 0;     // timestamp of last bind, for 2s post-bind pause
@@ -805,7 +807,7 @@ void runSplashAnimation() {
 // Persistent settings  (NVS via Preferences)
 // ================================================================
 
-void resetActivity();
+bool resetActivity();
 void initMedia();
 void renderMedia();
 void renderBatterySettings();
@@ -1101,6 +1103,14 @@ void loop() {
   serialCheckInput();
   irLearnPoll();
   rf433LearnPoll();
+  if (rf433AutoMode && rf433LearnReady) {
+    if (rf433BtnCount < RF433_MAX_BUTTONS) {
+      rf433AutoBind();
+    } else {
+      serialWritelnAll("[RF433] Auto-bind: button limit reached.");
+      rf433LearnStop();
+    }
+  }
   btProcessPendingEvents();
   checkPowerManagement(msNow);
   renderFunction();
@@ -1434,7 +1444,7 @@ void handleBTSettingsTap(int16_t sx, int16_t sy) {
 }
 
 void onTap(int16_t sx, int16_t sy) {
-  resetActivity();
+  if (resetActivity()) return;  // wake-up tap — don't propagate to UI
   uiClick(1200, 18);
   if (navState == NAV_RESET && currentFunction == FUNCTION_LORA) {
     handleLoraResetTap(sx, sy);
@@ -1618,7 +1628,7 @@ void onTap(int16_t sx, int16_t sy) {
       //   LISTENING + right → ignored
       //   WARMING UP → ignored
       if (rf433LearnMode) {
-        int learnH = isLand ? 16 : 20;
+        int learnH = isLand ? 22 : 28;
         int learnY = sh - learnH - 2;
         if (sprite_y >= learnY && sprite_y < learnY + learnH) {
           bool inGrace = (uint32_t)(millis() - rf433LearnStartMs) < 500;
@@ -1639,7 +1649,7 @@ void onTap(int16_t sx, int16_t sy) {
       }
 
       int areaY = titleH + 3;
-      int btnH  = isLand ? 22 : 28;
+      int btnH  = isLand ? 30 : 38;
       int btnW  = (sw - 9) / 2;
       for (int i = 0; i < rf433BtnCount; i++) {
         int row = i / 2;
@@ -1647,11 +1657,19 @@ void onTap(int16_t sx, int16_t sy) {
         int bx = 3 + col * (btnW + 3);
         int by = areaY + (row - rf433BtnOff) * (btnH + 3) + 3;
         if (sx >= bx && sx < bx + btnW && sprite_y >= by && sprite_y < by + btnH) {
-          rf433FlashIdx = i; rf433TxMs = millis();
-          if (rf433LearnMode && rf433LearnReady) {
-            rf433CustomBind(rf433Btns[i].label);  // rebind existing button
+          if (rf433DeleteMode) {
+            for (int j = i; j < rf433BtnCount - 1; j++) rf433Btns[j] = rf433Btns[j + 1];
+            rf433BtnCount--;
+            rf433DeleteMode = false;
+            rf433BtnOff = constrain(rf433BtnOff, 0, max(0, (rf433BtnCount + 1) / 2 - 1));
+            if (rf433IsCustomFile()) rf433CustomSave();
           } else {
-            rf433SendButton(i);
+            rf433FlashIdx = i; rf433TxMs = millis();
+            if (rf433LearnMode && rf433LearnReady) {
+              rf433CustomBind(rf433Btns[i].label);  // rebind existing button
+            } else {
+              rf433SendButton(i);
+            }
           }
           return;
         }
@@ -1734,7 +1752,7 @@ void onTap(int16_t sx, int16_t sy) {
 }
 
 void onSwipe(int16_t dx, int16_t dy) {
-  resetActivity();
+  if (resetActivity()) return;  // wake-up swipe — don't propagate to UI
   if (abs(dx) >= abs(dy)) {
     // Horizontal swipe → screen navigation (blocked inside settings)
     if (navState != NAV_NORMAL) return;
@@ -1751,7 +1769,7 @@ void onSwipe(int16_t dx, int16_t dy) {
       if      (currentFunction == FUNCTION_WIFI)    maxCursor = 2;  // 3 items
       else if (currentFunction == FUNCTION_LORA)    maxCursor = 4;  // 5 items
       else if (currentFunction == FUNCTION_BT)      maxCursor = 5;  // 6 items
-      else if (currentFunction == FUNCTION_RF433)   maxCursor = 3;  // 4 items
+      else if (currentFunction == FUNCTION_RF433)   maxCursor = 6;  // 7 items
       else /* BATTERY */                            maxCursor = 5;  // 6 items
       if (dy < 0) settingsCursor = min(settingsCursor + 1, maxCursor);
       else        settingsCursor = max(settingsCursor - 1, 0);
@@ -1791,7 +1809,7 @@ void onSwipe(int16_t dx, int16_t dy) {
       } else if (rf433Level == RF433_LEVEL_REMOTE) {
         bool isLandS  = statusSprite.width() > statusSprite.height();
         int  titleH   = isLandS ? 22 : 26;
-        int  btnH     = isLandS ? 22 : 28;
+        int  btnH     = isLandS ? 30 : 38;
         int  areaH    = statusSprite.height() - titleH - 5;
         int  visRows  = max(1, areaH / (btnH + 3));
         int  rows     = (rf433BtnCount + 1) / 2;
@@ -1858,7 +1876,7 @@ void onKey1Short() {
         (currentFunction == FUNCTION_LORA    && settingsCursor == 4) ||
         (currentFunction == FUNCTION_BT      && settingsCursor == 5) ||
         (currentFunction == FUNCTION_BATTERY && settingsCursor == 5) ||
-        (currentFunction == FUNCTION_RF433   && settingsCursor == 3)) {
+        (currentFunction == FUNCTION_RF433   && settingsCursor == 6)) {
       navState = NAV_RESET;
       resetFeedbackMs = 0; resetFeedbackBtn = -1;
       return;
@@ -1906,7 +1924,41 @@ void onKey1Short() {
           navState = NAV_NORMAL;
           rf433Level = RF433_LEVEL_LIST;
           break;
-        // case 3 = RESET — handled above
+        case 3:  // DELETE BUTTON — enter delete mode; user taps a button to remove it
+          if (rf433BtnCount > 0 && rf433LoadedPath[0]) {
+            rf433DeleteMode = true;
+            rf433Level = RF433_LEVEL_REMOTE;
+            navState = NAV_NORMAL;
+          }
+          break;
+        case 4:  // AUTO BIND — learn mode that auto-names each capture Btn_01, Btn_02…
+          if (!rf433LoadedPath[0] || !rf433IsCustomFile()) rf433AutoNew();
+          rf433AutoMode = true;
+          rf433LearnStart();
+          navState = NAV_NORMAL;
+          rf433Level = RF433_LEVEL_REMOTE;
+          break;
+        case 5: {  // DEL REMOTE — delete currently loaded remote file
+          if (!rf433LoadedPath[0]) break;
+          if (rf433LearnMode) rf433LearnStop();
+          if (!strcmp(rf433SavedPath, rf433LoadedPath)) {
+            rf433SavedPath[0] = '\0';
+            saveSettings();
+          }
+          char delMsg[80];
+          snprintf(delMsg, sizeof(delMsg), "[RF433] Deleted '%s'.", rf433LoadedName);
+          LittleFS.remove(rf433LoadedPath);
+          rf433LoadedPath[0] = '\0';
+          rf433LoadedName[0] = '\0';
+          rf433SelectedIdx = -1;
+          rf433BtnCount = 0;
+          rf433ScanFiles();
+          serialWritelnAll(delMsg);
+          rf433Level = RF433_LEVEL_LIST;
+          navState = NAV_NORMAL;
+          break;
+        }
+        // case 6 = RESET — handled above
       }
     }
   }
@@ -1931,7 +1983,7 @@ void onKey2Short() {
     else if (currentFunction == FUNCTION_BATTERY)
       settingsCursor = (settingsCursor + 1) % 6;  // 5 items + RESET
     else if (currentFunction == FUNCTION_RF433)
-      settingsCursor = (settingsCursor + 1) % 4;  // NEW / CAPTURE / SELECT / RESET
+      settingsCursor = (settingsCursor + 1) % 7;  // NEW / CAPTURE / SELECT / DELETE / AUTO / DEL REMOTE / RESET
   }
 }
 
@@ -2110,12 +2162,16 @@ static void printHelpRF433() {
   serialWritelnAll("  rf433 select <N>                load remote N and open UI");
   serialWritelnAll("  rf433 send <N> <label>          transmit button from remote N");
   serialWritelnAll("  rf433 reload                    re-scan /rf433db/ for new files");
+  serialWritelnAll("  rf433 rename <new name>         rename the loaded custom remote file");
   serialWritelnAll("  rf433 custom new [name]         create new custom remote");
   serialWritelnAll("  rf433 custom list               list custom remotes");
   serialWritelnAll("  rf433 learn start               arm SYN531R receiver (GROVE G4)");
   serialWritelnAll("  rf433 learn stop                stop capture, cut GROVE power");
   serialWritelnAll("  rf433 learn bind <label>        bind last capture to button label");
   serialWritelnAll("  rf433 learn show                print last captured signal info");
+  serialWritelnAll("  rf433 btn del <label>           delete a button from the loaded remote");
+  serialWritelnAll("  rf433 btn rename <old> <new>    rename a button in the loaded remote");
+  serialWritelnAll("  rf433 del                       delete the currently loaded remote file");
   serialWritelnAll("  rf433 enable / rf433 disable    toggle RF433 function (also in device settings)");
 }
 
@@ -2540,7 +2596,7 @@ void serialHandleIR(const char* arg) {
 
 void serialHandleRF433(const char* arg) {
   if (!*arg) {
-    serialWritelnAll("rf433 list|select <N>|send <N> <btn>|reload|custom|learn|enable|disable");
+    serialWritelnAll("rf433 list|select <N>|send <N> <btn>|reload|rename|custom|learn|btn|enable|disable");
     return;
   }
   if (cmdIs(arg,"list")) {
@@ -2681,6 +2737,69 @@ void serialHandleRF433(const char* arg) {
     char buf[80];
     snprintf(buf, sizeof(buf), "[RF433] Renamed to '%s'.", safeName);
     serialWritelnAll(buf);
+  } else if (cmdIs(arg,"del")) {
+    if (!rf433LoadedPath[0]) { serialWritelnAll("[RF433] No remote loaded."); return; }
+    if (rf433LearnMode) rf433LearnStop();
+    if (!strcmp(rf433SavedPath, rf433LoadedPath)) {
+      rf433SavedPath[0] = '\0';
+      saveSettings();
+    }
+    char delMsg[80];
+    snprintf(delMsg, sizeof(delMsg), "[RF433] Deleted '%s'.", rf433LoadedName);
+    LittleFS.remove(rf433LoadedPath);
+    rf433LoadedPath[0] = '\0';
+    rf433LoadedName[0] = '\0';
+    rf433SelectedIdx = -1;
+    rf433BtnCount = 0;
+    rf433ScanFiles();
+    if (currentFunction == FUNCTION_RF433) rf433Level = RF433_LEVEL_LIST;
+    serialWritelnAll(delMsg);
+  } else if (cmdIs(arg,"btn")) {
+    const char* sub = cmdArg(arg,"btn");
+    if (cmdIs(sub,"del")) {
+      const char* label = cmdArg(sub,"del");
+      while (*label == ' ') label++;
+      if (!*label) { serialWritelnAll("Usage: rf433 btn del <label>"); return; }
+      if (!rf433LoadedPath[0]) { serialWritelnAll("[RF433] No remote loaded."); return; }
+      if (!rf433IsCustomFile()) { serialWritelnAll("[RF433] Only custom remotes can be edited."); return; }
+      int found = -1;
+      for (int i = 0; i < rf433BtnCount; i++)
+        if (!strcasecmp(rf433Btns[i].label, label)) { found = i; break; }
+      if (found < 0) { serialWritelnAll("[RF433] Button not found."); return; }
+      for (int j = found; j < rf433BtnCount - 1; j++) rf433Btns[j] = rf433Btns[j + 1];
+      rf433BtnCount--;
+      rf433BtnOff = constrain(rf433BtnOff, 0, max(0, (rf433BtnCount + 1) / 2 - 1));
+      rf433CustomSave();
+      char msg[80];
+      snprintf(msg, sizeof(msg), "[RF433] Button '%s' deleted. %d button(s) remain.", label, rf433BtnCount);
+      serialWritelnAll(msg);
+    } else if (cmdIs(sub,"rename")) {
+      const char* rest = cmdArg(sub,"rename");
+      const char* sp = strchr(rest, ' ');
+      if (!sp || !*(sp + 1)) {
+        serialWritelnAll("Usage: rf433 btn rename <old_label> <new_label>");
+        return;
+      }
+      char oldLabel[20] = {};
+      int oldLen = min((int)(sp - rest), 19);
+      memcpy(oldLabel, rest, oldLen);
+      const char* newLabel = sp + 1;
+      while (*newLabel == ' ') newLabel++;
+      if (!*newLabel) { serialWritelnAll("Usage: rf433 btn rename <old_label> <new_label>"); return; }
+      if (!rf433LoadedPath[0]) { serialWritelnAll("[RF433] No remote loaded."); return; }
+      if (!rf433IsCustomFile()) { serialWritelnAll("[RF433] Only custom remotes can be edited."); return; }
+      int found = -1;
+      for (int i = 0; i < rf433BtnCount; i++)
+        if (!strcasecmp(rf433Btns[i].label, oldLabel)) { found = i; break; }
+      if (found < 0) { serialWritelnAll("[RF433] Button not found."); return; }
+      strlcpy(rf433Btns[found].label, newLabel, sizeof(rf433Btns[found].label));
+      rf433CustomSave();
+      char msg[80];
+      snprintf(msg, sizeof(msg), "[RF433] Button '%s' renamed to '%s'.", oldLabel, newLabel);
+      serialWritelnAll(msg);
+    } else {
+      serialWritelnAll("Usage: rf433 btn del <label> | rf433 btn rename <old> <new>");
+    }
   } else if (cmdIs(arg,"enable")) {
     rf433Enabled = true;
     saveSettings();
@@ -3115,6 +3234,7 @@ void renderFunction() {
     stopBuzzer();
   if (lastFunction == (int)FUNCTION_RF433 && currentFunction != FUNCTION_RF433) {
     if (rf433LearnMode) rf433LearnStop();
+    rf433DeleteMode = false;
   }
 
   static int serialLastScreen = -1;
@@ -5582,7 +5702,7 @@ void renderBT() {
 // Power management
 // ================================================================
 
-void resetActivity() {
+bool resetActivity() {
   bool wasOff = displayOff || displayDimmed;
   lastActivityMs = millis();
   if (wasOff) {
@@ -5592,6 +5712,7 @@ void resetActivity() {
     lastFunction = -1;   // force full redraw on next loop
     if (btScanRequested && btInitialized && !btScanning && !btConnected) btStartScan();
   }
+  return wasOff;
 }
 
 void checkPowerManagement(unsigned long msNow) {
@@ -6249,7 +6370,7 @@ void handleRF433SettingsTap(int16_t sx, int16_t sy) {
   bool isLandscape = sw > sh;
   int  sprite_y    = sy - SPRITE_Y;
 
-  static const int ITEM_COUNT = 4;
+  static const int ITEM_COUNT = 7;
   int divY     = isLandscape ? 22 : 26;
   int startY   = divY + 4;
   int btnH     = isLandscape ? 14 : 22;
@@ -7392,6 +7513,7 @@ void rf433LearnStop() {
   if (!irLearnMode) digitalWrite(GROVE_POWER_EN, LOW);
   rf433LearnMode  = false;
   rf433LearnReady = false;
+  rf433AutoMode   = false;
   serialWritelnAll("[RF433] Learn mode OFF.");
 }
 
@@ -7629,8 +7751,6 @@ void rf433LearnPoll() {
   memcpy(cleaned, tmp, tmpLen * sizeof(uint16_t));
   int cleanedLen = rf433CleanQuantize(cleaned, (int)tmpLen, T);
 
-  uint32_t code  = cleanedLen >= 8 ? rf433TryDecode(cleaned, cleanedLen, false) : 0;
-
   // Helper: store raw (pre-quantization) timing into dst — preserves exact measured widths
   // for accurate replay, same as how the working Toggle button was originally captured.
   auto storeRaw = [&](RF433LearnData& dst) {
@@ -7639,12 +7759,30 @@ void rf433LearnPoll() {
     dst.rawLen = (uint16_t)n;
   };
 
-  // PT2262/EV1527 sync gap: any raw pulse 8000-15000µs proves a real OOK remote packet.
-  // Fan remote has ~10300µs inter-repeat gap — accept single press, no double-confirm needed.
+  // Normalize polarity: any large inter-frame gap (>5000µs) must be at an odd index
+  // (odd = LOW = silence in transmit). The ISR triggers on both edges so polarity is
+  // random — if the first captured edge was falling, all indices are inverted.
+  auto normalizePolarity = [](RF433LearnData& d) {
+    uint16_t* rd = d.rawData;
+    int rl = (int)d.rawLen;
+    for (int i = 0; i < rl; i++) {
+      if (rd[i] > 5000) {
+        if (i % 2 == 0 && rl > 1) {
+          // Gap at even index → polarity inverted → shift array left by 1
+          memmove(rd, rd + 1, (rl - 1) * sizeof(uint16_t));
+          d.rawLen--;
+        }
+        break;
+      }
+    }
+  };
+
+  // Sync gap (8000-15000µs): proves a real OOK remote packet. EV1527/PT2262 ~10300µs,
+  // NEC ~9000µs, others in this range. Widened range catches more remote types.
   {
     bool hasSyncGap = false;
     for (int i = 0; i < (int)tmpLen; i++) {
-      if (tmp[i] >= 9500 && tmp[i] <= 11500) { hasSyncGap = true; break; }
+      if (tmp[i] >= 8000 && tmp[i] <= 15000) { hasSyncGap = true; break; }
     }
     if (hasSyncGap && cleanedLen >= 60) {
       storeRaw(rf433LearnLast);
@@ -7656,6 +7794,7 @@ void rf433LearnPoll() {
         memcpy(rf433LearnLast.rawData, tmp + startLast, RF433_MAX_RAW_LEN * sizeof(uint16_t));
         rf433LearnLast.rawLen = (uint16_t)RF433_MAX_RAW_LEN;
       }
+      normalizePolarity(rf433LearnLast);
       rf433LearnReady = true;
       char buf[80];
       snprintf(buf, sizeof(buf), "[RF433] Captured: %d pulses T=%dus (sync gap)", (int)tmpLen, (int)T);
@@ -7670,6 +7809,7 @@ void rf433LearnPoll() {
   // High-T signal: T≥600µs is not ambient ISM 433 MHz noise — accept immediately.
   if (T >= 600 && cleanedLen >= 16) {
     storeRaw(rf433LearnLast);
+    normalizePolarity(rf433LearnLast);
     rf433LearnReady = true;
     char buf[80];
     snprintf(buf, sizeof(buf), "[RF433] Captured: %d pulses T=%dus", (int)tmpLen, (int)T);
@@ -7680,18 +7820,7 @@ void rf433LearnPoll() {
     return;
   }
 
-  if (code) {
-    storeRaw(rf433LearnLast);
-    rf433LearnReady = true;
-    char buf[96];
-    snprintf(buf, sizeof(buf), "[RF433] Captured: %d pulses T=%dus", (int)tmpLen, (int)T);
-    serialWritelnAll(buf);
-    rf433TryDecode(rf433LearnLast.rawData, (int)rf433LearnLast.rawLen, true);
-    serialWritelnAll("  -> tap a button in UI to bind, or: rf433 learn bind <label>");
-    return;
-  }
-
-  // No sync gap, no decodable code, no high-T signal — ambient ISM noise, discard silently.
+  // No sync gap, no high-T signal — ambient ISM noise, discard silently.
 }
 
 // ── Custom remote save / bind ─────────────────────────────────────
@@ -7861,9 +7990,9 @@ void renderRF433Settings() {
   statusSprite.fillSprite(COLOR_BLACK);
   statusSprite.setFont(&fonts::Font0);
 
-  static const int ITEM_COUNT = 4;
-  const char* labels[ITEM_COUNT]  = { "NEW REMOTE", "CAPTURE BUTTON", "SELECT REMOTE", "RESET" };
-  const char* values[ITEM_COUNT]  = { "CREATE", "LEARN", "LIST", "\x10" };
+  static const int ITEM_COUNT = 7;
+  const char* labels[ITEM_COUNT]  = { "NEW REMOTE", "CAPTURE BUTTON", "SELECT REMOTE", "DELETE BUTTON", "AUTO BIND", "DEL REMOTE", "RESET" };
+  const char* values[ITEM_COUNT]  = { "CREATE", "LEARN", "LIST", "DEL", "AUTO", "REMOVE", "\x10" };
 
   int titleY = isLandscape ? 4 : 6;
   int divY   = isLandscape ? 22 : 26;
@@ -8033,13 +8162,27 @@ static void renderRF433Remote() {
   if (txAge < 500 && (txAge / 100) % 2 == 0)
     statusSprite.fillCircle(sw - 8, titleH / 2, 4, display.color565(0, 220, 80));
 
+  // Delete mode indicator (left side of title bar)
+  if (rf433DeleteMode) {
+    bool pulse = (millis() / 400) % 2 == 0;
+    uint16_t dotCol = pulse ? display.color565(255, 60, 60) : display.color565(100, 20, 20);
+    statusSprite.fillCircle(9, titleH / 2, 4, dotCol);
+    statusSprite.setTextDatum(TL_DATUM);
+    statusSprite.setTextSize(1);
+    statusSprite.setTextColor(dotCol);
+    statusSprite.drawString("DEL", 16, (titleH - 8) / 2);
+  }
+
   // Learn mode indicator (left side of title bar)
   if (rf433LearnMode) {
     bool inGrace = (uint32_t)(millis() - rf433LearnStartMs) < 500;
     bool pulse = (millis() / 400) % 2 == 0;
     uint16_t dotCol;
     const char* modeLabel;
-    if (rf433LearnReady) {
+    if (rf433AutoMode) {
+      dotCol    = pulse ? display.color565(220, 140, 0) : display.color565(90, 55, 0);
+      modeLabel = "AUTO";
+    } else if (rf433LearnReady) {
       dotCol    = display.color565(50, 220, 50);
       modeLabel = "BIND";
     } else if (inGrace) {
@@ -8057,7 +8200,7 @@ static void renderRF433Remote() {
   }
 
   // Learn mode status/stop bar — only shown while learn mode is active
-  int learnH = rf433LearnMode ? (isLand ? 16 : 20) : 0;
+  int learnH = rf433LearnMode ? (isLand ? 22 : 28) : 0;
   int learnY = sh - learnH - 2;
 
   if (rf433LearnMode) {
@@ -8091,9 +8234,11 @@ static void renderRF433Remote() {
     } else {
       bool pulse = (millis() / 400) % 2 == 0;
       int mid = sw / 3;  // cancel takes left third
-      uint16_t lBg     = display.color565(0, 20, 6);
+      uint16_t lBg     = rf433AutoMode ? display.color565(20, 12, 0) : display.color565(0, 20, 6);
       uint16_t colCanc = display.color565(120, 40, 40);
-      uint16_t lCol    = pulse ? display.color565(0, 200, 80) : display.color565(0, 60, 25);
+      uint16_t lCol    = rf433AutoMode
+                           ? (pulse ? display.color565(220, 140, 0) : display.color565(90, 55, 0))
+                           : (pulse ? display.color565(0, 200, 80)  : display.color565(0, 60, 25));
       statusSprite.fillRect(4, learnY, sw - 8, learnH, lBg);
       statusSprite.drawRect(4, learnY, sw - 8, learnH, lCol);
       statusSprite.drawFastVLine(mid - 1, learnY + 1, learnH - 2, display.color565(50, 30, 30));
@@ -8102,7 +8247,8 @@ static void renderRF433Remote() {
       statusSprite.setTextColor(colCanc);
       statusSprite.drawString("CANCEL", 4 + (mid - 6) / 2, learnY + learnH / 2);
       statusSprite.setTextColor(lCol);
-      statusSprite.drawString("LISTENING...", mid + (sw - mid - 4) / 2, learnY + learnH / 2);
+      statusSprite.drawString(rf433AutoMode ? "AUTO BIND..." : "LISTENING...",
+                              mid + (sw - mid - 4) / 2, learnY + learnH / 2);
     }
   }
 
@@ -8118,7 +8264,7 @@ static void renderRF433Remote() {
   }
 
   const int pad  = 3;
-  int  btnH      = isLand ? 22 : 28;
+  int  btnH      = isLand ? 30 : 38;
   int  btnW      = (sw - pad * 3) / 2;
   int  rows      = (rf433BtnCount + 1) / 2;
   int  visRows   = max(1, areaH / (btnH + pad));
@@ -8141,8 +8287,15 @@ static void renderRF433Remote() {
     if (by + btnH <= areaY || by >= areaY + areaH) continue;
 
     bool flashing = (rf433FlashIdx == i) && rf433TxMs > 0 && (millis() - rf433TxMs) < 200;
-    uint16_t edge = flashing ? display.color565(180, 255, 120) : display.color565(0, 180, 80);
-    uint16_t bg   = flashing ? display.color565(8, 45, 18)     : display.color565(0, 12, 5);
+    uint16_t edge, bg;
+    if (rf433DeleteMode) {
+      bool pulse = (millis() / 500) % 2 == 0;
+      edge = pulse ? display.color565(255, 60, 60) : display.color565(140, 30, 30);
+      bg   = display.color565(30, 5, 5);
+    } else {
+      edge = flashing ? display.color565(180, 255, 120) : display.color565(0, 180, 80);
+      bg   = flashing ? display.color565(8, 45, 18)     : display.color565(0, 12, 5);
+    }
     statusSprite.fillRoundRect(bx, by, btnW, btnH, 4, bg);
     statusSprite.drawRoundRect(bx, by, btnW, btnH, 4, edge);
     statusSprite.setTextDatum(MC_DATUM);
