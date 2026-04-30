@@ -1149,9 +1149,9 @@ void loop() {
 // ================================================================
 
 void createStatusSprite() {
-  statusSprite.deleteSprite();
+  statusSprite.deleteSprite();   // free both before allocating either —
+  headerSprite.deleteSprite();   // avoids fragmentation when portrait needs more bytes than landscape
   statusSprite.createSprite(display.width(), display.height() - g_spriteY);
-  headerSprite.deleteSprite();
   headerSprite.createSprite(display.width(), SPRITE_Y);
 }
 
@@ -1204,6 +1204,7 @@ void updateOrientation() {
     }
     currentRotation = newRotation;
     display.setRotation(currentRotation);
+    display.fillScreen(0x0000);   // blank immediately — prevents old orientation content showing
     createStatusSprite();
     lastFunction = -1;
     lastMinute   = -1;  // force clock redraw
@@ -3445,6 +3446,9 @@ void renderFunction() {
     if (rf433LearnMode) rf433LearnStop();
     rf433DeleteMode = false;
   }
+
+  if (lastFunction != (int)currentFunction)
+    display.fillScreen(0x0000);  // blank on every function/orientation transition
 
   static int serialLastScreen = -1;
   if ((int)currentFunction != serialLastScreen) {
