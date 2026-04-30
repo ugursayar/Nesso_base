@@ -112,11 +112,12 @@ struct RF433LearnData {
 
 NessoDisplay display;
 LGFX_Sprite  statusSprite(&display);
+LGFX_Sprite  headerSprite(&display);   // 22px header for IR/RF433 — double-buffered to avoid flicker
 NessoTouch   touch;
 
 // Y-offset where statusSprite is pushed; area above holds the WiFi icon
 const int SPRITE_Y = 22;
-// Runtime sprite Y offset — set to 0 for IR/RF433 (no header bar), SPRITE_Y otherwise
+// Sprite Y offset — always SPRITE_Y (22px); IR/RF433 clear the header area themselves
 int g_spriteY = SPRITE_Y;
 
 const uint16_t COLOR_TEAL   = 0x0410;
@@ -1150,10 +1151,12 @@ void loop() {
 void createStatusSprite() {
   statusSprite.deleteSprite();
   statusSprite.createSprite(display.width(), display.height() - g_spriteY);
+  headerSprite.deleteSprite();
+  headerSprite.createSprite(display.width(), SPRITE_Y);
 }
 
 void updateOrientation() {
-  if (key1Down || key2Down) return;  // suppress during button hold — avoids flicker on long press
+  if (key1Down || key2Down || touchActive) return;  // suppress during any input — avoids rotation during swipe
   float ax, ay, az;
   if (!IMU.accelerationAvailable()) return;
   IMU.readAcceleration(ax, ay, az);
@@ -1280,7 +1283,7 @@ void drawBTIcon() {
 }
 
 void renderHeader() {
-  display.fillScreen(BG_COLOR);
+  display.fillRect(0, 0, display.width(), SPRITE_Y, BG_COLOR);
   drawBatteryIcon();
   drawWiFiStatus();
   drawBTIcon();
@@ -1549,9 +1552,8 @@ void onTap(int16_t sx, int16_t sy) {
 
     if (irLevel == IR_LEVEL_LIST) {
       // ── Directory browser ───────────────────────────────────────
-      int titleH  = isLand ? 20 : 24;
-      // Tap title = go back to parent directory
-      if (sprite_y < titleH) {
+      // Tap title bar (display y < SPRITE_Y) = go back to parent directory
+      if (sy < SPRITE_Y) {
         if (strcmp(irBrowsePath, "/irdb") != 0) {
           char parent[64]; strlcpy(parent, irBrowsePath, sizeof(parent));
           char* last = strrchr(parent, '/');
@@ -1562,7 +1564,7 @@ void onTap(int16_t sx, int16_t sy) {
         return;
       }
       int rowH    = isLand ? 18 : 20;
-      int listTop = titleH + 4;
+      int listTop = 4;  // title bar on display; sprite body starts at y=0
       int visRows = max(1, (sh - listTop - 4) / rowH);
       for (int i = 0; i < visRows; i++) {
         int n = i + irListOff;
@@ -1584,8 +1586,8 @@ void onTap(int16_t sx, int16_t sy) {
 
     } else if (irLevel == IR_LEVEL_REMOTE) {
       // ── Level 1: Remote buttons ─────────────────────────────────
-      int titleH = isLand ? 22 : 26;
-      if (sprite_y < titleH) { irLevel = IR_LEVEL_LIST; return; }
+      // Tap title bar (display y < SPRITE_Y) = back to list
+      if (sy < SPRITE_Y) { irLevel = IR_LEVEL_LIST; return; }
 
       // Learn mode bar tap (shown at bottom when learn mode active)
       if (irLearnMode) {
@@ -1608,7 +1610,7 @@ void onTap(int16_t sx, int16_t sy) {
         }
       }
 
-      int areaY = titleH + 3;
+      int areaY = 3;  // title bar on display; sprite body starts at y=0
       int contentY = sprite_y - areaY + irBtnPageOff; // position in layout space
       for (int i = 0; i < irBtnCount; i++) {
         if (sx >= irLayout[i].x && sx < irLayout[i].x + irLayout[i].w &&
@@ -1636,17 +1638,16 @@ void onTap(int16_t sx, int16_t sy) {
     bool isLand = sw > sh;
 
     if (rf433Level == RF433_LEVEL_LIST) {
-      int titleH  = isLand ? 20 : 24;
       int barH2   = isLand ? 16 : 20;
       int barY2   = sh - barH2 - 2;
-      if (sprite_y < titleH) return;
+      if (sy < SPRITE_Y) return;  // tap in title bar — no action (no back on root dir)
       // "+ NEW REMOTE" action bar at the bottom
       if (sprite_y >= barY2 && sprite_y < barY2 + barH2) {
         rf433AutoNew();
         return;
       }
       int rowH    = isLand ? 18 : 20;
-      int listTop = titleH + 4;
+      int listTop = 4;  // title bar on display; sprite body starts at y=0
       int visRows = max(1, (barY2 - 4 - listTop) / rowH);
       for (int i = 0; i < visRows; i++) {
         int n = i + rf433ListOff;
@@ -1662,8 +1663,8 @@ void onTap(int16_t sx, int16_t sy) {
         }
       }
     } else if (rf433Level == RF433_LEVEL_REMOTE) {
-      int titleH  = isLand ? 22 : 26;
-      if (sprite_y < titleH) { rf433Level = RF433_LEVEL_LIST; return; }
+      // Tap title bar (display y < SPRITE_Y) = back to list
+      if (sy < SPRITE_Y) { rf433Level = RF433_LEVEL_LIST; return; }
 
       // Learn mode bar tap:
       //   CAPTURED  + left  → RETRY  (discard, back to LISTENING)
@@ -1694,7 +1695,7 @@ void onTap(int16_t sx, int16_t sy) {
         }
       }
 
-      int areaY = titleH + 3;
+      int areaY = 3;  // title bar on display; sprite body starts at y=0
       int btnH  = isLand ? 30 : 38;
       int btnW  = (sw - 9) / 2;
       for (int i = 0; i < rf433BtnCount; i++) {
@@ -1872,6 +1873,7 @@ void onSwipe(int16_t dx, int16_t dy) {
 // ================================================================
 
 void checkButtons(unsigned long msNow) {
+  bool wasOff = displayOff || displayDimmed;  // capture before resetActivity() wakes display
   bool anyKey = (digitalRead(KEY1) == LOW) || (digitalRead(KEY2) == LOW);
   if (anyKey) resetActivity();
   bool k1 = (digitalRead(KEY1) == LOW);
@@ -1880,7 +1882,7 @@ void checkButtons(unsigned long msNow) {
   // ── KEY1 ──────────────────────────────────────────────────────
   if (k1 && !key1Down) {
     key1Down      = true;
-    key1LongFired = false;
+    key1LongFired = wasOff;  // suppress short/long action if this press woke the display
     key1PressedAt = msNow;
   } else if (!k1 && key1Down) {
     key1Down = false;
@@ -1894,7 +1896,7 @@ void checkButtons(unsigned long msNow) {
   // ── KEY2 ──────────────────────────────────────────────────────
   if (k2 && !key2Down) {
     key2Down      = true;
-    key2LongFired = false;
+    key2LongFired = wasOff;  // suppress short/long action if this press woke the display
     key2PressedAt = msNow;
   } else if (!k2 && key2Down) {
     key2Down = false;
@@ -2113,9 +2115,7 @@ void onKey1Long() {
     else if (currentFunction == FUNCTION_BATTERY) applyDeviceSettings();
     // RF433: no persistent settings to apply, just close
     navState = NAV_NORMAL;
-    // No lastFunction = -1 here: the sprite-based screens redraw every frame
-    // without needing a full display.fillScreen() call, so clearing lastFunction
-    // would trigger initBT()/initLora() which calls display.fillScreen() → flicker.
+    // No lastFunction = -1 here: sprite-based screens redraw every frame already.
     debugln("Settings applied");
   }
 }
@@ -3420,16 +3420,6 @@ void serialCheckInput() {
 }
 
 void renderFunction() {
-  // Resize sprite every frame based on current function — avoids lastFunction=-1 race
-  // with updateOrientation() leaving g_spriteY stuck at 0 for non-IR/RF433 screens.
-  {
-    int desired = (currentFunction == FUNCTION_IR || currentFunction == FUNCTION_RF433) ? 0 : SPRITE_Y;
-    if (desired != g_spriteY) {
-      g_spriteY = desired;
-      createStatusSprite();
-      irLayoutH = 0;  // force IR button layout rebuild on next render
-    }
-  }
 
   if (lastFunction == (int)FUNCTION_LORA && currentFunction != FUNCTION_LORA && loraInitialized) {
     lora.standby();
@@ -3476,14 +3466,32 @@ void renderFunction() {
       break;
 
     case FUNCTION_IR:
-      if (lastFunction != (int)FUNCTION_IR) initIR();
+      if (lastFunction != (int)FUNCTION_IR) {
+        statusSprite.fillSprite(COLOR_BLACK);
+        statusSprite.setFont(&fonts::Font0);
+        statusSprite.setTextSize(1);
+        statusSprite.setTextDatum(MC_DATUM);
+        statusSprite.setTextColor(display.color565(80,80,80));
+        statusSprite.drawString("Loading...", statusSprite.width()/2, statusSprite.height()/2);
+        statusSprite.pushSprite(0, g_spriteY);
+        initIR();
+      }
       if (navState == NAV_SETTINGS) renderIRSettings();
       else                          renderIR();
       statusSprite.pushSprite(0, g_spriteY);
       break;
 
     case FUNCTION_RF433:
-      if (lastFunction != (int)FUNCTION_RF433) initRF433();
+      if (lastFunction != (int)FUNCTION_RF433) {
+        statusSprite.fillSprite(COLOR_BLACK);
+        statusSprite.setFont(&fonts::Font0);
+        statusSprite.setTextSize(1);
+        statusSprite.setTextDatum(MC_DATUM);
+        statusSprite.setTextColor(display.color565(80,80,80));
+        statusSprite.drawString("Loading...", statusSprite.width()/2, statusSprite.height()/2);
+        statusSprite.pushSprite(0, g_spriteY);
+        initRF433();
+      }
       if (navState == NAV_SETTINGS) renderRF433Settings();
       else                          renderRF433();
       statusSprite.pushSprite(0, g_spriteY);
@@ -3495,7 +3503,8 @@ void renderFunction() {
       break;
 
     case FUNCTION_MEDIA:
-      initMedia();   // internally guards on sub-screen change
+      if (lastFunction != (int)FUNCTION_MEDIA) lastMediaSubScreen = -1;  // force redraw on re-entry
+      initMedia();
       renderMedia();
       break;
 
@@ -3643,7 +3652,6 @@ void drawDateDay() {
 void initBattery() {
   progressPos       = 0;
   progressExpanding = true;
-  display.fillScreen(COLOR_BLACK);
   renderHeader();
 }
 
@@ -4058,7 +4066,6 @@ void renderObiwan() {
 // ================================================================
 
 void initController() {
-  display.fillScreen(COLOR_BLACK);
   renderHeader();
 }
 
@@ -4599,7 +4606,6 @@ void transmitRemoteCommand(int leftMotorPower, int rightMotorPower) {
 // ================================================================
 
 void initLora() {
-  display.fillScreen(COLOR_BLACK);
   renderHeader();
 
   loraListening = false;   // user must tap LISTEN; no auto-resume on entry
@@ -5460,7 +5466,6 @@ void btInitStack() {
 }
 
 void initBT() {
-  display.fillScreen(COLOR_BLACK);
   renderHeader();
   btScrollOffset    = 0;
   btSelectedAddr[0] = '\0';
@@ -5699,7 +5704,7 @@ void renderBT() {
   // Detail view for a selected device
   if (btSelectedAddr[0] != '\0') {
     renderBTDetail();
-    return;
+    if (btSelectedAddr[0] != '\0') return;  // only skip normal render if detail was actually drawn
   }
 
   // (BLE connection events are handled in btProcessPendingEvents(), called from loop())
@@ -6076,8 +6081,6 @@ void renderBatterySettings() {
     statusSprite.setTextColor(sel ? (isReset ? display.color565(255,80,80) : COLOR_ORANGE) : COLOR_GRAY);
     statusSprite.drawString(values[idx], sw - 8, textY);
   }
-
-  statusSprite.pushSprite(0, SPRITE_Y);
 }
 
 void handleBatterySettingsTap(int16_t sx, int16_t sy) {
@@ -6121,7 +6124,6 @@ void applyWiFiSettings() {
 }
 
 void initWiFi() {
-  display.fillScreen(BG_COLOR);
   renderHeader();
   wifiScanOffset = 0;
   if (wifiAutoScan && !wifiScanning) {
@@ -6591,8 +6593,7 @@ void handleRF433SettingsTap(int16_t sx, int16_t sy) {
   int  sprite_y    = sy - g_spriteY;
 
   static const int ITEM_COUNT = 7;
-  int divY     = isLandscape ? 22 : 26;
-  int startY   = divY + 4;
+  int startY   = 4;  // title bar is on display; list starts near top of sprite
   int btnH     = isLandscape ? 20 : 30;
   int btnY     = sh - 6 - btnH;
   int sepY     = btnY - 6;
@@ -6626,8 +6627,7 @@ void handleIRSettingsTap(int16_t sx, int16_t sy) {
   int  sprite_y    = sy - g_spriteY;
 
   static const int ITEM_COUNT = 7;
-  int divY     = isLandscape ? 22 : 26;
-  int startY   = divY + 4;
+  int startY   = 4;  // title bar is on display; list starts near top of sprite
   int btnH     = isLandscape ? 20 : 30;
   int btnY     = sh - 6 - btnH;
   int sepY     = btnY - 6;
@@ -7147,8 +7147,10 @@ static void irAutoBind() {
 }
 
 void initIR() {
+  headerSprite.fillSprite(0x0000);
+  headerSprite.pushSprite(0, 0);
+  irLayoutH = 0;
   IrSender.begin(IR_SEND_PIN);
-  display.fillScreen(BG_COLOR);
   irBtnPageOff = 0;
   irOpenDir("/irdb");
   if (irSavedPath[0] != '\0') {
@@ -7407,18 +7409,20 @@ static void irBuildLayout(int sw, bool isLand) {
 // ── Shared: draw a list title bar with optional back arrow ────────
 static void irDrawTitle(const char* title, bool showBack, int sw, int titleH, bool isLand) {
   uint16_t orange = display.color565(200,80,0);
-  statusSprite.fillRect(0, 0, sw, titleH, display.color565(20,10,0));
-  statusSprite.drawFastHLine(0, titleH, sw, display.color565(80,30,0));
+  headerSprite.setFont(&fonts::Font0);
+  headerSprite.fillSprite(display.color565(20,10,0));
   if (showBack) {
-    statusSprite.setTextDatum(TL_DATUM);
-    statusSprite.setTextSize(1);
-    statusSprite.setTextColor(display.color565(120,50,0));
-    statusSprite.drawString("< BACK", 4, (titleH-8)/2);
+    headerSprite.setTextDatum(TL_DATUM);
+    headerSprite.setTextSize(1);
+    headerSprite.setTextColor(display.color565(120,50,0));
+    headerSprite.drawString("< BACK", 4, (SPRITE_Y-8)/2);
   }
-  statusSprite.setTextDatum(TC_DATUM);
-  statusSprite.setTextSize(2);
-  statusSprite.setTextColor(orange);
-  statusSprite.drawString(title, sw/2, isLand ? 3 : 4);
+  headerSprite.setTextDatum(TC_DATUM);
+  headerSprite.setTextSize(2);
+  headerSprite.setTextColor(orange);
+  headerSprite.drawString(title, sw/2, isLand ? 3 : 4);
+  headerSprite.drawFastHLine(0, SPRITE_Y-1, sw, display.color565(80,30,0));  // accent line at bottom
+  // caller must call headerSprite.pushSprite(0, 0) after adding any indicators
 }
 
 
@@ -7470,13 +7474,14 @@ void renderIRSettings() {
   const char* labels[ITEM_COUNT] = { "NEW REMOTE", "SELECT REMOTE", "DEL REMOTE", "CAPTURE BUTTON", "AUTO BIND", "DELETE BUTTON", "RESET" };
   const char* values[ITEM_COUNT] = { "CREATE", "LIST", "REMOVE", "LEARN", "AUTO", "DEL", "\x10" };
 
-  int titleY = isLandscape ? 4 : 6;
-  int divY   = isLandscape ? 22 : 26;
-  statusSprite.setTextDatum(TC_DATUM);
-  statusSprite.setTextSize(2);
-  statusSprite.setTextColor(display.color565(180, 70, 0));
-  statusSprite.drawString("IR ACTIONS", sw / 2, titleY);
-  statusSprite.drawFastHLine(8, divY, sw - 16, display.color565(80, 30, 0));
+  headerSprite.setFont(&fonts::Font0);
+  headerSprite.fillSprite(display.color565(20, 10, 0));
+  headerSprite.setTextDatum(TC_DATUM);
+  headerSprite.setTextSize(2);
+  headerSprite.setTextColor(display.color565(180, 70, 0));
+  headerSprite.drawString("IR ACTIONS", sw / 2, isLandscape ? 4 : 6);
+  headerSprite.drawFastHLine(8, SPRITE_Y-1, sw - 16, display.color565(80, 30, 0));
+  headerSprite.pushSprite(0, 0);
 
   int btnH = isLandscape ? 20 : 30;
   int btnY = sh - 6 - btnH;
@@ -7494,7 +7499,7 @@ void renderIRSettings() {
   statusSprite.setTextColor(COLOR_RED);
   statusSprite.drawString("CANCEL", 16 + bw + bw / 2,  btnY + btnH / 2);
 
-  int startY   = divY + 4;
+  int startY   = 4;  // title bar is on display; list starts near top of sprite
   int rowH     = isLandscape ? 20 : 26;
   int rowsArea = sepY - startY;
   int visRows  = constrain(rowsArea / rowH, 1, ITEM_COUNT);
@@ -7555,6 +7560,7 @@ static void renderIRDir() {
   const char* sl = strrchr(irBrowsePath, '/');
   const char* dirLabel = (sl && !atRoot) ? sl + 1 : "IR REMOTE";
   irDrawTitle(dirLabel, !atRoot, sw, titleH, isLand);
+  headerSprite.pushSprite(0, 0);
 
   if (irDirCount == 0) {
     statusSprite.setTextDatum(MC_DATUM);
@@ -7565,7 +7571,7 @@ static void renderIRDir() {
   }
 
   int rowH     = isLand ? 18 : 20;
-  int listTop  = titleH + 4;
+  int listTop  = 4;  // title bar is on display; sprite body starts at y=0
   int listArea = sh - listTop - 4;
   int visRows  = max(1, listArea / rowH);
   irListOff    = constrain(irListOff, 0, max(0, irDirCount - visRows));
@@ -7613,9 +7619,9 @@ static void renderIRDir() {
 
 // ── Level 1: Remote button grid ──────────────────────────────────
 static void renderIRRemote() {
-  if (!irLoadedPath[0]) { irLevel = IR_LEVEL_LIST; return; }
+  if (!irLoadedPath[0]) { irLevel = IR_LEVEL_LIST; renderIRDir(); return; }
   // Empty remote in learn mode: keep the view open and show a hint
-  if (irBtnCount == 0 && !irLearnMode) { irLevel = IR_LEVEL_LIST; return; }
+  if (irBtnCount == 0 && !irLearnMode) { irLevel = IR_LEVEL_LIST; renderIRDir(); return; }
 
   int sw = statusSprite.width(), sh = statusSprite.height();
   bool isLand = sw > sh;
@@ -7625,23 +7631,23 @@ static void renderIRRemote() {
   int titleH = isLand ? 22 : 26;
   irDrawTitle(irLoadedName, true, sw, titleH, isLand);
 
-  // TX indicator: blinking red dot for 500 ms
+  // TX indicator: blinking red dot for 500 ms — drawn into headerSprite
   uint32_t txAge = irTxMs ? (uint32_t)(millis() - irTxMs) : 0xFFFFFFFFu;
   if (txAge < 500 && (txAge / 100) % 2 == 0)
-    statusSprite.fillCircle(sw - 8, titleH/2, 4, display.color565(220,0,0));
+    headerSprite.fillCircle(sw - 8, SPRITE_Y/2, 4, display.color565(220,0,0));
 
-  // Delete mode indicator (left side of title bar)
+  // Delete mode indicator (left side of title bar) — drawn into headerSprite
   if (irDeleteMode) {
     bool pulse = (millis() / 400) % 2 == 0;
     uint16_t dotCol = pulse ? display.color565(255, 60, 60) : display.color565(100, 20, 20);
-    statusSprite.fillCircle(9, titleH/2, 4, dotCol);
-    statusSprite.setTextDatum(TL_DATUM);
-    statusSprite.setTextSize(1);
-    statusSprite.setTextColor(dotCol);
-    statusSprite.drawString("DEL", 16, (titleH - 8) / 2);
+    headerSprite.fillCircle(9, SPRITE_Y/2, 4, dotCol);
+    headerSprite.setTextDatum(TL_DATUM);
+    headerSprite.setTextSize(1);
+    headerSprite.setTextColor(dotCol);
+    headerSprite.drawString("DEL", 16, (SPRITE_Y - 8) / 2);
   }
 
-  // Learn mode indicator (left side of title bar)
+  // Learn mode indicator (left side of title bar) — drawn into headerSprite
   if (irLearnMode) {
     bool pulse = (millis() / 400) % 2 == 0;
     uint16_t dotCol;
@@ -7656,12 +7662,13 @@ static void renderIRRemote() {
       dotCol    = pulse ? display.color565(220, 180, 0) : display.color565(70, 55, 0);
       modeLabel = "LEARN";
     }
-    statusSprite.fillCircle(9, titleH/2, 4, dotCol);
-    statusSprite.setTextDatum(TL_DATUM);
-    statusSprite.setTextSize(1);
-    statusSprite.setTextColor(dotCol);
-    statusSprite.drawString(modeLabel, 16, (titleH - 8) / 2);
+    headerSprite.fillCircle(9, SPRITE_Y/2, 4, dotCol);
+    headerSprite.setTextDatum(TL_DATUM);
+    headerSprite.setTextSize(1);
+    headerSprite.setTextColor(dotCol);
+    headerSprite.drawString(modeLabel, 16, (SPRITE_Y - 8) / 2);
   }
+  headerSprite.pushSprite(0, 0);
 
   // Learn mode status/stop bar — only shown while learn mode is active
   int learnH = irLearnMode ? (isLand ? 28 : 36) : 0;
@@ -7704,7 +7711,7 @@ static void renderIRRemote() {
     }
   }
 
-  int areaY = titleH + 3;
+  int areaY = 3;  // title bar is on display, sprite body starts at y=0
   int areaH = (irLearnMode ? learnY - 4 : sh - 2) - areaY;
 
   // Empty custom remote: show hint while waiting for first bind
@@ -8388,18 +8395,20 @@ static const char* rf433DisplayName(const char* src) {
 
 static void rf433DrawTitle(const char* title, bool showBack, int sw, int titleH, bool isLand) {
   uint16_t green = display.color565(0, 180, 80);
-  statusSprite.fillRect(0, 0, sw, titleH, display.color565(0, 20, 8));
-  statusSprite.drawFastHLine(0, titleH, sw, green);
+  headerSprite.setFont(&fonts::Font0);
+  headerSprite.fillSprite(display.color565(0, 20, 8));
   if (showBack) {
-    statusSprite.setTextDatum(TL_DATUM);
-    statusSprite.setTextSize(1);
-    statusSprite.setTextColor(display.color565(0, 80, 35));
-    statusSprite.drawString("< BACK", 4, (titleH - 8) / 2);
+    headerSprite.setTextDatum(TL_DATUM);
+    headerSprite.setTextSize(1);
+    headerSprite.setTextColor(display.color565(0, 80, 35));
+    headerSprite.drawString("< BACK", 4, (SPRITE_Y - 8) / 2);
   }
-  statusSprite.setTextDatum(TC_DATUM);
-  statusSprite.setTextSize(2);
-  statusSprite.setTextColor(green);
-  statusSprite.drawString(title, sw / 2, isLand ? 3 : 4);
+  headerSprite.setTextDatum(TC_DATUM);
+  headerSprite.setTextSize(2);
+  headerSprite.setTextColor(green);
+  headerSprite.drawString(title, sw / 2, isLand ? 3 : 4);
+  headerSprite.drawFastHLine(0, SPRITE_Y-1, sw, green);  // accent line at bottom
+  // caller must call headerSprite.pushSprite(0, 0) after adding any indicators
 }
 
 void renderRF433Settings() {
@@ -8414,13 +8423,14 @@ void renderRF433Settings() {
   const char* labels[ITEM_COUNT]  = { "NEW REMOTE", "SELECT REMOTE", "DEL REMOTE", "CAPTURE BUTTON", "AUTO BIND", "DELETE BUTTON", "RESET" };
   const char* values[ITEM_COUNT]  = { "CREATE", "LIST", "REMOVE", "LEARN", "AUTO", "DEL", "\x10" };
 
-  int titleY = isLandscape ? 4 : 6;
-  int divY   = isLandscape ? 22 : 26;
-  statusSprite.setTextDatum(TC_DATUM);
-  statusSprite.setTextSize(2);
-  statusSprite.setTextColor(display.color565(0, 180, 80));
-  statusSprite.drawString("RF433 ACTIONS", sw / 2, titleY);
-  statusSprite.drawFastHLine(8, divY, sw - 16, display.color565(0, 80, 40));
+  headerSprite.setFont(&fonts::Font0);
+  headerSprite.fillSprite(display.color565(0, 20, 8));
+  headerSprite.setTextDatum(TC_DATUM);
+  headerSprite.setTextSize(2);
+  headerSprite.setTextColor(display.color565(0, 180, 80));
+  headerSprite.drawString("RF433 ACTIONS", sw / 2, isLandscape ? 4 : 6);
+  headerSprite.drawFastHLine(8, SPRITE_Y-1, sw - 16, display.color565(0, 80, 40));
+  headerSprite.pushSprite(0, 0);
 
   int btnH = isLandscape ? 20 : 30;
   int btnY = sh - 6 - btnH;
@@ -8438,7 +8448,7 @@ void renderRF433Settings() {
   statusSprite.setTextColor(COLOR_RED);
   statusSprite.drawString("CANCEL", 16 + bw + bw / 2,  btnY + btnH / 2);
 
-  int startY   = divY + 4;
+  int startY   = 4;  // title bar is on display; list starts near top of sprite
   int rowH     = isLandscape ? 20 : 26;
   int rowsArea = sepY - startY;
   int visRows  = constrain(rowsArea / rowH, 1, ITEM_COUNT);
@@ -8495,6 +8505,7 @@ static void renderRF433Dir() {
 
   int titleH = isLand ? 20 : 24;
   rf433DrawTitle("RF 433", false, sw, titleH, isLand);
+  headerSprite.pushSprite(0, 0);
 
   if (!rf433Enabled) {
     statusSprite.setTextDatum(MC_DATUM);
@@ -8528,7 +8539,7 @@ static void renderRF433Dir() {
   }
 
   int rowH     = isLand ? 18 : 20;
-  int listTop  = titleH + 4;
+  int listTop  = 4;  // title bar is on display; sprite body starts at y=0
   int listArea = barY2 - 4 - listTop;
   int visRows  = max(1, listArea / rowH);
   rf433ListOff = constrain(rf433ListOff, 0, max(0, rf433FileCount - visRows));
@@ -8566,7 +8577,7 @@ static void renderRF433Dir() {
 }
 
 static void renderRF433Remote() {
-  if (!rf433LoadedPath[0]) { rf433Level = RF433_LEVEL_LIST; return; }
+  if (!rf433LoadedPath[0]) { rf433Level = RF433_LEVEL_LIST; renderRF433Dir(); return; }
 
   int sw = statusSprite.width(), sh = statusSprite.height();
   bool isLand = sw > sh;
@@ -8577,23 +8588,23 @@ static void renderRF433Remote() {
   int titleH = isLand ? 22 : 26;
   rf433DrawTitle(rf433DisplayName(rf433LoadedName), true, sw, titleH, isLand);
 
-  // TX indicator: blinking green dot for 500 ms
+  // TX indicator: blinking green dot for 500 ms — drawn into headerSprite
   uint32_t txAge = rf433TxMs ? (uint32_t)(millis() - rf433TxMs) : 0xFFFFFFFFu;
   if (txAge < 500 && (txAge / 100) % 2 == 0)
-    statusSprite.fillCircle(sw - 8, titleH / 2, 4, display.color565(0, 220, 80));
+    headerSprite.fillCircle(sw - 8, SPRITE_Y / 2, 4, display.color565(0, 220, 80));
 
-  // Delete mode indicator (left side of title bar)
+  // Delete mode indicator (left side of title bar) — drawn into headerSprite
   if (rf433DeleteMode) {
     bool pulse = (millis() / 400) % 2 == 0;
     uint16_t dotCol = pulse ? display.color565(255, 60, 60) : display.color565(100, 20, 20);
-    statusSprite.fillCircle(9, titleH / 2, 4, dotCol);
-    statusSprite.setTextDatum(TL_DATUM);
-    statusSprite.setTextSize(1);
-    statusSprite.setTextColor(dotCol);
-    statusSprite.drawString("DEL", 16, (titleH - 8) / 2);
+    headerSprite.fillCircle(9, SPRITE_Y / 2, 4, dotCol);
+    headerSprite.setTextDatum(TL_DATUM);
+    headerSprite.setTextSize(1);
+    headerSprite.setTextColor(dotCol);
+    headerSprite.drawString("DEL", 16, (SPRITE_Y - 8) / 2);
   }
 
-  // Learn mode indicator (left side of title bar)
+  // Learn mode indicator (left side of title bar) — drawn into headerSprite
   if (rf433LearnMode) {
     bool inGrace = (uint32_t)(millis() - rf433LearnStartMs) < 500;
     bool pulse = (millis() / 400) % 2 == 0;
@@ -8612,12 +8623,13 @@ static void renderRF433Remote() {
       dotCol    = pulse ? display.color565(0, 220, 80) : display.color565(0, 60, 25);
       modeLabel = "LEARN";
     }
-    statusSprite.fillCircle(9, titleH / 2, 4, dotCol);
-    statusSprite.setTextDatum(TL_DATUM);
-    statusSprite.setTextSize(1);
-    statusSprite.setTextColor(dotCol);
-    statusSprite.drawString(modeLabel, 16, (titleH - 8) / 2);
+    headerSprite.fillCircle(9, SPRITE_Y / 2, 4, dotCol);
+    headerSprite.setTextDatum(TL_DATUM);
+    headerSprite.setTextSize(1);
+    headerSprite.setTextColor(dotCol);
+    headerSprite.drawString(modeLabel, 16, (SPRITE_Y - 8) / 2);
   }
+  headerSprite.pushSprite(0, 0);
 
   // Learn mode status/stop bar — only shown while learn mode is active
   int learnH = rf433LearnMode ? (isLand ? 28 : 36) : 0;
@@ -8672,7 +8684,7 @@ static void renderRF433Remote() {
     }
   }
 
-  int areaY = titleH + 3;
+  int areaY = 3;  // title bar is on display; sprite body starts at y=0
   int areaH = (rf433LearnMode ? learnY - 4 : sh - 2) - areaY;
 
   if (rf433BtnCount == 0) {
@@ -8733,7 +8745,8 @@ void renderRF433() {
 }
 
 void initRF433() {
-  display.fillScreen(BG_COLOR);
+  headerSprite.fillSprite(0x0000);
+  headerSprite.pushSprite(0, 0);
   rf433BtnOff  = 0;
   rf433ListOff = 0;
   if (rf433SavedPath[0] != '\0') {
