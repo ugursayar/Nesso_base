@@ -137,11 +137,11 @@ Navigation uses KEY1 (forward) and KEY2 (backward) with 500ms debounce. Modes ar
 | 5 | `FUNCTION_IR` | IR remote control |
 | 6 | `FUNCTION_RF433` | 433 MHz RF remote — enabled in device settings (disabled by default) |
 | 7 | `FUNCTION_MEDIA` | Matrix rain / Vader / Obi-Wan |
-| 8 | `FUNCTION_BATTERY` | Battery + device settings (long-press KEY1) |
+| 8 | `FUNCTION_BATTERY` | Battery + device settings (long-press KEY1); items: DIM TIMEOUT, SLEEP TIMEOUT, LOW BAT SLEEP, UI CLICKS, RF433, SPEAKER, VOLUME, RESET |
 
 ### Speaker Hat 2 (MAX98357A I2S amplifier)
 
-Enabled from the Battery/Device settings screen (long-press KEY1 → SPEAKER item) or at compile-time via NVS. When enabled, all audio (UI clicks and melodies) is routed through the I2S speaker instead of the onboard buzzer.
+Enabled from the Battery/Device settings screen (long-press KEY1 → SPEAKER item). When enabled, all audio (UI clicks and melodies) is routed through the I2S speaker instead of the onboard buzzer. Volume is set with the adjacent VOLUME item (25 / 50 / 75 / 100 %, default 75 %). Both settings are also exposed in the web file manager settings panel.
 
 **HAT port wiring:**
 
@@ -159,9 +159,11 @@ Enabled from the Battery/Device settings screen (long-press KEY1 → SPEAKER ite
 
 **Boot chime:** Three-note ascending C major arpeggio (C5–E5–G5) plays once at startup when speaker is enabled.
 
-**Implementation:** A FreeRTOS task (`spkTaskFn`, core 1, stack 4096 B) owns the I2S DMA writes and blocks internally per note. The main loop posts `SpkMsg` commands to a depth-4 queue (`g_spkQueue`). `uiClick()`, `startBuzzer()`, and `stopBuzzer()` route to the speaker queue when `spkEnabled && g_spkQueue`; the buzzer timer advances normally for UI-state tracking but does not call `tone()`.
+**Implementation:** Main-loop-driven polling — no FreeRTOS task or queue. `spkUpdate()` is called on every `loop()` iteration and writes up to 512 synthesised samples per call via `i2s_channel_write()` with `timeout_ms = 0` (non-blocking: samples are dropped rather than stalling the main loop if the DMA buffer is momentarily full). `uiClick()`, `startBuzzer()`, and `stopBuzzer()` set playback state (`spkPlayTone` / `spkPlayMelody` / `spkStop`); the buzzer timer still advances for UI-state tracking but skips `tone()` calls. The ESP32-C6 is single-core — a FreeRTOS task approach caused resets and was replaced by this polling design.
 
-**NVS key:** `spkOn` (bool).
+**Volume:** `spkVolume` (1–4) maps to amplitude 7 500 / 15 000 / 22 500 / 30 000 (25–100 % of int16 headroom). Amplitude is applied per-sample as `spkVolume * 7500`.
+
+**NVS keys:** `spkOn` (bool), `spkVol` (uint8 1–4).
 
 **Sample rate:** 22 050 Hz, 16-bit stereo (both channels identical — the MAX98357A down-mixes to mono internally).
 
