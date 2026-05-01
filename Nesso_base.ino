@@ -28,6 +28,7 @@
 #include <IRremote.hpp>
 #include <LittleFS.h>
 #include <WebServer.h>
+#include "ESP_I2S.h"
 
 // IR type definitions placed before #include <ArduinoJson.h> so the
 // Arduino preprocessor sees them before inserting auto-generated prototypes.
@@ -179,6 +180,7 @@ static const BuzzNote OBIWAN_MELODY[] = {
   {523,1000},{0,400},
 };
 static const int OBIWAN_MELODY_LEN = (int)(sizeof(OBIWAN_MELODY)/sizeof(OBIWAN_MELODY[0]));
+
 
 // Shared buzzer state — one melody plays at a time
 const BuzzNote* buzzerMelody    = nullptr;
@@ -613,6 +615,26 @@ bool         irDeleteMode = false;   // tap-to-delete button mode
 bool         irAutoMode   = false;   // auto-bind: each capture → Btn_XX
 IRLearnData  irLearnLast  = {};      // most recently captured signal
 
+// ── Speaker Hat 2 ─────────────────────────────────────────────────
+bool             spkEnabled     = false;
+static bool      spkInitialized = false;
+static I2SClass  spkI2S;
+// Playback state — updated by spkUpdate(), called from main loop
+static uint16_t        g_spkFreq         = 0;
+static float           g_spkPhase        = 0.0f;
+static uint32_t        g_spkSamplesLeft  = 0;
+static uint32_t        g_spkTotalSamples = 0;
+static uint32_t        g_spkNotePos      = 0;
+static bool            g_spkDecayEnv     = false;
+static const BuzzNote* g_spkMelody       = nullptr;
+static int             g_spkMelLen       = 0;
+static int             g_spkMelIdx       = 0;
+static bool            g_spkMelLoop      = false;
+static uint32_t        g_spkLastMs       = 0;
+static int16_t         g_spkBuf[1024];   // 512 stereo frames, global (not stack)
+static uint8_t         spkVolume         = 3;  // 1–4 → 25 / 50 / 75 / 100 %
+static const char* const SPK_VOL_LABELS[] = {"25%", "50%", "75%", "100%"};
+
 // ── RF433 (SYN115 TX + SYN531R RX on GROVE Y-cable) ──────────────
 bool           rf433Enabled     = false;
 
@@ -830,6 +852,8 @@ void loadSettings() {
   btStartupEnabled = p.getBool ("btStartup",  true);
   p.getString("irPath", irSavedPath, sizeof(irSavedPath));
   rf433Enabled = p.getBool("rf433On", false);
+  spkEnabled   = p.getBool("spkOn",   false);
+  spkVolume    = constrain((int)p.getUChar("spkVol", 3), 1, 4);
   p.getString("rf433Path", rf433SavedPath, sizeof(rf433SavedPath));
   p.getString("wifiSsid", wifiUserSsid, sizeof(wifiUserSsid));
   p.getString("wifiPass", wifiUserPass, sizeof(wifiUserPass));
@@ -856,6 +880,8 @@ void saveSettings() {
   p.putBool ("btStartup",  btStartupEnabled);
   p.putString("irPath",    irSavedPath);
   p.putBool  ("rf433On",  rf433Enabled);
+  p.putBool  ("spkOn",    spkEnabled);
+  p.putUChar ("spkVol",   spkVolume);
   p.putString("rf433Path", rf433SavedPath);
   p.putString("wifiSsid", wifiUserSsid);
   p.putString("wifiPass", wifiUserPass);
@@ -1039,6 +1065,11 @@ void setup() {
     splashLog("> WiFi: connection failed", COLOR_RED);
   }
 
+  if (spkEnabled) {
+    if (spkInit()) splashLog("> Speaker: ready",     COLOR_GREEN);
+    else           splashLog("> Speaker: init failed", COLOR_RED);
+  }
+
   splashLog("> Ready.", COLOR_GREEN);
   delay(900);
 
@@ -1049,6 +1080,7 @@ void setup() {
   currentFunction = FUNCTION_MAIN;
   lastFunction    = -1;
 
+  spkPlayBootChime();
   debugln("N#1 initialized.");
   serialPrintHelp();
   // BLE stack init is deferred — happens silently ~2 s after first clock render.
@@ -1057,6 +1089,8 @@ void setup() {
 
 void loop() {
   unsigned long msNow = millis();
+
+  spkUpdate();  // every iteration — non-blocking, keeps DMA fed through heavy renders
 
   if (msNow - buttonCheckTime > 20) {
     buttonCheckTime = msNow;
@@ -1819,7 +1853,7 @@ void onSwipe(int16_t dx, int16_t dy) {
       else if (currentFunction == FUNCTION_BT)      maxCursor = 5;  // 6 items
       else if (currentFunction == FUNCTION_RF433)   maxCursor = 6;  // 7 items
       else if (currentFunction == FUNCTION_IR)      maxCursor = 6;  // 7 items
-      else /* BATTERY */                            maxCursor = 5;  // 6 items
+      else /* BATTERY */                            maxCursor = 7;  // 8 items
       if (dy < 0) settingsCursor = min(settingsCursor + 1, maxCursor);
       else        settingsCursor = max(settingsCursor - 1, 0);
     } else if (currentFunction == FUNCTION_MEDIA && navState == NAV_NORMAL) {
@@ -1925,7 +1959,7 @@ void onKey1Short() {
     if ((currentFunction == FUNCTION_WIFI    && settingsCursor == 2) ||
         (currentFunction == FUNCTION_LORA    && settingsCursor == 4) ||
         (currentFunction == FUNCTION_BT      && settingsCursor == 5) ||
-        (currentFunction == FUNCTION_BATTERY && settingsCursor == 5) ||
+        (currentFunction == FUNCTION_BATTERY && settingsCursor == 7) ||
         (currentFunction == FUNCTION_RF433   && settingsCursor == 6) ||
         (currentFunction == FUNCTION_IR      && settingsCursor == 6)) {
       navState = NAV_RESET;
@@ -1959,6 +1993,18 @@ void onKey1Short() {
         case 2: lowBatIdx       = (lowBatIdx       + 1) % LOW_BAT_COUNT;       break;
         case 3: uiClickEnabled  = !uiClickEnabled;                              break;
         case 4: rf433Enabled    = !rf433Enabled;                                break;
+        case 5:
+          if (!spkEnabled) {
+            noTone(BEEP_PIN);
+            spkEnabled = spkInit();
+          } else {
+            spkEnabled = false;
+            spkDeinit();
+          }
+          break;
+        case 6:
+          spkVolume = (spkVolume % 4) + 1;  // cycle 1→2→3→4→1
+          break;
       }
     } else if (currentFunction == FUNCTION_RF433) {
       switch (settingsCursor) {
@@ -2084,7 +2130,7 @@ void onKey2Short() {
     else if (currentFunction == FUNCTION_BT)
       settingsCursor = (settingsCursor + 1) % 6;  // 5 items + RESET
     else if (currentFunction == FUNCTION_BATTERY)
-      settingsCursor = (settingsCursor + 1) % 6;  // 5 items + RESET
+      settingsCursor = (settingsCursor + 1) % 8;  // 7 items + RESET
     else if (currentFunction == FUNCTION_RF433)
       settingsCursor = (settingsCursor + 1) % 7;  // NEW / SELECT / DEL REMOTE / CAPTURE / AUTO / DELETE / RESET
     else if (currentFunction == FUNCTION_IR)
@@ -3821,21 +3867,32 @@ void startBuzzer(const BuzzNote* melody, int len) {
   buzzerMelodyLen = len;
   buzzerNoteIdx   = 0;
   buzzerPlaying   = true;
-  uint16_t f = melody[0].freq;
-  if (f) tone(BEEP_PIN, f); else noTone(BEEP_PIN);
   buzzerNoteEndMs = millis() + melody[0].ms;
+  if (spkEnabled && spkInitialized) {
+    spkPlayMelody(melody, len, true);
+  } else {
+    uint16_t f = melody[0].freq;
+    if (f) tone(BEEP_PIN, f); else noTone(BEEP_PIN);
+  }
 }
 
 void stopBuzzer() {
   buzzerPlaying = false;
   noTone(BEEP_PIN);
+  if (spkEnabled && spkInitialized) {
+    spkStop();
+  }
 }
 
 // One-shot UI click feedback — skipped if a melody is playing so music isn't interrupted.
 // freq: Hz; durationMs: length in ms. Keep durations short (≤40 ms).
 void uiClick(uint16_t freq, uint16_t durationMs) {
   if (!uiClickEnabled || buzzerPlaying) return;
-  tone(BEEP_PIN, freq, durationMs);
+  if (spkEnabled && spkInitialized) {
+    spkPlayTone(freq, durationMs);
+  } else {
+    tone(BEEP_PIN, freq, durationMs);
+  }
 }
 
 void updateBuzzer(unsigned long msNow) {
@@ -3843,9 +3900,172 @@ void updateBuzzer(unsigned long msNow) {
   if (msNow < buzzerNoteEndMs) return;
   buzzerNoteIdx = (buzzerNoteIdx + 1) % buzzerMelodyLen;
   uint16_t f = buzzerMelody[buzzerNoteIdx].freq;
-  if (f) tone(BEEP_PIN, f); else noTone(BEEP_PIN);
+  if (!spkEnabled || !spkInitialized) {
+    if (f) tone(BEEP_PIN, f); else noTone(BEEP_PIN);
+  }
   buzzerNoteEndMs = msNow + buzzerMelody[buzzerNoteIdx].ms;
 }
+
+// ================================================================
+// Speaker Hat 2 — MAX98357A I2S amplifier subsystem
+// ================================================================
+// HAT port wiring (Nesso N1 ↔ Hat SPK2):
+//   G7 (GPIO 7) → BCLK   G6 (GPIO 6) → LRCLK   G2 (GPIO 2) → DATA
+// Uses the arduino-esp32 ESP_I2S library (ESP32-C6 tested, handles
+// all board-specific I2S init quirks that the raw IDF API does not).
+
+#define SPK_BCLK_PIN    7
+#define SPK_LRC_PIN     6
+#define SPK_DOUT_PIN    2
+#define SPK_SAMPLE_RATE 22050
+#define SPK_AMPLITUDE_MAX 30000  // 100% volume ceiling; actual = spkVolume * 7500
+
+// Main-loop-driven audio: spkUpdate() is called every ~20 ms from loop().
+// No FreeRTOS task — writes directly to the I2S DMA from the Arduino task,
+// mirroring the ESP_I2S library example pattern.
+
+static bool spkLoadNextNote() {
+  if (g_spkMelody && g_spkMelIdx < g_spkMelLen) {
+    g_spkFreq         = g_spkMelody[g_spkMelIdx].freq;
+    uint32_t ms       = g_spkMelody[g_spkMelIdx].ms;
+    g_spkTotalSamples = (uint32_t)SPK_SAMPLE_RATE * ms / 1000;
+    g_spkSamplesLeft  = g_spkTotalSamples;
+    g_spkNotePos      = 0;
+    g_spkPhase        = 0.0f;
+    g_spkMelIdx++;
+    if (g_spkMelIdx >= g_spkMelLen) {
+      if (g_spkMelLoop) g_spkMelIdx = 0;
+      else              g_spkMelody = nullptr;
+    }
+    return true;
+  }
+  return false;
+}
+
+void spkStop() {
+  g_spkMelody      = nullptr;
+  g_spkSamplesLeft = 0;
+  g_spkFreq        = 0;
+}
+
+void spkPlayTone(uint16_t freq, uint16_t ms) {
+  g_spkMelody       = nullptr;
+  g_spkFreq         = freq;
+  g_spkTotalSamples = (uint32_t)SPK_SAMPLE_RATE * ms / 1000;
+  g_spkSamplesLeft  = g_spkTotalSamples;
+  g_spkNotePos      = 0;
+  g_spkDecayEnv     = true;
+  g_spkPhase        = 0.0f;
+}
+
+void spkPlayMelody(const BuzzNote* mel, int len, bool loop) {
+  g_spkMelody  = mel;
+  g_spkMelLen  = len;
+  g_spkMelIdx  = 0;
+  g_spkMelLoop = loop;
+  g_spkDecayEnv = false;
+  g_spkFreq    = 0;
+  g_spkSamplesLeft = 0;  // triggers note load on first spkUpdate()
+}
+
+void spkUpdate() {
+  if (!spkInitialized) return;
+
+  uint32_t now     = millis();
+  int32_t  elapsed = (int32_t)(now - g_spkLastMs);
+  if (elapsed <= 0) elapsed = 1;
+  g_spkLastMs = now;
+
+  int toWrite = (int)((uint32_t)SPK_SAMPLE_RATE * (uint32_t)elapsed / 1000);
+  if (toWrite > 512) toWrite = 512;
+  if (toWrite <= 0)  return;
+
+  int ramp    = SPK_SAMPLE_RATE * 5 / 1000;  // 5 ms envelope ramp
+  int written = 0;
+
+  while (written < toWrite) {
+    if (g_spkSamplesLeft == 0) {
+      if (!spkLoadNextNote()) {
+        memset(g_spkBuf + written * 2, 0, (toWrite - written) * 4);
+        written = toWrite;
+        break;
+      }
+    }
+
+    int batch = min(toWrite - written, (int)g_spkSamplesLeft);
+
+    float phaseInc = (g_spkFreq > 0)
+      ? (2.0f * (float)M_PI * g_spkFreq / SPK_SAMPLE_RATE)
+      : 0.0f;
+
+    for (int i = 0; i < batch; i++) {
+      float env;
+      if (g_spkFreq == 0) {
+        env = 0.0f;
+      } else if (g_spkDecayEnv) {
+        env = 1.0f - (float)(g_spkNotePos + i) / (float)g_spkTotalSamples;
+        if (env < 0) env = 0;
+      } else {
+        int p   = (int)(g_spkNotePos + i);
+        int tot = (int)g_spkTotalSamples;
+        if      (p < ramp)        env = (float)p / ramp;
+        else if (p >= tot - ramp) env = (float)(tot - 1 - p) / ramp;
+        else                      env = 1.0f;
+      }
+      int16_t s = (int16_t)((float)(spkVolume * 7500) * env * sinf(g_spkPhase));
+      g_spkBuf[(written + i) * 2]     = s;
+      g_spkBuf[(written + i) * 2 + 1] = s;
+      g_spkPhase += phaseInc;
+      if (g_spkPhase > 2.0f * (float)M_PI) g_spkPhase -= 2.0f * (float)M_PI;
+    }
+
+    g_spkSamplesLeft -= batch;
+    g_spkNotePos     += batch;
+    written          += batch;
+  }
+
+  // Non-blocking write: timeout=0 drops samples if DMA is momentarily full
+  // rather than stalling the main loop.  ESP_I2S.h pulls in driver/i2s_std.h.
+  size_t bytesWritten = 0;
+  i2s_channel_write(spkI2S.txChan(), g_spkBuf, (size_t)toWrite * 4, &bytesWritten, 0);
+}
+
+bool spkInit() {
+  if (spkInitialized) return true;
+  noTone(BEEP_PIN);
+  spkI2S.setPins(SPK_BCLK_PIN, SPK_LRC_PIN, SPK_DOUT_PIN);
+  if (!spkI2S.begin(I2S_MODE_STD, SPK_SAMPLE_RATE,
+                    I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO)) {
+    return false;
+  }
+  memset(g_spkBuf, 0, sizeof(g_spkBuf));
+  g_spkLastMs = millis();
+  spkInitialized = true;
+  return true;
+}
+
+void spkDeinit() {
+  spkStop();
+  if (spkInitialized) {
+    spkI2S.end();
+    spkInitialized = false;
+  }
+}
+
+static const BuzzNote SPK_BOOT_CHIME[] = {{523,80},{659,80},{784,120}};
+static const int      SPK_BOOT_CHIME_LEN = 3;
+
+void spkPlayBootChime() {
+  if (!spkInitialized) return;
+  spkPlayMelody(SPK_BOOT_CHIME, SPK_BOOT_CHIME_LEN, false);
+  // Block until chime finishes — called during setup splash where blocking is OK.
+  while (g_spkMelody != nullptr || g_spkSamplesLeft > 0) {
+    spkUpdate();
+    delay(5);
+  }
+}
+
+// ================================================================
 
 void initMatrix() {
   display.fillScreen(COLOR_BLACK);
@@ -4275,25 +4495,35 @@ void readGamePad() {
   int16_t powerx = x - zero_x;
   int16_t powery = y - zero_y;
 
-  // Store raw axis values for the joystick visualisation
-  joyDisplayX = powerx;
-  joyDisplayY = powery;
+  // Remap joystick axes to match device orientation so "forward" always means
+  // toward the top of the display, regardless of how the device is rotated.
+  int16_t rx, ry;
+  switch (currentRotation) {
+    case 1:  rx =  powery; ry = -powerx; break;  // landscape right
+    case 2:  rx = -powerx; ry = -powery; break;  // portrait flipped
+    case 3:  rx = -powery; ry =  powerx; break;  // landscape left
+    default: rx =  powerx; ry =  powery; break;  // portrait normal
+  }
 
-  if (powerx < 0) {
+  // Store remapped values so the visualisation label and dot match commands
+  joyDisplayX = rx;
+  joyDisplayY = ry;
+
+  if (rx < 0) {
     resetActivity();
-    int16_t p = map(powerx, 0, -515, 0, -255);
+    int16_t p = map(rx, 0, -515, 0, -255);
     transmitRemoteCommand(p, p);
-  } else if (powerx > 0) {
+  } else if (rx > 0) {
     resetActivity();
-    int16_t p = map(powerx, 0, 515, 0, 255);
+    int16_t p = map(rx, 0, 515, 0, 255);
     transmitRemoteCommand(p, p);
-  } else if (powery < 0) {
+  } else if (ry < 0) {
     resetActivity();
-    int16_t p = map(powery, 0, -515, 0, -255);
+    int16_t p = map(ry, 0, -515, 0, -255);
     transmitRemoteCommand(p, -p);
-  } else if (powery > 0) {
+  } else if (ry > 0) {
     resetActivity();
-    int16_t p = map(powery, 0, 515, 0, 255);
+    int16_t p = map(ry, 0, 515, 0, 255);
     transmitRemoteCommand(p, -p);
   } else {
     transmitRemoteCommand(0, 0);
@@ -4462,6 +4692,8 @@ static void webFMHandleGetSettings() {
   doc["low_bat"]       = lowBatIdx;
   doc["ui_click"]      = uiClickEnabled;
   doc["rf433_on"]      = rf433Enabled;
+  doc["spk_on"]        = spkEnabled;
+  doc["spk_vol"]       = spkVolume;
   String json; serializeJson(doc, json);
   webFMJson(200, json.c_str());
 }
@@ -4486,6 +4718,8 @@ static void webFMHandlePostSettings() {
   lowBatIdx      = constrain((int)(doc["low_bat"]       | lowBatIdx),       0, 2);
   uiClickEnabled =           doc["ui_click"]  | uiClickEnabled;
   if (doc.containsKey("rf433_on")) rf433Enabled = (bool)doc["rf433_on"];
+  if (doc.containsKey("spk_on"))  spkEnabled   = (bool)doc["spk_on"];
+  if (doc.containsKey("spk_vol")) spkVolume    = constrain((int)(doc["spk_vol"] | spkVolume), 1, 4);
   saveSettings();
   saveConfig();
   configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
@@ -6017,15 +6251,17 @@ void renderBatterySettings() {
   statusSprite.fillSprite(COLOR_BLACK);
   statusSprite.setFont(&fonts::Font0);
 
-  static const int ITEM_COUNT = 6;
-  const char* labels[ITEM_COUNT] = {"DIM TIMEOUT", "SLEEP TIMEOUT", "LOW BAT SLEEP", "UI CLICKS", "RF433", "RESET"};
+  static const int ITEM_COUNT = 8;
+  const char* labels[ITEM_COUNT] = {"DIM TIMEOUT", "SLEEP TIMEOUT", "LOW BAT SLEEP", "UI CLICKS", "RF433", "SPEAKER", "VOLUME", "RESET"};
   char values[ITEM_COUNT][16];
   snprintf(values[0], 16, "%s", DIM_TIMEOUT_LABELS[dimTimeoutIdx]);
   snprintf(values[1], 16, "%s", SLEEP_TIMEOUT_LABELS[sleepTimeoutIdx]);
   snprintf(values[2], 16, "%s", LOW_BAT_LABELS[lowBatIdx]);
   snprintf(values[3], 16, "%s", uiClickEnabled ? "ON" : "OFF");
   snprintf(values[4], 16, "%s", rf433Enabled   ? "ON" : "OFF");
-  snprintf(values[5], 16, "%s", "\x10");  // right-arrow glyph
+  snprintf(values[5], 16, "%s", spkEnabled     ? "ON" : "OFF");
+  snprintf(values[6], 16, "%s", SPK_VOL_LABELS[spkVolume - 1]);
+  snprintf(values[7], 16, "%s", "\x10");  // right-arrow glyph
 
   int titleY = isLandscape ? 4 : 6;
   int divY   = isLandscape ? 22 : 26;
@@ -6067,6 +6303,8 @@ void renderBatterySettings() {
     int y       = startY + i * rowH;
     bool sel    = (idx == settingsCursor);
     bool isReset = (idx == ITEM_COUNT - 1);
+    bool isVolume = (idx == 6);
+    bool dimmed = isVolume && !spkEnabled;  // VOLUME is inactive when speaker is off
     int textY   = y + (rowH - 8) / 2;
 
     if (isReset && sel)
@@ -6079,10 +6317,12 @@ void renderBatterySettings() {
     statusSprite.setTextColor(sel ? (isReset ? display.color565(255,80,80) : display.color565(0,140,255))
                                   : display.color565(60, 60, 60));
     statusSprite.drawString(sel ? ">" : " ", 6, textY);
-    statusSprite.setTextColor(sel ? COLOR_WHITE : (isReset ? display.color565(100,40,40) : COLOR_GRAY));
+    statusSprite.setTextColor(dimmed ? display.color565(45,45,45)
+                              : sel ? COLOR_WHITE : (isReset ? display.color565(100,40,40) : COLOR_GRAY));
     statusSprite.drawString(labels[idx], 18, textY);
     statusSprite.setTextDatum(TR_DATUM);
-    statusSprite.setTextColor(sel ? (isReset ? display.color565(255,80,80) : COLOR_ORANGE) : COLOR_GRAY);
+    statusSprite.setTextColor(dimmed ? display.color565(45,45,45)
+                              : sel ? (isReset ? display.color565(255,80,80) : COLOR_ORANGE) : COLOR_GRAY);
     statusSprite.drawString(values[idx], sw - 8, textY);
   }
 }
@@ -6093,7 +6333,7 @@ void handleBatterySettingsTap(int16_t sx, int16_t sy) {
   bool isLandscape = sw > sh;
   int  sprite_y    = sy - SPRITE_Y;
 
-  static const int ITEM_COUNT = 6;  // 5 items + RESET
+  static const int ITEM_COUNT = 8;  // 7 items + RESET
   int divY     = isLandscape ? 22 : 26;
   int startY   = divY + 4;
   int rowH     = isLandscape ? 20 : 32;

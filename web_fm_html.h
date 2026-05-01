@@ -112,6 +112,15 @@ tr.sel td{background:#1e293b}
     <div class="sr"><label>RF433 Module</label>
       <select id="s_rf433"><option value="1">ON</option><option value="0">OFF</option></select>
     </div>
+    <div class="sr"><label>Speaker Hat</label>
+      <select id="s_spk"><option value="1">ON</option><option value="0">OFF</option></select>
+    </div>
+    <div class="sr"><label>Volume</label>
+      <select id="s_spkvol">
+        <option value="1">25%</option><option value="2">50%</option>
+        <option value="3">75%</option><option value="4">100%</option>
+      </select>
+    </div>
   </div>
   <div style="display:flex;gap:8px;align-items:center">
     <button onclick="saveDevSettings()" style="background:#1e3a5f;border-color:#38bdf8;color:#38bdf8">Save</button>
@@ -227,6 +236,8 @@ function loadDevSettings(){
     $('s_lowbat').value=d.low_bat||0;
     $('s_click').value=d.ui_click?'1':'0';
     $('s_rf433').value=d.rf433_on?'1':'0';
+    $('s_spk').value=d.spk_on?'1':'0';
+    $('s_spkvol').value=d.spk_vol||3;
   }).catch(function(e){$('sst').textContent='Load failed: '+e;$('sst').className='st err';});
 }
 function loadSysInfo(){
@@ -254,7 +265,9 @@ function saveDevSettings(){
     sleep_timeout:parseInt($('s_sleep').value),
     low_bat:parseInt($('s_lowbat').value),
     ui_click:$('s_click').value==='1',
-    rf433_on:$('s_rf433').value==='1'
+    rf433_on:$('s_rf433').value==='1',
+    spk_on:$('s_spk').value==='1',
+    spk_vol:parseInt($('s_spkvol').value)
   };
   $('sst').textContent='Saving...';$('sst').className='st';
   fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)})

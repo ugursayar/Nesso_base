@@ -139,6 +139,32 @@ Navigation uses KEY1 (forward) and KEY2 (backward) with 500ms debounce. Modes ar
 | 7 | `FUNCTION_MEDIA` | Matrix rain / Vader / Obi-Wan |
 | 8 | `FUNCTION_BATTERY` | Battery + device settings (long-press KEY1) |
 
+### Speaker Hat 2 (MAX98357A I2S amplifier)
+
+Enabled from the Battery/Device settings screen (long-press KEY1 → SPEAKER item) or at compile-time via NVS. When enabled, all audio (UI clicks and melodies) is routed through the I2S speaker instead of the onboard buzzer.
+
+**HAT port wiring:**
+
+| Signal | GPIO | `#define` | Notes |
+|---|---|---|---|
+| BCLK  | GPIO 7 (G7) | `SPK_BCLK_PIN` | Bit clock |
+| LRCLK | GPIO 6 (G6) | `SPK_LRC_PIN`  | Word select |
+| DATA  | GPIO 2 (G2) | `SPK_DOUT_PIN` | Serial data |
+
+**Audio quality improvements over buzzer:**
+- Sine wave synthesis instead of square wave — smooth, musical tones
+- 5 ms attack/release envelopes on melody notes — eliminates click artifacts
+- Linear decay envelope on UI clicks — natural "tap" feel
+- Vader March and Obi-Wan theme play at full audio quality
+
+**Boot chime:** Three-note ascending C major arpeggio (C5–E5–G5) plays once at startup when speaker is enabled.
+
+**Implementation:** A FreeRTOS task (`spkTaskFn`, core 1, stack 4096 B) owns the I2S DMA writes and blocks internally per note. The main loop posts `SpkMsg` commands to a depth-4 queue (`g_spkQueue`). `uiClick()`, `startBuzzer()`, and `stopBuzzer()` route to the speaker queue when `spkEnabled && g_spkQueue`; the buzzer timer advances normally for UI-state tracking but does not call `tone()`.
+
+**NVS key:** `spkOn` (bool).
+
+**Sample rate:** 22 050 Hz, 16-bit stereo (both channels identical — the MAX98357A down-mixes to mono internally).
+
 ### IR Remote System
 
 IR device files (`.ir` format) are stored in LittleFS under `/irdb/` and scanned at boot by `irScanFiles()`. The UI is two levels:
