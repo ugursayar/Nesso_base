@@ -134,10 +134,11 @@ Navigation uses KEY1 (forward) and KEY2 (backward) with 500ms debounce. Modes ar
 | 2 | `FUNCTION_BT` | Bluetooth scanner |
 | 3 | `FUNCTION_WIFI` | WiFi network scanner |
 | 4 | `FUNCTION_LORA` | LoRa / Meshtastic |
-| 5 | `FUNCTION_IR` | IR remote control |
-| 6 | `FUNCTION_RF433` | 433 MHz RF remote — enabled in device settings (disabled by default) |
-| 7 | `FUNCTION_MEDIA` | Matrix rain / Vader / Obi-Wan |
-| 8 | `FUNCTION_BATTERY` | Battery + device settings (long-press KEY1); items: DIM TIMEOUT, SLEEP TIMEOUT, LOW BAT SLEEP, UI CLICKS, RF433, SPEAKER, VOLUME, RESET |
+| 5 | `FUNCTION_RFID2` | M5Stack RFID2 Unit — hidden from navigation when unit not connected |
+| 6 | `FUNCTION_IR` | IR remote control |
+| 7 | `FUNCTION_RF433` | 433 MHz RF remote — enabled in device settings (disabled by default) |
+| 8 | `FUNCTION_MEDIA` | Matrix rain / Vader / Obi-Wan |
+| 9 | `FUNCTION_BATTERY` | Battery + device settings (long-press KEY1); items: DIM TIMEOUT, SLEEP TIMEOUT, LOW BAT SLEEP, UI CLICKS, RF433, SPEAKER, VOLUME, RESET |
 
 ### Speaker Hat 2 (MAX98357A I2S amplifier)
 
@@ -440,6 +441,19 @@ rf433 learn stop                 # cuts GROVE power
 
 Connect at **115200 baud**. Type `help` for the full list. Commands work over both USB serial and BLE UART.
 
+#### Navigation / General
+
+| Command | Description |
+|---|---|
+| `help` | Print full command reference |
+| `status` | Current state summary (screen, WiFi, BT, BLE-UART) |
+| `next` | Advance to next screen (same as KEY1) |
+| `prev` | Go to previous screen (same as KEY2) |
+| `goto <screen>` | Jump directly to a screen — valid names: `main`, `controller`, `bt`, `wifi`, `lora`, `rfid2`, `ir`, `rf433`, `media`, `matrix`, `vader`, `obiwan`, `battery` |
+| `clock` | Print current date/time (NTP) |
+| `battery` | Print voltage, percentage, charge state, uptime |
+| `webfm` | Print web file manager URL (WiFi required) |
+
 #### Filesystem (`fs`)
 
 | Command | Description |
@@ -485,6 +499,87 @@ The device prints byte count and auto-rescans `/irdb` on success.
 | `ir learn stop` | Stop capture, cut GROVE power |
 | `ir learn bind <label>` | Bind last captured signal to a button label |
 | `ir learn show` | Print details of last captured signal |
+
+### RFID2 Unit (M5Stack Unit RFID2, WS1850S chip)
+
+Reads ISO/IEC 14443-A cards (MIFARE Classic, Ultralight, NTAG, etc.) over I2C. Scanned UIDs are saved to `.rfid` files in LittleFS under `/rfid2db/`.
+
+**GROVE PORT.CUSTOM wiring:**
+
+| GROVE signal | Nesso N1 GPIO | Constant | Direction |
+|---|---|---|---|
+| Yellow (SDA) | GPIO 5 | `GROVE_IO_0` | I2C data |
+| Gray (SCL) | GPIO 4 | `GROVE_IO_1` | I2C clock |
+
+**I2C address:** 0x28 (WS1850S fixed)
+
+**Library:** `MFRC522_I2C` v1.0.0 (install via arduino-cli: `arduino-cli lib install "MFRC522_I2C"`)
+
+**ESP32-C6 I2C constraint:** ESP32-C6 has only ONE HP I2C controller (`Wire`, default SDA=GPIO10 SCL=GPIO8). The second bus (`TwoWire(1)`) is LP I2C whose SDA is hardware-locked to GPIO 6 — unusable for GPIO 5. Solution: briefly switch `Wire` to GPIO 5/4 for each MFRC522 operation via `rfid2WireGrove()` / `rfid2WireRestore()`, which call `Wire.end()` + `Wire.begin()` with new pins. `Wire.end()` is mandatory before `Wire.begin()` with different pins on ESP32-C6; omitting it leaves the bus on the old pins silently.
+
+**Detection:** `initRFID2()` runs a live I2C probe on every screen entry with 150 ms GROVE power stabilisation delay, so connecting the unit after boot is supported without reboot.
+
+#### UI levels
+
+The RFID2 screen has three levels:
+
+| Level | Constant | Description |
+|---|---|---|
+| Main | `RFID2_LEVEL_MAIN` | Default. NFC icon + "WAITING…"; shows UID + card type for 3 s after a read. Blinking `REC` dot when record mode is active. |
+| File list | `RFID2_LEVEL_LIST` | Scrollable browser of `.rfid` files in `/rfid2db/`. Tap a file to open its card list. Tap title bar to return to Main. |
+| Card list | `RFID2_LEVEL_CARDS` | Cards stored in the loaded file. Tap title bar to return to file list. In delete mode, tapping a card removes it immediately. |
+
+Long-press KEY1 opens the settings overlay (6 items: NEW FILE, VIEW FILES, DEL FILE, RECORD CARD, DELETE CARD, RESET). Vertical swipe scrolls the cursor in settings mode; vertical swipe scrolls the list in normal mode at LIST/CARDS levels.
+
+#### .rfid file format
+
+Files are stored under `/rfid2db/` (custom files in `/rfid2db/<name>.rfid`). Format:
+
+```
+Filetype: Nesso RFID Database
+Version: 1
+#
+name: Card_01
+uid: E3:ED:B5:19
+sak: 08
+type: MIFARE 1KB
+#
+name: Card_02
+uid: A1:B2:C3:D4
+sak: 00
+type: MIFARE Ultralight
+```
+
+Each card block is separated by `#`. Fields: `name` (label up to 23 chars), `uid` (hex colon-separated), `sak` (hex byte), `type` (string).
+
+#### Record mode
+
+When record mode is active (`rfid2RecordMode = true`), every new card tap is auto-saved to the loaded file as `Card_01`, `Card_02`, … A blinking amber `REC` dot appears in the top-right corner of the Main screen. Enable via the settings overlay (RECORD CARD) or `rfid2 record start` serial command.
+
+**Serial output on card read:**
+```
+[RFID2] UID(4): E3:ED:B5:19  SAK: 0x08  Type: MIFARE 1KB
+```
+
+**NVS key:** `rfid2Path` (string — last loaded file path, reloaded on next entry to RFID2 screen).
+
+#### Serial commands
+
+| Command | Description |
+|---|---|
+| `rfid2 list` | List all `.rfid` files in `/rfid2db/` (`*` = currently loaded) |
+| `rfid2 reload` | Re-scan `/rfid2db/` without reboot |
+| `rfid2 select <N>` | Load file N and open RFID screen |
+| `rfid2 new [name]` | Create new `.rfid` file and start record mode |
+| `rfid2 del` | Delete the currently loaded file |
+| `rfid2 rename <new name>` | Rename the loaded file |
+| `rfid2 card list` | List cards in the loaded file |
+| `rfid2 card del <label>` | Delete a card by label (or UID) from the loaded file |
+| `rfid2 card rename <old> <new>` | Rename a card in the loaded file |
+| `rfid2 record start` | Start auto-saving scanned cards to the loaded file |
+| `rfid2 record stop` | Stop record mode |
+| `rfid2 scan` | I2C bus scan on GROVE port (SDA=GPIO5 SCL=GPIO4) — lists all found addresses |
+| `rfid2 probe` | Probe specifically 0x28, prints error code, updates `rfid2Available` |
 
 ### Web File Manager
 

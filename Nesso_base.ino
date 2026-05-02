@@ -29,6 +29,7 @@
 #include <LittleFS.h>
 #include <WebServer.h>
 #include "ESP_I2S.h"
+#include <MFRC522_I2C.h>
 
 // IR type definitions placed before #include <ArduinoJson.h> so the
 // Arduino preprocessor sees them before inserting auto-generated prototypes.
@@ -104,6 +105,24 @@ struct RF433LearnData {
   uint16_t rawData[RF433_MAX_RAW_LEN];
   uint16_t rawLen;
 };
+
+// RFID2 type definitions (before ArduinoJson so prototypes can reference them)
+#define RFID2_MAX_FILES  32
+#define RFID2_MAX_CARDS  32
+
+struct RFID2Card {
+  char    label[24];
+  char    uid[25];
+  uint8_t sak;
+  char    type[24];
+};
+
+struct RFID2FileEntry {
+  char name[40];
+  char path[64];
+};
+
+enum RFID2Level : uint8_t { RFID2_LEVEL_MAIN = 0, RFID2_LEVEL_LIST = 1, RFID2_LEVEL_CARDS = 2 };
 
 #include <ArduinoJson.h>
 
@@ -668,6 +687,50 @@ static volatile uint16_t rf433RawBuf[RF433_MAX_ISR_LEN];
 static volatile int      rf433RawLen     = 0;
 static volatile uint32_t rf433LastEdgeUs = 0;
 
+// ── RFID2 (WS1850S / MFRC522 I2C on GROVE PORT.CUSTOM)
+// GROVE SDA = GROVE_IO_0 = GPIO 5 (yellow), SCL = GROVE_IO_1 = GPIO 4 (gray)
+// ESP32-C6 has only one HP I2C (Wire, GPIO 10/8). The second bus is LP I2C
+// whose SDA is hardware-locked to GPIO 6 — unusable for GPIO 5.
+// Solution: briefly switch Wire to GPIO 5/4 for each MFRC522 operation,
+// then restore it to GPIO 10/8 so all other peripherals keep working.
+MFRC522_I2C mfrc522(0x28, UINT8_MAX, &Wire);   // uses main Wire; pins switched per-call
+bool        rfid2Available  = false;
+
+static RFID2FileEntry rfid2Files[RFID2_MAX_FILES];
+static int            rfid2FileCount   = 0;
+static int            rfid2ListOff     = 0;
+static RFID2Card      rfid2Cards[RFID2_MAX_CARDS];
+static int            rfid2CardCount   = 0;
+static int            rfid2CardOff     = 0;
+static int            rfid2SelectedIdx = -1;
+static char           rfid2LoadedPath[64] = "";
+static char           rfid2LoadedName[40] = "";
+static char           rfid2SavedPath[64]  = "";
+static RFID2Level     rfid2UILevel    = RFID2_LEVEL_MAIN;
+static bool           rfid2RecordMode = false;
+static bool           rfid2DeleteMode = false;
+static int            rfid2FlashIdx   = -1;
+static uint32_t       rfid2FlashMs    = 0;
+
+// Live-scan state (updated every 200 ms poll)
+static char     rfid2UidStr[25]   = "";
+static char     rfid2CardType[32] = "";
+static uint8_t  rfid2LastSak      = 0;
+static uint32_t rfid2LastScanMs   = 0;
+static bool     rfid2HasCard      = false;
+
+// Switch Wire to GROVE PORT.CUSTOM pins before any MFRC522 operation.
+// Wire.end() is required on ESP32-C6 to release current pin mux before reassigning.
+static inline void rfid2WireGrove() {
+  Wire.end();
+  Wire.begin(GROVE_IO_0, GROVE_IO_1, 100000);  // SDA=GPIO5, SCL=GPIO4
+}
+// Restore Wire to the Nesso N1 default (SDA=GPIO10 SCL=GPIO8) after the operation.
+static inline void rfid2WireRestore() {
+  Wire.end();
+  Wire.begin(SDA, SCL, 100000);  // SDA=GPIO10, SCL=GPIO8
+}
+
 // ----------------------------------------------------------------
 // Navigation
 // ----------------------------------------------------------------
@@ -678,13 +741,14 @@ enum MainFunctions {
   FUNCTION_BT         = 2,
   FUNCTION_WIFI       = 3,
   FUNCTION_LORA       = 4,
-  FUNCTION_IR         = 5,   // IR remote — after LoRa
-  FUNCTION_RF433      = 6,   // 433 MHz RF remote (SYN115 TX + SYN531R RX)
-  FUNCTION_MEDIA      = 7,   // matrix + vader + obiwan merged; sub-screen via swipe up/down
-  FUNCTION_BATTERY    = 8,   // moved to end; long-press opens device settings
+  FUNCTION_RFID2      = 5,   // M5Stack RFID2 Unit (WS1850S I2C 0x28) — hidden when not connected
+  FUNCTION_IR         = 6,   // IR remote
+  FUNCTION_RF433      = 7,   // 433 MHz RF remote (SYN115 TX + SYN531R RX)
+  FUNCTION_MEDIA      = 8,   // matrix + vader + obiwan merged; sub-screen via swipe up/down
+  FUNCTION_BATTERY    = 9,   // moved to end; long-press opens device settings
 } currentFunction;
 
-const int  mainFunctionCount = 9;
+const int  mainFunctionCount = 10;
 int        lastFunction;
 
 // ── Web file manager ─────────────────────────────────────────────
@@ -854,7 +918,8 @@ void loadSettings() {
   rf433Enabled = p.getBool("rf433On", false);
   spkEnabled   = p.getBool("spkOn",   false);
   spkVolume    = constrain((int)p.getUChar("spkVol", 3), 1, 4);
-  p.getString("rf433Path", rf433SavedPath, sizeof(rf433SavedPath));
+  p.getString("rf433Path",  rf433SavedPath, sizeof(rf433SavedPath));
+  p.getString("rfid2Path",  rfid2SavedPath, sizeof(rfid2SavedPath));
   p.getString("wifiSsid", wifiUserSsid, sizeof(wifiUserSsid));
   p.getString("wifiPass", wifiUserPass, sizeof(wifiUserPass));
   wifiDebugMode    = p.getBool ("wifiDbg",    false);
@@ -882,7 +947,8 @@ void saveSettings() {
   p.putBool  ("rf433On",  rf433Enabled);
   p.putBool  ("spkOn",    spkEnabled);
   p.putUChar ("spkVol",   spkVolume);
-  p.putString("rf433Path", rf433SavedPath);
+  p.putString("rf433Path",  rf433SavedPath);
+  p.putString("rfid2Path",  rfid2SavedPath);
   p.putString("wifiSsid", wifiUserSsid);
   p.putString("wifiPass", wifiUserPass);
   p.putBool ("wifiDbg",    wifiDebugMode);
@@ -981,6 +1047,17 @@ static void rf433CustomNew(const char* name);
 static bool rf433CustomSave();
 static void rf433CustomBind(const char* label);
 
+// Forward declarations for RFID2 helpers
+void initRFID2();
+void renderRFID2();
+void renderRFID2Settings();
+void handleRFID2SettingsTap(int16_t sx, int16_t sy);
+void rfid2ScanFiles();
+void rfid2LoadFile(const char* path);
+void serialHandleRFID2(const char* arg);
+static void rfid2AutoNew();
+static bool rfid2SaveFile();
+
 // ================================================================
 // Setup & Loop
 // ================================================================
@@ -1034,10 +1111,31 @@ void setup() {
   if (joystickAvailable) splashLog("> Joystick: found", COLOR_GREEN);
   else                   splashLog("> Joystick: not found", COLOR_GRAY);
 
+  // Probe RFID2 unit on GROVE PORT.CUSTOM (SDA=GPIO5, SCL=GPIO4, I2C addr 0x28)
+  // Wire is on GPIO 10/8 here — use it to enable GROVE power via I2C expander first,
+  // then briefly switch Wire to GPIO 5/4 for the I2C probe, then restore.
+  pinMode(GROVE_POWER_EN, OUTPUT);
+  digitalWrite(GROVE_POWER_EN, HIGH);
+  delay(150);  // WS1850S needs up to ~100 ms after power-on before responding on I2C
+  rfid2WireGrove();   // Wire → GPIO 5 (SDA) / GPIO 4 (SCL)
+  Wire.beginTransmission(0x28);
+  byte rfidProbeErr = Wire.endTransmission();
+  rfid2WireRestore(); // Wire → GPIO 10 / GPIO 8
+  rfid2Available = (rfidProbeErr == 0);
+  if (rfid2Available) {
+    splashLog("> RFID2: found", COLOR_GREEN);
+  } else {
+    char rfidMsg[48];
+    snprintf(rfidMsg, sizeof(rfidMsg), "> RFID2: not found (I2C err %d)", rfidProbeErr);
+    splashLog(rfidMsg, COLOR_GRAY);
+  }
+  digitalWrite(GROVE_POWER_EN, LOW);
+
   if (LittleFS.begin(true)) {
     loadConfig();
     irScanFiles();
     rf433ScanFiles();
+    rfid2ScanFiles();
     splashLog("> FS: ready", COLOR_GREEN);
   } else {
     splashLog("> FS: mount failed", COLOR_RED);
@@ -1520,6 +1618,8 @@ void onTap(int16_t sx, int16_t sy) {
     handleRF433SettingsTap(sx, sy);
   } else if (navState == NAV_SETTINGS && currentFunction == FUNCTION_IR) {
     handleIRSettingsTap(sx, sy);
+  } else if (navState == NAV_SETTINGS && currentFunction == FUNCTION_RFID2) {
+    handleRFID2SettingsTap(sx, sy);
   } else if (currentFunction == FUNCTION_BT && navState == NAV_NORMAL) {
     if (btSelectedAddr[0] != '\0') {
       btSelectedAddr[0] = '\0';   // tap in detail view → back to list
@@ -1757,6 +1857,79 @@ void onTap(int16_t sx, int16_t sy) {
         }
       }
     }
+  } else if (currentFunction == FUNCTION_RFID2 && navState == NAV_NORMAL) {
+    int sprite_y = sy - g_spriteY;
+    int sw = statusSprite.width(), sh = statusSprite.height();
+    bool isLand = sw > sh;
+
+    if (rfid2UILevel == RFID2_LEVEL_MAIN) {
+      return;  // main screen: card reads handled by poll in renderRFID2Main
+    } else if (rfid2UILevel == RFID2_LEVEL_LIST) {
+      if (sy < SPRITE_Y) { rfid2UILevel = RFID2_LEVEL_MAIN; return; }  // title bar → back to main
+      int barH   = isLand ? 16 : 20;
+      int barY   = sh - barH - 2;
+      if (sprite_y >= barY && sprite_y < barY + barH) {
+        rfid2AutoNew();
+        return;
+      }
+      int rowH    = isLand ? 18 : 20;
+      int listTop = 4;
+      int visRows = max(1, (barY - 4 - listTop) / rowH);
+      for (int i = 0; i < visRows; i++) {
+        int n = i + rfid2ListOff;
+        if (n >= rfid2FileCount) break;
+        int rowY = listTop + i * rowH;
+        if (sprite_y >= rowY && sprite_y < rowY + rowH) {
+          rfid2LoadFile(rfid2Files[n].path);
+          rfid2UILevel = RFID2_LEVEL_CARDS;
+          rfid2CardOff = 0;
+          strlcpy(rfid2SavedPath, rfid2Files[n].path, sizeof(rfid2SavedPath));
+          saveSettings();
+          return;
+        }
+      }
+    } else if (rfid2UILevel == RFID2_LEVEL_CARDS) {
+      if (sy < SPRITE_Y) { rfid2UILevel = RFID2_LEVEL_LIST; rfid2RecordMode = false; rfid2DeleteMode = false; return; }
+
+      // Record bar at bottom (shown when record mode is active)
+      if (rfid2RecordMode) {
+        int recH = isLand ? 24 : 30;
+        int recY = sh - recH - 2;
+        if (sprite_y >= recY) {
+          if (sx < sw / 2) rfid2RecordMode = false;  // STOP tap
+          return;
+        }
+      }
+
+      // Card list tap
+      int areaY   = 4;
+      int recH    = rfid2RecordMode ? (isLand ? 24 : 30) + 2 : 0;
+      int areaEnd = sh - recH - 2;
+      int rowH    = isLand ? 20 : 24;
+      int visRows = max(1, (areaEnd - areaY) / rowH);
+      rfid2CardOff = constrain(rfid2CardOff, 0, max(0, rfid2CardCount - visRows));
+      for (int i = 0; i < visRows; i++) {
+        int n = i + rfid2CardOff;
+        if (n >= rfid2CardCount) break;
+        int rowY = areaY + i * rowH;
+        if (sprite_y >= rowY && sprite_y < rowY + rowH) {
+          if (rfid2DeleteMode) {
+            for (int j = n; j < rfid2CardCount - 1; j++) rfid2Cards[j] = rfid2Cards[j + 1];
+            rfid2CardCount--;
+            rfid2DeleteMode = false;
+            rfid2CardOff = constrain(rfid2CardOff, 0, max(0, rfid2CardCount - 1));
+            rfid2SaveFile();
+            char dmsg[64];
+            snprintf(dmsg, sizeof(dmsg), "[RFID2] Card deleted from '%s'.", rfid2LoadedName);
+            serialWritelnAll(dmsg);
+          } else {
+            rfid2FlashIdx = n;
+            rfid2FlashMs  = millis();
+          }
+          return;
+        }
+      }
+    }
   } else if (currentFunction == FUNCTION_WIFI && navState == NAV_NORMAL) {
     int sprite_y = sy - g_spriteY;
     bool isLand  = statusSprite.width() > statusSprite.height();
@@ -1845,7 +2018,8 @@ void onSwipe(int16_t dx, int16_t dy) {
     if (navState == NAV_SETTINGS &&
         (currentFunction == FUNCTION_LORA || currentFunction == FUNCTION_BT ||
          currentFunction == FUNCTION_WIFI  || currentFunction == FUNCTION_BATTERY ||
-         currentFunction == FUNCTION_RF433 || currentFunction == FUNCTION_IR)) {
+         currentFunction == FUNCTION_RF433 || currentFunction == FUNCTION_IR  ||
+         currentFunction == FUNCTION_RFID2)) {
       // Move the cursor — the render function will update settingsScrollOffset to track it
       int maxCursor;
       if      (currentFunction == FUNCTION_WIFI)    maxCursor = 2;  // 3 items
@@ -1853,6 +2027,7 @@ void onSwipe(int16_t dx, int16_t dy) {
       else if (currentFunction == FUNCTION_BT)      maxCursor = 5;  // 6 items
       else if (currentFunction == FUNCTION_RF433)   maxCursor = 6;  // 7 items
       else if (currentFunction == FUNCTION_IR)      maxCursor = 6;  // 7 items
+      else if (currentFunction == FUNCTION_RFID2)   maxCursor = 5;  // 6 items
       else /* BATTERY */                            maxCursor = 7;  // 8 items
       if (dy < 0) settingsCursor = min(settingsCursor + 1, maxCursor);
       else        settingsCursor = max(settingsCursor - 1, 0);
@@ -1898,6 +2073,15 @@ void onSwipe(int16_t dx, int16_t dy) {
         int  rows     = (rf433BtnCount + 1) / 2;
         rf433BtnOff = constrain(rf433BtnOff - dy, 0, max(0, rows - visRows));
       }
+    } else if (currentFunction == FUNCTION_RFID2 && navState == NAV_NORMAL) {
+      if (rfid2UILevel == RFID2_LEVEL_LIST) {
+        if (dy < 0) rfid2ListOff = min(rfid2ListOff + 1, max(0, rfid2FileCount - 1));
+        else        rfid2ListOff = max(rfid2ListOff - 1, 0);
+      } else if (rfid2UILevel == RFID2_LEVEL_CARDS) {
+        if (dy < 0) rfid2CardOff = min(rfid2CardOff + 1, max(0, rfid2CardCount - 1));
+        else        rfid2CardOff = max(rfid2CardOff - 1, 0);
+      }
+      // RFID2_LEVEL_MAIN: no list to scroll
     }
   }
 }
@@ -1952,7 +2136,8 @@ void onKey1Short() {
     do {
       currentFunction = static_cast<MainFunctions>((currentFunction + 1) % mainFunctionCount);
     } while ((currentFunction == FUNCTION_CONTROLLER && !joystickAvailable) ||
-             (currentFunction == FUNCTION_RF433      && !rf433Enabled));
+             (currentFunction == FUNCTION_RF433      && !rf433Enabled)     ||
+             (currentFunction == FUNCTION_RFID2      && !rfid2Available));
     debugln("KEY1 short: next function");
   } else if (navState == NAV_SETTINGS) {
     // RESET item is always the last entry in each function's list — navigate to reset page
@@ -2109,6 +2294,59 @@ void onKey1Short() {
           break;
         // case 6 = RESET — handled above
       }
+    } else if (currentFunction == FUNCTION_RFID2) {
+      switch (settingsCursor) {
+        case 0:  // NEW FILE — create and return to main in record mode
+          rfid2AutoNew();
+          navState = NAV_NORMAL;
+          break;
+        case 1:  // VIEW FILES — open file browser
+          navState = NAV_NORMAL;
+          rfid2UILevel = RFID2_LEVEL_LIST;
+          rfid2RecordMode = false;
+          rfid2DeleteMode = false;
+          break;
+        case 2: {  // DEL FILE — delete currently loaded file, return to main
+          if (!rfid2LoadedPath[0]) break;
+          rfid2RecordMode = false;
+          rfid2DeleteMode = false;
+          if (!strcmp(rfid2SavedPath, rfid2LoadedPath)) {
+            rfid2SavedPath[0] = '\0';
+            saveSettings();
+          }
+          char delMsg[80];
+          snprintf(delMsg, sizeof(delMsg), "[RFID2] Deleted '%s'.", rfid2LoadedName);
+          LittleFS.remove(rfid2LoadedPath);
+          rfid2LoadedPath[0] = '\0';
+          rfid2LoadedName[0] = '\0';
+          rfid2SelectedIdx = -1;
+          rfid2CardCount = 0;
+          rfid2ScanFiles();
+          serialWritelnAll(delMsg);
+          rfid2UILevel = RFID2_LEVEL_MAIN;
+          navState = NAV_NORMAL;
+          break;
+        }
+        case 3:  // RECORD CARD — enable record mode on main screen
+          if (!rfid2LoadedPath[0]) rfid2AutoNew();
+          rfid2RecordMode = true;
+          rfid2DeleteMode = false;
+          rfid2UILevel = RFID2_LEVEL_MAIN;
+          navState = NAV_NORMAL;
+          break;
+        case 4:  // DELETE CARD — enter delete mode; if no file open, go to browser first
+          rfid2RecordMode = false;
+          navState = NAV_NORMAL;
+          if (rfid2CardCount > 0 && rfid2LoadedPath[0]) {
+            rfid2DeleteMode = true;
+            rfid2UILevel = RFID2_LEVEL_CARDS;
+          } else {
+            rfid2DeleteMode = false;
+            rfid2UILevel = RFID2_LEVEL_LIST;
+          }
+          break;
+        // case 5 = RESET — handled above
+      }
     }
   }
 }
@@ -2120,7 +2358,8 @@ void onKey2Short() {
     do {
       currentFunction = static_cast<MainFunctions>((currentFunction - 1 + mainFunctionCount) % mainFunctionCount);
     } while ((currentFunction == FUNCTION_CONTROLLER && !joystickAvailable) ||
-             (currentFunction == FUNCTION_RF433      && !rf433Enabled));
+             (currentFunction == FUNCTION_RF433      && !rf433Enabled)     ||
+             (currentFunction == FUNCTION_RFID2      && !rfid2Available));
     debugln("KEY2 short: prev function");
   } else if (navState == NAV_SETTINGS) {
     if (currentFunction == FUNCTION_WIFI)
@@ -2135,6 +2374,8 @@ void onKey2Short() {
       settingsCursor = (settingsCursor + 1) % 7;  // NEW / SELECT / DEL REMOTE / CAPTURE / AUTO / DELETE / RESET
     else if (currentFunction == FUNCTION_IR)
       settingsCursor = (settingsCursor + 1) % 7;  // NEW / SELECT / DEL REMOTE / CAPTURE / AUTO / DELETE / RESET
+    else if (currentFunction == FUNCTION_RFID2)
+      settingsCursor = (settingsCursor + 1) % 6;  // NEW FILE / SELECT FILE / DEL FILE / RECORD / DELETE CARD / RESET
   }
 }
 
@@ -2149,7 +2390,8 @@ void onKey1Long() {
   if (navState == NAV_NORMAL) {
     if (currentFunction == FUNCTION_LORA || currentFunction == FUNCTION_BT ||
         currentFunction == FUNCTION_WIFI  || currentFunction == FUNCTION_BATTERY ||
-        currentFunction == FUNCTION_RF433 || currentFunction == FUNCTION_IR) {
+        currentFunction == FUNCTION_RF433 || currentFunction == FUNCTION_IR  ||
+        currentFunction == FUNCTION_RFID2) {
       navState             = NAV_SETTINGS;
       settingsCursor       = 0;
       settingsScrollOffset = 0;
@@ -2160,7 +2402,7 @@ void onKey1Long() {
     else if (currentFunction == FUNCTION_LORA) applyLoraSettings();
     else if (currentFunction == FUNCTION_BT) applyBTSettings();
     else if (currentFunction == FUNCTION_BATTERY) applyDeviceSettings();
-    // RF433: no persistent settings to apply, just close
+    // RF433 / RFID2: no persistent settings to apply, just close
     navState = NAV_NORMAL;
     // No lastFunction = -1 here: sprite-based screens redraw every frame already.
     debugln("Settings applied");
@@ -2237,12 +2479,12 @@ void serialWritelnAll(const char* s) { serialWriteAll(s); serialWriteAll("\r\n")
 static void printHelpNav() {
   serialWritelnAll("Navigation:");
   serialWritelnAll("  next | prev           next/prev screen");
-  serialWritelnAll("  goto <screen>         main|controller|bt|wifi|lora|ir|media|battery");
+  serialWritelnAll("  goto <screen>         main|controller|bt|wifi|lora|rfid2|ir|rf433|media|matrix|vader|obiwan|battery");
   serialWritelnAll("  status                current state summary");
   serialWritelnAll("Information:");
   serialWritelnAll("  clock                 time and date (NTP UTC+3)");
   serialWritelnAll("  battery               voltage, level, charge status, uptime");
-  serialWritelnAll("  controller            joystick position and last motor values");
+  serialWritelnAll("  controller            joystick position and last motor values [Adafruit Gamepad QT]");
   serialWritelnAll("  send <L> <R>          transmit motor command  (-255..255)");
 }
 
@@ -2289,7 +2531,7 @@ static void printHelpFS() {
 }
 
 static void printHelpIR() {
-  serialWritelnAll("IR Remote:");
+  serialWritelnAll("IR Remote (M5Stack IR Unit):");
   serialWritelnAll("  -- Remote management --");
   serialWritelnAll("  ir list                       list all .ir files in /irdb/");
   serialWritelnAll("  ir select <N>                 load device N and open remote UI");
@@ -2311,7 +2553,7 @@ static void printHelpIR() {
 }
 
 static void printHelpRF433() {
-  serialWritelnAll("RF 433 MHz:");
+  serialWritelnAll("RF 433 MHz (M5Stack RF433R/T Units):");
   serialWritelnAll("  -- Remote management --");
   serialWritelnAll("  rf433 list                      list all .sub remotes in /rf433db/");
   serialWritelnAll("  rf433 select <N>                load remote N and open UI");
@@ -2331,6 +2573,27 @@ static void printHelpRF433() {
   serialWritelnAll("  rf433 learn show                print last captured signal info");
   serialWritelnAll("  -- Feature toggle --");
   serialWritelnAll("  rf433 enable / rf433 disable    toggle RF433 function (also in device settings)");
+}
+
+static void printHelpRFID2() {
+  serialWritelnAll("RFID2 (M5Stack RFID2 Unit):");
+  serialWritelnAll("  -- File management --");
+  serialWritelnAll("  rfid2 list                       list all .rfid files in /rfid2db/");
+  serialWritelnAll("  rfid2 reload                     re-scan /rfid2db/ for new files");
+  serialWritelnAll("  rfid2 select <N>                 load file N and open RFID screen");
+  serialWritelnAll("  rfid2 new [name]                 create new RFID file and start recording");
+  serialWritelnAll("  rfid2 del                        delete the loaded file");
+  serialWritelnAll("  rfid2 rename <new name>          rename the loaded file");
+  serialWritelnAll("  -- Card management --");
+  serialWritelnAll("  rfid2 card list                  list cards in the loaded file");
+  serialWritelnAll("  rfid2 card del <label>           delete a card from the loaded file");
+  serialWritelnAll("  rfid2 card rename <old> <new>    rename a card in the loaded file");
+  serialWritelnAll("  -- Record mode --");
+  serialWritelnAll("  rfid2 record start               start auto-saving scanned cards");
+  serialWritelnAll("  rfid2 record stop                stop recording");
+  serialWritelnAll("  -- Diagnostics --");
+  serialWritelnAll("  rfid2 scan                       I2C bus scan on GROVE port (SDA=GPIO5 SCL=GPIO4)");
+  serialWritelnAll("  rfid2 probe                      probe 0x28, update unit availability status");
 }
 
 static void printHelpMusic() {
@@ -2419,6 +2682,15 @@ void serialPrintFunctionHelp(int fn) {
       printHelpMusic();
       break;
     }
+    case FUNCTION_RFID2:
+      snprintf(buf, sizeof(buf), "[RFID2] unit:%s  file:%s  cards:%d  record:%s",
+        rfid2Available ? "connected" : "not found",
+        rfid2LoadedName[0] ? rfid2LoadedName : "none",
+        rfid2CardCount,
+        rfid2RecordMode ? "ON" : "off");
+      serialWritelnAll(buf);
+      printHelpRFID2();
+      break;
   }
 }
 
@@ -2433,6 +2705,7 @@ void serialPrintHelp() {
   printHelpFS();
   printHelpIR();
   printHelpRF433();
+  printHelpRFID2();
   printHelpMusic();
   serialWritelnAll("IMU / Orientation:");
   serialWritelnAll("  imu                    single accelerometer snapshot");
@@ -2505,7 +2778,8 @@ void serialPrintController() {
 void serialGoto(const char* name) {
   static const struct { const char* n; int f; } map[] = {
     {"main",0},{"controller",1},{"bt",2},{"wifi",3},
-    {"lora",4},{"ir",5},{"media",6},{"matrix",6},{"vader",6},{"obiwan",6},{"battery",7}
+    {"lora",4},{"rfid2",5},{"ir",6},{"rf433",7},
+    {"media",8},{"matrix",8},{"vader",8},{"obiwan",8},{"battery",9}
   };
   for (auto& e : map) {
     if (strcasecmp(name, e.n) == 0) {
@@ -3419,6 +3693,7 @@ void serialHandleCommand(const char* raw) {
   else if (cmdIs(raw,"ir"))     serialHandleIR(cmdArg(raw,"ir"));
   else if (cmdIs(raw,"rf433")) serialHandleRF433(cmdArg(raw,"rf433"));
   else if (cmdIs(raw,"lora"))  serialHandleLora(cmdArg(raw,"lora"));
+  else if (cmdIs(raw,"rfid2")) serialHandleRFID2(cmdArg(raw,"rfid2"));
   else if (cmdIs(raw,"music")) serialHandleMusic(cmdArg(raw,"music"));
   else if (cmdIs(raw,"imu"))   serialHandleImu(cmdArg(raw,"imu"));
   else if (cmdIs(raw,"webfm")) {
@@ -3491,6 +3766,12 @@ void renderFunction() {
   if (lastFunction == (int)FUNCTION_RF433 && currentFunction != FUNCTION_RF433) {
     if (rf433LearnMode) rf433LearnStop();
     rf433DeleteMode = false;
+  }
+  if (lastFunction == (int)FUNCTION_RFID2 && currentFunction != FUNCTION_RFID2) {
+    rfid2RecordMode = false;
+    rfid2DeleteMode = false;
+    if (!rf433LearnMode && !irLearnMode)
+      digitalWrite(GROVE_POWER_EN, LOW);
   }
 
   if (lastFunction != (int)currentFunction)
@@ -3587,6 +3868,22 @@ void renderFunction() {
       loraCheckPacket();
       renderLora();
       statusSprite.pushSprite(0, SPRITE_Y);
+      break;
+
+    case FUNCTION_RFID2:
+      if (lastFunction != (int)FUNCTION_RFID2) {
+        statusSprite.fillSprite(COLOR_BLACK);
+        statusSprite.setFont(&fonts::Font0);
+        statusSprite.setTextSize(1);
+        statusSprite.setTextDatum(MC_DATUM);
+        statusSprite.setTextColor(display.color565(80, 80, 80));
+        statusSprite.drawString("Loading...", statusSprite.width()/2, statusSprite.height()/2);
+        statusSprite.pushSprite(0, g_spriteY);
+        initRFID2();
+      }
+      if (navState == NAV_SETTINGS) renderRFID2Settings();
+      else                          renderRFID2();
+      statusSprite.pushSprite(0, g_spriteY);
       break;
   }
   lastFunction = (int)currentFunction;
@@ -9065,3 +9362,828 @@ void batteryCheck() {
     }
   }
 }
+
+
+// ================================================================
+// FUNCTION_RFID2 — M5Stack RFID2 Unit (WS1850S I2C 0x28) with file mgmt
+// GROVE PORT.CUSTOM: SDA = GPIO 5 (yellow), SCL = GPIO 4 (gray)
+// ================================================================
+
+// ── File scanning ─────────────────────────────────────────────────
+static void rfid2ScanDir(const char* dirPath) {
+  File dir = LittleFS.open(dirPath);
+  if (!dir || !dir.isDirectory()) { dir.close(); return; }
+  while (rfid2FileCount < RFID2_MAX_FILES) {
+    File entry = dir.openNextFile();
+    if (!entry) break;
+    char pathBuf[64];
+    snprintf(pathBuf, sizeof(pathBuf), "%s/%s", dirPath, entry.name());
+    bool isDir = entry.isDirectory();
+    entry.close();
+    if (isDir) {
+      rfid2ScanDir(pathBuf);
+    } else {
+      const char* slash    = strrchr(pathBuf, '/');
+      const char* fileName = slash ? slash + 1 : pathBuf;
+      int len = strlen(fileName);
+      if (len > 5 && !strcasecmp(fileName + len - 5, ".rfid")) {
+        strlcpy(rfid2Files[rfid2FileCount].path, pathBuf, 64);
+        strlcpy(rfid2Files[rfid2FileCount].name, fileName, 40);
+        int nlen = strlen(rfid2Files[rfid2FileCount].name);
+        if (nlen > 5) rfid2Files[rfid2FileCount].name[nlen - 5] = '\0';
+        rfid2FileCount++;
+      }
+    }
+  }
+  dir.close();
+}
+
+void rfid2ScanFiles() {
+  rfid2FileCount = 0;
+  memset(rfid2Files, 0, sizeof(rfid2Files));
+  rfid2ScanDir("/rfid2db");
+  // Update selectedIdx
+  rfid2SelectedIdx = -1;
+  if (rfid2LoadedPath[0]) {
+    for (int i = 0; i < rfid2FileCount; i++)
+      if (!strcmp(rfid2Files[i].path, rfid2LoadedPath)) { rfid2SelectedIdx = i; break; }
+  }
+}
+
+// ── File load/save ────────────────────────────────────────────────
+void rfid2LoadFile(const char* path) {
+  File f = LittleFS.open(path, "r");
+  if (!f) { rfid2CardCount = 0; rfid2LoadedPath[0] = '\0'; rfid2LoadedName[0] = '\0'; return; }
+  rfid2CardCount = 0;
+  strlcpy(rfid2LoadedPath, path, sizeof(rfid2LoadedPath));
+  const char* sl = strrchr(path, '/');
+  strlcpy(rfid2LoadedName, sl ? sl + 1 : path, sizeof(rfid2LoadedName));
+  int nl = strlen(rfid2LoadedName);
+  if (nl > 5 && !strcasecmp(rfid2LoadedName + nl - 5, ".rfid")) rfid2LoadedName[nl - 5] = '\0';
+  rfid2SelectedIdx = -1;
+  for (int i = 0; i < rfid2FileCount; i++)
+    if (!strcmp(rfid2Files[i].path, path)) { rfid2SelectedIdx = i; break; }
+
+  RFID2Card* card = nullptr;
+  while (f.available()) {
+    char key[24]; int ki = 0; bool gotKey = false; char c;
+    while (f.available()) {
+      c = f.read();
+      if (c == '\n') break;
+      if (c == '\r') continue;
+      if (c == '#') { while (f.available()) { c = f.read(); if (c == '\n') break; } break; }
+      if (c == ':') { key[ki] = '\0'; gotKey = true; break; }
+      if (ki < (int)sizeof(key) - 1) key[ki++] = c;
+    }
+    if (!gotKey) continue;
+    char val[64]; int vi = 0;
+    while (f.available()) {
+      c = f.read(); if (c == '\n') break; if (c == '\r') continue;
+      if (vi < (int)sizeof(val) - 1) val[vi++] = c;
+    }
+    val[vi] = '\0';
+    char* v = val; while (*v == ' ') v++;
+    int vlen = strlen(v);
+    while (vlen > 0 && (v[vlen-1]==' '||v[vlen-1]=='\r'||v[vlen-1]=='\n')) vlen--;
+    v[vlen] = '\0';
+
+    if (!strcmp(key, "name") && rfid2CardCount < RFID2_MAX_CARDS) {
+      card = &rfid2Cards[rfid2CardCount++];
+      memset(card, 0, sizeof(*card));
+      strlcpy(card->label, v, sizeof(card->label));
+    } else if (!strcmp(key, "uid") && card) {
+      strlcpy(card->uid, v, sizeof(card->uid));
+    } else if (!strcmp(key, "sak") && card) {
+      card->sak = (uint8_t)strtoul(v, nullptr, 16);
+    } else if (!strcmp(key, "type") && card) {
+      strlcpy(card->type, v, sizeof(card->type));
+    }
+  }
+  f.close();
+}
+
+static bool rfid2SaveFile() {
+  if (!rfid2LoadedPath[0]) return false;
+  File f = LittleFS.open(rfid2LoadedPath, "w");
+  if (!f) return false;
+  f.println("Filetype: Nesso RFID Database");
+  f.println("Version: 1");
+  for (int i = 0; i < rfid2CardCount; i++) {
+    f.println("#");
+    f.print("name: "); f.println(rfid2Cards[i].label);
+    f.print("uid: ");  f.println(rfid2Cards[i].uid);
+    char sstr[8]; snprintf(sstr, sizeof(sstr), "%02X", rfid2Cards[i].sak);
+    f.print("sak: ");  f.println(sstr);
+    f.print("type: "); f.println(rfid2Cards[i].type);
+  }
+  f.close();
+  return true;
+}
+
+// ── Auto-create new file ──────────────────────────────────────────
+static void rfid2AutoNew() {
+  if (!LittleFS.exists("/rfid2db")) LittleFS.mkdir("/rfid2db");
+  char path[64]; int idx = 1;
+  do { snprintf(path, sizeof(path), "/rfid2db/Cards_%02d.rfid", idx++); }
+  while (LittleFS.exists(path) && idx < 100);
+  File f = LittleFS.open(path, "w");
+  if (!f) return;
+  f.println("Filetype: Nesso RFID Database");
+  f.println("Version: 1");
+  f.close();
+  rfid2ScanFiles();
+  rfid2LoadFile(path);
+  strlcpy(rfid2SavedPath, path, sizeof(rfid2SavedPath));
+  saveSettings();
+  rfid2CardCount  = 0;
+  rfid2UILevel    = RFID2_LEVEL_MAIN;  // stay on main screen in record mode
+  rfid2CardOff    = 0;
+  rfid2RecordMode = true;
+  char msg[64];
+  snprintf(msg, sizeof(msg), "[RFID2] Created '%s'. Record mode ON.", rfid2LoadedName);
+  serialWritelnAll(msg);
+}
+
+// ── Card-scan poll (called from renderRFID2Main and renderRFID2Cards) ─
+static void rfid2Poll() {
+  static uint32_t pollMs = 0;
+  if (millis() - pollMs < 200) return;
+  pollMs = millis();
+
+  rfid2WireGrove();
+  bool gotCard = mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial();
+  if (gotCard) {
+    rfid2UidStr[0] = '\0';
+    for (byte i = 0; i < mfrc522.uid.size; i++) {
+      char hex[4];
+      if (i > 0) strncat(rfid2UidStr, ":", sizeof(rfid2UidStr) - strlen(rfid2UidStr) - 1);
+      snprintf(hex, sizeof(hex), "%02X", mfrc522.uid.uidByte[i]);
+      strncat(rfid2UidStr, hex, sizeof(rfid2UidStr) - strlen(rfid2UidStr) - 1);
+    }
+    byte piccType = mfrc522.PICC_GetType(mfrc522.uid.sak);
+    String typeStr = mfrc522.PICC_GetTypeName(piccType);
+    typeStr.toCharArray(rfid2CardType, sizeof(rfid2CardType));
+    rfid2LastSak    = mfrc522.uid.sak;
+    rfid2HasCard    = true;
+    rfid2LastScanMs = millis();
+
+    char sbuf[140];
+    snprintf(sbuf, sizeof(sbuf), "[RFID2] UID(%u): %s  SAK: 0x%02X  Type: %s",
+      mfrc522.uid.size, rfid2UidStr, mfrc522.uid.sak, rfid2CardType);
+    serialWritelnAll(sbuf);
+
+    if (rfid2RecordMode && rfid2LoadedPath[0] && rfid2CardCount < RFID2_MAX_CARDS) {
+      // Auto-name as Card_XX
+      char autoLabel[24];
+      snprintf(autoLabel, sizeof(autoLabel), "Card_%02d", rfid2CardCount + 1);
+      RFID2Card& nc = rfid2Cards[rfid2CardCount++];
+      memset(&nc, 0, sizeof(nc));
+      strlcpy(nc.label, autoLabel, sizeof(nc.label));
+      strlcpy(nc.uid,   rfid2UidStr, sizeof(nc.uid));
+      nc.sak = rfid2LastSak;
+      strlcpy(nc.type,  rfid2CardType, sizeof(nc.type));
+      rfid2SaveFile();
+      char rmsg[80];
+      snprintf(rmsg, sizeof(rmsg), "[RFID2] Saved '%s' UID:%s", autoLabel, rfid2UidStr);
+      serialWritelnAll(rmsg);
+    }
+    mfrc522.PICC_HaltA();
+  }
+  rfid2WireRestore();
+
+  if (rfid2HasCard && millis() - rfid2LastScanMs > 3000)
+    rfid2HasCard = false;
+}
+
+// ── Title bar helper ──────────────────────────────────────────────
+static void rfid2DrawTitle(const char* title, bool showBack, int sw, bool isLand) {
+  uint16_t cyan = display.color565(0, 160, 210);
+  headerSprite.setFont(&fonts::Font0);
+  headerSprite.fillSprite(display.color565(0, 10, 18));
+  if (showBack) {
+    headerSprite.setTextDatum(TL_DATUM);
+    headerSprite.setTextSize(1);
+    headerSprite.setTextColor(display.color565(0, 80, 120));
+    headerSprite.drawString("< BACK", 4, (SPRITE_Y - 8) / 2);
+  }
+  headerSprite.setTextDatum(TC_DATUM);
+  headerSprite.setTextSize(2);
+  headerSprite.setTextColor(cyan);
+  headerSprite.drawString(title, sw / 2, isLand ? 3 : 4);
+  headerSprite.drawFastHLine(0, SPRITE_Y - 1, sw, cyan);
+}
+
+// ── Render: main NFC scan screen ─────────────────────────────────
+static void renderRFID2Main() {
+  int  sw          = statusSprite.width();
+  int  sh          = statusSprite.height();
+  bool isLandscape = sw > sh;
+
+  statusSprite.fillSprite(COLOR_BLACK);
+  statusSprite.setFont(&fonts::Font0);
+
+  // Poll for card at 5 Hz
+  if (rfid2Available) rfid2Poll();
+
+  // Record mode indicator (top-right of content area, just below header line)
+  if (rfid2RecordMode && rfid2LoadedName[0]) {
+    bool pulse = (millis() / 400) % 2 == 0;
+    uint16_t dotCol = rfid2HasCard
+      ? display.color565(50, 220, 50)
+      : (pulse ? display.color565(0, 200, 80) : display.color565(0, 60, 25));
+    statusSprite.fillCircle(sw - 8, 6, 4, dotCol);
+    statusSprite.setTextDatum(TR_DATUM);
+    statusSprite.setTextSize(1);
+    statusSprite.setTextColor(dotCol);
+    statusSprite.drawString(rfid2HasCard ? "SAVED" : "REC", sw - 16, 2);
+  }
+
+  // RFID icon centered in content area
+  int cx = sw / 2;
+  int cy = isLandscape ? sh / 2 - 14 : sh / 3;
+
+  if (!rfid2Available) {
+    uint16_t dimCol = display.color565(50, 50, 50);
+    statusSprite.fillCircle(cx, cy, 5, dimCol);
+    statusSprite.fillArc(cx, cy, 16, 12, 315, 45, dimCol);
+    statusSprite.fillArc(cx, cy, 27, 23, 315, 45, dimCol);
+    statusSprite.fillArc(cx, cy, 38, 34, 315, 45, dimCol);
+    statusSprite.setTextDatum(MC_DATUM);
+    statusSprite.setTextSize(1);
+    statusSprite.setTextColor(COLOR_RED);
+    statusSprite.drawString("UNIT NOT FOUND", sw / 2, cy + 44);
+    statusSprite.setTextColor(display.color565(100, 100, 100));
+    statusSprite.drawString("Connect M5Stack RFID2 to GROVE port", sw / 2, cy + 58);
+    return;
+  }
+
+  bool     blink   = rfid2HasCard && ((millis() / 250) % 2);
+  uint16_t iconCol = rfid2HasCard
+    ? (blink ? COLOR_GREEN : display.color565(0, 180, 80))
+    : display.color565(0, 80, 130);
+
+  statusSprite.fillCircle(cx, cy, 5, iconCol);
+  statusSprite.fillArc(cx, cy, 16, 12, 315, 45, iconCol);
+  statusSprite.fillArc(cx, cy, 27, 23, 315, 45, iconCol);
+  statusSprite.fillArc(cx, cy, 38, 34, 315, 45, iconCol);
+
+  // Status dot top-left
+  statusSprite.fillCircle(8, 6, 4, rfid2HasCard ? COLOR_GREEN : display.color565(50, 50, 50));
+
+  // UID / waiting text below icon
+  int ty = cy + (isLandscape ? 44 : 52);
+  statusSprite.setTextDatum(MC_DATUM);
+  if (rfid2HasCard) {
+    statusSprite.setTextSize(2);
+    statusSprite.setTextColor(COLOR_GREEN);
+    statusSprite.drawString(rfid2UidStr, sw / 2, ty);
+    statusSprite.setTextSize(1);
+    statusSprite.setTextColor(display.color565(150, 210, 150));
+    statusSprite.drawString(rfid2CardType, sw / 2, ty + 18);
+  } else {
+    statusSprite.setTextSize(1);
+    statusSprite.setTextColor(display.color565(70, 70, 70));
+    statusSprite.drawString("WAITING...", sw / 2, ty);
+  }
+}
+
+// ── Render: file list ─────────────────────────────────────────────
+static void renderRFID2FileList() {
+  int sw = statusSprite.width(), sh = statusSprite.height();
+  bool isLand = sw > sh;
+  statusSprite.fillSprite(COLOR_BLACK);
+  statusSprite.setFont(&fonts::Font0);
+
+  rfid2DrawTitle("RFID2", true, sw, isLand);  // showBack=true: title bar tap → MAIN
+
+  if (!rfid2Available) {
+    headerSprite.pushSprite(0, 0);
+    statusSprite.setTextDatum(MC_DATUM);
+    statusSprite.setTextSize(1);
+    statusSprite.setTextColor(COLOR_RED);
+    statusSprite.drawString("UNIT NOT CONNECTED", sw / 2, sh / 2 - 8);
+    statusSprite.setTextColor(COLOR_GRAY);
+    statusSprite.drawString("Connect M5Stack RFID2 to GROVE port", sw / 2, sh / 2 + 6);
+    return;
+  }
+
+  // Indicators in header
+  if (rfid2HasCard) {
+    headerSprite.fillCircle(sw - 8, SPRITE_Y / 2, 4, COLOR_GREEN);
+  }
+  headerSprite.pushSprite(0, 0);
+
+  int barH  = isLand ? 16 : 20;
+  int barY  = sh - barH - 2;
+  uint16_t cyan = display.color565(0, 160, 210);
+  statusSprite.fillRect(4, barY, sw - 8, barH, display.color565(0, 10, 18));
+  statusSprite.drawRect(4, barY, sw - 8, barH, display.color565(0, 50, 80));
+  statusSprite.setTextDatum(MC_DATUM);
+  statusSprite.setTextSize(1);
+  statusSprite.setTextColor(cyan);
+  statusSprite.drawString("+ NEW FILE", sw / 2, barY + barH / 2);
+
+  if (rfid2FileCount == 0) {
+    statusSprite.setTextDatum(MC_DATUM);
+    statusSprite.setTextSize(1);
+    statusSprite.setTextColor(COLOR_GRAY);
+    statusSprite.drawString("No files yet", sw / 2, 4 + (barY - 4) / 2);
+    return;
+  }
+
+  int rowH     = isLand ? 18 : 20;
+  int listTop  = 4;
+  int listArea = barY - 4 - listTop;
+  int visRows  = max(1, listArea / rowH);
+  rfid2ListOff = constrain(rfid2ListOff, 0, max(0, rfid2FileCount - visRows));
+
+  if (rfid2FileCount > visRows) {
+    int sbarH = max(6, listArea * visRows / rfid2FileCount);
+    int sbarY = listTop + (listArea - sbarH) * rfid2ListOff / max(1, rfid2FileCount - visRows);
+    statusSprite.fillRect(sw - 3, listTop, 2, listArea, display.color565(0, 15, 22));
+    statusSprite.fillRect(sw - 3, sbarY,   2, sbarH,    cyan);
+  }
+
+  uint16_t colFile = display.color565(0, 140, 190);
+  for (int i = 0; i < visRows; i++) {
+    int n    = i + rfid2ListOff;
+    if (n >= rfid2FileCount) break;
+    int rowY  = listTop + i * rowH;
+    int textY = rowY + (rowH - 8) / 2;
+    bool isSel = !strcmp(rfid2Files[n].path, rfid2LoadedPath);
+
+    if (isSel) statusSprite.fillRect(2, rowY, sw - 4, rowH - 1, display.color565(0, 10, 18));
+    statusSprite.setTextDatum(TL_DATUM);
+    statusSprite.setTextSize(1);
+    statusSprite.setTextColor(isSel ? COLOR_WHITE : colFile);
+    statusSprite.drawString(rfid2Files[n].name, 8, textY);
+    statusSprite.setTextDatum(TR_DATUM);
+    statusSprite.setTextColor(isSel ? cyan : display.color565(0, 50, 80));
+    statusSprite.drawString(isSel ? "OPEN>" : ">", sw - 6, textY);
+
+    if (i < visRows - 1 && n < rfid2FileCount - 1)
+      statusSprite.drawFastHLine(4, rowY + rowH - 1, sw - 8, display.color565(0, 15, 22));
+  }
+}
+
+// ── Render: card list ─────────────────────────────────────────────
+static void renderRFID2Cards() {
+  if (!rfid2LoadedPath[0]) { rfid2UILevel = RFID2_LEVEL_LIST; renderRFID2FileList(); return; }
+
+  int sw = statusSprite.width(), sh = statusSprite.height();
+  bool isLand = sw > sh;
+  uint16_t cyan = display.color565(0, 160, 210);
+  statusSprite.fillSprite(COLOR_BLACK);
+  statusSprite.setFont(&fonts::Font0);
+
+  rfid2DrawTitle(rfid2LoadedName, true, sw, isLand);
+
+  // Poll for card
+  if (rfid2Available) rfid2Poll();
+
+  // Delete / record indicators in header
+  if (rfid2DeleteMode) {
+    bool pulse = (millis() / 400) % 2 == 0;
+    uint16_t dotCol = pulse ? display.color565(255, 60, 60) : display.color565(100, 20, 20);
+    headerSprite.fillCircle(9, SPRITE_Y / 2, 4, dotCol);
+    headerSprite.setTextDatum(TL_DATUM);
+    headerSprite.setTextSize(1);
+    headerSprite.setTextColor(dotCol);
+    headerSprite.drawString("DEL", 16, (SPRITE_Y - 8) / 2);
+  } else if (rfid2RecordMode) {
+    bool pulse = (millis() / 400) % 2 == 0;
+    uint16_t dotCol = rfid2HasCard
+      ? display.color565(50, 220, 50)
+      : (pulse ? display.color565(0, 200, 80) : display.color565(0, 60, 25));
+    headerSprite.fillCircle(9, SPRITE_Y / 2, 4, dotCol);
+    headerSprite.setTextDatum(TL_DATUM);
+    headerSprite.setTextSize(1);
+    headerSprite.setTextColor(dotCol);
+    headerSprite.drawString(rfid2HasCard ? "SAVED" : "REC", 16, (SPRITE_Y - 8) / 2);
+  } else if (rfid2HasCard) {
+    headerSprite.fillCircle(sw - 8, SPRITE_Y / 2, 4, COLOR_GREEN);
+  }
+  headerSprite.pushSprite(0, 0);
+
+  // Record mode bar at bottom
+  int recH = rfid2RecordMode ? (isLand ? 24 : 30) : 0;
+  int recY = sh - recH - 2;
+
+  if (rfid2RecordMode) {
+    bool pulse = (millis() / 400) % 2 == 0;
+    uint16_t lCol = rfid2HasCard
+      ? display.color565(50, 220, 50)
+      : (pulse ? display.color565(0, 200, 80) : display.color565(0, 60, 25));
+    uint16_t lBg  = display.color565(0, 12, 6);
+    uint16_t colStop = display.color565(120, 40, 40);
+    int mid = sw / 3;
+    statusSprite.fillRect(4, recY, sw - 8, recH, lBg);
+    statusSprite.drawRect(4, recY, sw - 8, recH, lCol);
+    statusSprite.drawFastVLine(mid - 1, recY + 1, recH - 2, display.color565(50, 30, 30));
+    statusSprite.setTextSize(1);
+    statusSprite.setTextDatum(MC_DATUM);
+    statusSprite.setTextColor(colStop);
+    statusSprite.drawString("STOP", 4 + (mid - 6) / 2, recY + recH / 2);
+    statusSprite.setTextColor(lCol);
+    statusSprite.drawString(rfid2HasCard ? "CARD SAVED!" : "TAP CARD TO RECORD",
+                            mid + (sw - mid - 4) / 2, recY + recH / 2);
+  }
+
+  int areaY   = 4;
+  int areaEnd = rfid2RecordMode ? (recY - 2) : (sh - 2);
+  int rowH    = isLand ? 20 : 24;
+  int areaH   = areaEnd - areaY;
+  int visRows = max(1, areaH / rowH);
+  rfid2CardOff = constrain(rfid2CardOff, 0, max(0, rfid2CardCount - visRows));
+
+  if (rfid2CardCount == 0) {
+    statusSprite.setTextDatum(MC_DATUM);
+    statusSprite.setTextSize(1);
+    statusSprite.setTextColor(display.color565(0, 60, 80));
+    statusSprite.drawString("No cards saved yet.", sw / 2, areaY + areaH / 2 - 8);
+    statusSprite.setTextColor(display.color565(0, 40, 55));
+    statusSprite.drawString(rfid2RecordMode ? "Tap a card to record" : "Long-press KEY1 -> RECORD", sw / 2, areaY + areaH / 2 + 6);
+    return;
+  }
+
+  if (rfid2CardCount > visRows) {
+    int sbarH = max(6, areaH * visRows / rfid2CardCount);
+    int sbarY = areaY + (areaH - sbarH) * rfid2CardOff / max(1, rfid2CardCount - visRows);
+    statusSprite.fillRect(sw - 3, areaY, 2, areaH, display.color565(0, 15, 22));
+    statusSprite.fillRect(sw - 3, sbarY, 2, sbarH, cyan);
+  }
+
+  for (int i = 0; i < visRows; i++) {
+    int n    = i + rfid2CardOff;
+    if (n >= rfid2CardCount) break;
+    int rowY  = areaY + i * rowH;
+    int textY = rowY + (rowH - 8) / 2;
+    bool isFlash = (rfid2FlashIdx == n) && rfid2FlashMs > 0 && (millis() - rfid2FlashMs) < 300;
+    bool isDel   = rfid2DeleteMode;
+
+    uint16_t rowBg, labelCol, uidCol;
+    if (isDel) {
+      bool pulse = (millis() / 500) % 2 == 0;
+      rowBg    = display.color565(25, 4, 4);
+      labelCol = pulse ? display.color565(255, 60, 60) : display.color565(140, 30, 30);
+      uidCol   = display.color565(100, 30, 30);
+    } else if (isFlash) {
+      rowBg    = display.color565(0, 15, 22);
+      labelCol = COLOR_WHITE;
+      uidCol   = cyan;
+    } else {
+      rowBg    = COLOR_BLACK;
+      labelCol = display.color565(0, 140, 190);
+      uidCol   = display.color565(0, 80, 110);
+    }
+    if (isDel || isFlash)
+      statusSprite.fillRect(2, rowY, sw - 4, rowH - 1, rowBg);
+
+    statusSprite.setTextDatum(TL_DATUM);
+    statusSprite.setTextSize(1);
+    statusSprite.setTextColor(labelCol);
+    statusSprite.drawString(rfid2Cards[n].label, 8, textY);
+    statusSprite.setTextDatum(TR_DATUM);
+    statusSprite.setTextColor(uidCol);
+    statusSprite.drawString(rfid2Cards[n].uid, sw - 6, textY);
+
+    if (i < visRows - 1 && n < rfid2CardCount - 1)
+      statusSprite.drawFastHLine(4, rowY + rowH - 1, sw - 8, display.color565(0, 15, 22));
+  }
+}
+
+// ── Settings overlay ─────────────────────────────────────────────
+void renderRFID2Settings() {
+  int sw = statusSprite.width(), sh = statusSprite.height();
+  bool isLandscape = sw > sh;
+  statusSprite.fillSprite(COLOR_BLACK);
+  statusSprite.setFont(&fonts::Font0);
+
+  static const int ITEM_COUNT = 6;
+  const char* labels[ITEM_COUNT] = { "NEW FILE", "VIEW FILES", "DEL FILE", "RECORD CARD", "DELETE CARD", "RESET" };
+  const char* values[ITEM_COUNT] = { "CREATE",   "BROWSE",     "REMOVE",   "REC",         "BROWSE",      "\x10"  };
+
+  uint16_t cyan = display.color565(0, 160, 210);
+  headerSprite.setFont(&fonts::Font0);
+  headerSprite.fillSprite(display.color565(0, 10, 18));
+  headerSprite.setTextDatum(TC_DATUM);
+  headerSprite.setTextSize(2);
+  headerSprite.setTextColor(cyan);
+  headerSprite.drawString("RFID2 ACTIONS", sw / 2, isLandscape ? 4 : 6);
+  headerSprite.drawFastHLine(8, SPRITE_Y - 1, sw - 16, display.color565(0, 80, 120));
+  headerSprite.pushSprite(0, 0);
+
+  int btnH = isLandscape ? 20 : 30;
+  int btnY = sh - 6 - btnH;
+  int sepY = btnY - 6;
+  statusSprite.drawFastHLine(8, sepY, sw - 16, display.color565(40, 40, 40));
+  int bw = (sw - 24) / 2;
+  statusSprite.fillRect(8,       btnY, bw, btnH, display.color565(0, 60, 0));
+  statusSprite.fillRect(16 + bw, btnY, bw, btnH, display.color565(60, 0, 0));
+  statusSprite.drawRect(8,       btnY, bw, btnH, COLOR_GREEN);
+  statusSprite.drawRect(16 + bw, btnY, bw, btnH, COLOR_RED);
+  statusSprite.setTextSize(1);
+  statusSprite.setTextDatum(MC_DATUM);
+  statusSprite.setTextColor(COLOR_GREEN);
+  statusSprite.drawString("APPLY",  8  + bw / 2,      btnY + btnH / 2);
+  statusSprite.setTextColor(COLOR_RED);
+  statusSprite.drawString("CANCEL", 16 + bw + bw / 2, btnY + btnH / 2);
+
+  int startY   = 4;
+  int rowH     = isLandscape ? 20 : 26;
+  int rowsArea = sepY - startY;
+  int visRows  = constrain(rowsArea / rowH, 1, ITEM_COUNT);
+
+  settingsScrollOffset = constrain(settingsScrollOffset, 0, ITEM_COUNT - visRows);
+  if (settingsCursor < settingsScrollOffset) settingsScrollOffset = settingsCursor;
+  if (settingsCursor >= settingsScrollOffset + visRows) settingsScrollOffset = settingsCursor - visRows + 1;
+
+  if (ITEM_COUNT > visRows) {
+    int barH = max(6, rowsArea * visRows / ITEM_COUNT);
+    int barY = startY + (rowsArea - barH) * settingsScrollOffset / max(1, ITEM_COUNT - visRows);
+    statusSprite.fillRect(sw - 4, startY, 3, rowsArea, display.color565(20, 20, 20));
+    statusSprite.fillRect(sw - 4, barY,   3, barH,     display.color565(0, 80, 120));
+  }
+
+  for (int i = 0; i < visRows; i++) {
+    int idx     = i + settingsScrollOffset;
+    if (idx >= ITEM_COUNT) break;
+    int y       = startY + i * rowH;
+    bool sel    = (idx == settingsCursor);
+    bool isReset = (idx == ITEM_COUNT - 1);
+    int textY   = y + (rowH - 8) / 2;
+
+    if (isReset && sel)
+      statusSprite.fillRect(4, y, sw - 8, rowH - 2, display.color565(60, 15, 15));
+    else if (sel)
+      statusSprite.fillRect(4, y, sw - 8, rowH - 2, display.color565(0, 10, 18));
+
+    statusSprite.setTextDatum(TL_DATUM);
+    statusSprite.setTextSize(1);
+    statusSprite.setTextColor(sel ? (isReset ? display.color565(255, 80, 80) : cyan) : display.color565(60, 60, 60));
+    statusSprite.drawString(sel ? ">" : " ", 6, textY);
+    statusSprite.setTextColor(sel ? COLOR_WHITE : (isReset ? display.color565(100, 40, 40) : COLOR_GRAY));
+    statusSprite.drawString(labels[idx], 14, textY);
+    statusSprite.setTextDatum(TR_DATUM);
+    statusSprite.setTextColor(sel ? cyan : display.color565(40, 60, 80));
+    statusSprite.drawString(values[idx], sw - 10, textY);
+
+    if (i < visRows - 1)
+      statusSprite.drawFastHLine(4, y + rowH - 1, sw - 8, display.color565(20, 20, 20));
+  }
+}
+
+void handleRFID2SettingsTap(int16_t sx, int16_t sy) {
+  int sw = statusSprite.width(), sh = statusSprite.height();
+  bool isLandscape = sw > sh;
+  int  sprite_y    = sy - g_spriteY;
+  static const int ITEM_COUNT = 6;
+  int startY   = 4;
+  int btnH     = isLandscape ? 20 : 30;
+  int btnY     = sh - 6 - btnH;
+  int sepY     = btnY - 6;
+  int rowH     = isLandscape ? 20 : 26;
+  int rowsArea = sepY - startY;
+  int visRows  = constrain(rowsArea / rowH, 1, ITEM_COUNT);
+  for (int i = 0; i < visRows; i++) {
+    int idx  = i + settingsScrollOffset;
+    if (idx >= ITEM_COUNT) break;
+    int rowY = startY + i * rowH;
+    if (sprite_y >= rowY && sprite_y < rowY + rowH) {
+      if (settingsCursor == idx) onKey1Short();
+      else                       settingsCursor = idx;
+      return;
+    }
+  }
+  if (sprite_y >= btnY && sprite_y < btnY + btnH) {
+    if (sx < sw / 2) onKey1Long();
+    else             onKey2Long();
+  }
+}
+
+void initRFID2() {
+  rfid2HasCard      = false;
+  rfid2UidStr[0]    = '\0';
+  rfid2CardType[0]  = '\0';
+  rfid2RecordMode   = false;
+  rfid2DeleteMode   = false;
+  rfid2UILevel      = RFID2_LEVEL_MAIN;
+
+  // Enable GROVE power (Wire still on GPIO10/8)
+  pinMode(GROVE_POWER_EN, OUTPUT);
+  digitalWrite(GROVE_POWER_EN, HIGH);
+  delay(150);
+
+  // Probe unit
+  rfid2WireGrove();
+  Wire.beginTransmission(0x28);
+  byte rfid2Err = Wire.endTransmission();
+  rfid2Available = (rfid2Err == 0);
+  if (rfid2Available) {
+    mfrc522.PCD_Init();
+  } else {
+    char dbuf[56];
+    snprintf(dbuf, sizeof(dbuf), "[RFID2] unit not found (I2C err %d)", rfid2Err);
+    serialWritelnAll(dbuf);
+  }
+  rfid2WireRestore();
+
+  if (!rfid2Available)
+    digitalWrite(GROVE_POWER_EN, LOW);
+
+  // Restore last file silently (for record mode use without navigating to browser)
+  if (rfid2SavedPath[0] && LittleFS.exists(rfid2SavedPath))
+    rfid2LoadFile(rfid2SavedPath);
+
+  renderHeader();  // draw standard battery/WiFi header for main screen
+}
+
+void renderRFID2() {
+  static RFID2Level prevLevel = RFID2_LEVEL_MAIN;
+  if (rfid2UILevel == RFID2_LEVEL_MAIN) {
+    if (prevLevel != RFID2_LEVEL_MAIN) renderHeader();  // restore standard header on return
+    renderRFID2Main();
+  } else if (rfid2UILevel == RFID2_LEVEL_LIST) {
+    renderRFID2FileList();
+  } else {
+    renderRFID2Cards();
+  }
+  prevLevel = rfid2UILevel;
+}
+
+// ── RFID2 serial command handler ──────────────────────────────────
+void serialHandleRFID2(const char* arg) {
+  char buf[96];
+  if (cmdIs(arg, "list")) {
+    if (rfid2FileCount == 0) { serialWritelnAll("[RFID2] No files."); return; }
+    for (int i = 0; i < rfid2FileCount; i++) {
+      snprintf(buf, sizeof(buf), "%2d: [%c] %s", i,
+        !strcmp(rfid2Files[i].path, rfid2LoadedPath) ? '*' : ' ',
+        rfid2Files[i].name);
+      serialWritelnAll(buf);
+    }
+  } else if (cmdIs(arg, "reload")) {
+    rfid2ScanFiles();
+    snprintf(buf, sizeof(buf), "[RFID2] Rescanned — %d file(s).", rfid2FileCount);
+    serialWritelnAll(buf);
+  } else if (cmdIs(arg, "new")) {
+    const char* name = cmdArg(arg, "new");
+    if (name && *name) {
+      if (!LittleFS.exists("/rfid2db")) LittleFS.mkdir("/rfid2db");
+      char safe[40]; int si = 0;
+      for (int i = 0; name[i] && si < 35; i++)
+        safe[si++] = (name[i] == ' ') ? '_' : name[i];
+      safe[si] = '\0';
+      char path[64]; snprintf(path, sizeof(path), "/rfid2db/%s.rfid", safe);
+      File f = LittleFS.open(path, "w");
+      if (f) { f.println("Filetype: Nesso RFID Database\nVersion: 1"); f.close(); }
+      rfid2ScanFiles();
+      rfid2LoadFile(path);
+      rfid2CardCount  = 0;
+      rfid2UILevel    = RFID2_LEVEL_MAIN;
+      rfid2RecordMode = true;
+      rfid2CardOff    = 0;
+      strlcpy(rfid2SavedPath, path, sizeof(rfid2SavedPath));
+      saveSettings();
+      snprintf(buf, sizeof(buf), "[RFID2] Created '%s'. Record mode ON.", rfid2LoadedName);
+      serialWritelnAll(buf);
+    } else {
+      rfid2AutoNew();
+    }
+  } else if (cmdIs(arg, "select")) {
+    const char* ns = cmdArg(arg, "select");
+    if (!ns || !*ns) { serialWritelnAll("[RFID2] Usage: rfid2 select <N>"); return; }
+    int idx = atoi(ns);
+    if (idx < 0 || idx >= rfid2FileCount) { serialWritelnAll("[RFID2] Index out of range."); return; }
+    rfid2LoadFile(rfid2Files[idx].path);
+    rfid2UILevel = RFID2_LEVEL_MAIN;
+    rfid2CardOff = 0;
+    strlcpy(rfid2SavedPath, rfid2Files[idx].path, sizeof(rfid2SavedPath));
+    saveSettings();
+    snprintf(buf, sizeof(buf), "[RFID2] Loaded '%s' (%d cards).", rfid2LoadedName, rfid2CardCount);
+    serialWritelnAll(buf);
+  } else if (cmdIs(arg, "del")) {
+    if (!rfid2LoadedPath[0]) { serialWritelnAll("[RFID2] No file loaded."); return; }
+    snprintf(buf, sizeof(buf), "[RFID2] Deleted '%s'.", rfid2LoadedName);
+    LittleFS.remove(rfid2LoadedPath);
+    if (!strcmp(rfid2SavedPath, rfid2LoadedPath)) { rfid2SavedPath[0] = '\0'; saveSettings(); }
+    rfid2LoadedPath[0] = '\0'; rfid2LoadedName[0] = '\0';
+    rfid2SelectedIdx = -1; rfid2CardCount = 0;
+    rfid2ScanFiles();
+    rfid2UILevel = RFID2_LEVEL_MAIN;
+    serialWritelnAll(buf);
+  } else if (cmdIs(arg, "rename")) {
+    const char* newname = cmdArg(arg, "rename");
+    if (!rfid2LoadedPath[0] || !newname || !*newname) { serialWritelnAll("[RFID2] Usage: rfid2 rename <new name>"); return; }
+    char safe[40]; int si = 0;
+    for (int i = 0; newname[i] && si < 35; i++)
+      safe[si++] = (newname[i] == ' ') ? '_' : newname[i];
+    safe[si] = '\0';
+    const char* dirEnd = strrchr(rfid2LoadedPath, '/');
+    char newPath[64];
+    if (dirEnd) snprintf(newPath, sizeof(newPath), "%.*s/%s.rfid", (int)(dirEnd - rfid2LoadedPath), rfid2LoadedPath, safe);
+    else        snprintf(newPath, sizeof(newPath), "/rfid2db/%s.rfid", safe);
+    LittleFS.rename(rfid2LoadedPath, newPath);
+    if (!strcmp(rfid2SavedPath, rfid2LoadedPath)) { strlcpy(rfid2SavedPath, newPath, sizeof(rfid2SavedPath)); saveSettings(); }
+    rfid2ScanFiles();
+    rfid2LoadFile(newPath);
+    snprintf(buf, sizeof(buf), "[RFID2] Renamed to '%s'.", rfid2LoadedName);
+    serialWritelnAll(buf);
+  } else if (cmdIs(arg, "card")) {
+    const char* sub = cmdArg(arg, "card");
+    if (cmdIs(sub, "list")) {
+      if (!rfid2LoadedPath[0]) { serialWritelnAll("[RFID2] No file loaded."); return; }
+      snprintf(buf, sizeof(buf), "[RFID2] '%s' — %d card(s):", rfid2LoadedName, rfid2CardCount);
+      serialWritelnAll(buf);
+      for (int i = 0; i < rfid2CardCount; i++) {
+        snprintf(buf, sizeof(buf), "  %2d: %-20s  %s  (SAK:%02X %s)",
+          i, rfid2Cards[i].label, rfid2Cards[i].uid, rfid2Cards[i].sak, rfid2Cards[i].type);
+        serialWritelnAll(buf);
+      }
+    } else if (cmdIs(sub, "del")) {
+      const char* nameArg = cmdArg(sub, "del");
+      if (!nameArg || !*nameArg || !rfid2LoadedPath[0]) { serialWritelnAll("[RFID2] Usage: rfid2 card del <label>"); return; }
+      int found = -1;
+      for (int i = 0; i < rfid2CardCount; i++)
+        if (!strcasecmp(rfid2Cards[i].label, nameArg) || !strcasecmp(rfid2Cards[i].uid, nameArg)) { found = i; break; }
+      if (found < 0) { serialWritelnAll("[RFID2] Card not found."); return; }
+      snprintf(buf, sizeof(buf), "[RFID2] Deleted '%s' (%s).", rfid2Cards[found].label, rfid2Cards[found].uid);
+      for (int j = found; j < rfid2CardCount - 1; j++) rfid2Cards[j] = rfid2Cards[j + 1];
+      rfid2CardCount--;
+      rfid2SaveFile();
+      serialWritelnAll(buf);
+    } else if (cmdIs(sub, "rename")) {
+      const char* rest = cmdArg(sub, "rename");
+      if (!rfid2LoadedPath[0] || !rest || !*rest) { serialWritelnAll("[RFID2] Usage: rfid2 card rename <old> <new>"); return; }
+      // split rest into oldName and newName at first space
+      char oldName[24] = ""; char newName[24] = "";
+      const char* sp = strchr(rest, ' ');
+      if (!sp) { serialWritelnAll("[RFID2] Usage: rfid2 card rename <old> <new>"); return; }
+      size_t olen = sp - rest;
+      if (olen >= sizeof(oldName)) olen = sizeof(oldName) - 1;
+      memcpy(oldName, rest, olen); oldName[olen] = '\0';
+      while (*sp == ' ') sp++;
+      strlcpy(newName, sp, sizeof(newName));
+      if (!newName[0]) { serialWritelnAll("[RFID2] Usage: rfid2 card rename <old> <new>"); return; }
+      int found = -1;
+      for (int i = 0; i < rfid2CardCount; i++)
+        if (!strcasecmp(rfid2Cards[i].label, oldName)) { found = i; break; }
+      if (found < 0) { serialWritelnAll("[RFID2] Card not found."); return; }
+      strlcpy(rfid2Cards[found].label, newName, sizeof(rfid2Cards[found].label));
+      rfid2SaveFile();
+      snprintf(buf, sizeof(buf), "[RFID2] Renamed '%s' → '%s'.", oldName, newName);
+      serialWritelnAll(buf);
+    } else {
+      serialWritelnAll("[RFID2] Usage: rfid2 card list | rfid2 card del <label> | rfid2 card rename <old> <new>");
+    }
+  } else if (cmdIs(arg, "record")) {
+    const char* sub = cmdArg(arg, "record");
+    if (cmdIs(sub, "start")) {
+      if (!rfid2LoadedPath[0]) rfid2AutoNew();
+      rfid2RecordMode = true;
+      rfid2UILevel = RFID2_LEVEL_MAIN;
+      serialWritelnAll("[RFID2] Record mode ON — tap cards to save.");
+    } else if (cmdIs(sub, "stop")) {
+      rfid2RecordMode = false;
+      serialWritelnAll("[RFID2] Record mode OFF.");
+    } else {
+      serialWritelnAll("[RFID2] Usage: rfid2 record start | rfid2 record stop");
+    }
+  } else if (cmdIs(arg, "scan")) {
+    serialWritelnAll("[RFID2] Scanning I2C on GROVE port (SDA=GPIO5 SCL=GPIO4)...");
+    pinMode(GROVE_POWER_EN, OUTPUT);
+    digitalWrite(GROVE_POWER_EN, HIGH);
+    delay(200);
+    rfid2WireGrove();
+    bool found = false;
+    for (uint8_t addr = 1; addr < 127; addr++) {
+      Wire.beginTransmission(addr);
+      if (Wire.endTransmission() == 0) {
+        snprintf(buf, sizeof(buf), "  Found device at 0x%02X", addr);
+        serialWritelnAll(buf);
+        found = true;
+      }
+    }
+    rfid2WireRestore();
+    if (!found) serialWritelnAll("  No devices found.");
+    else        serialWritelnAll("  Scan complete.");
+    if (currentFunction != FUNCTION_RFID2) digitalWrite(GROVE_POWER_EN, LOW);
+  } else if (cmdIs(arg, "probe")) {
+    serialWritelnAll("[RFID2] Probing 0x28 on GROVE port...");
+    pinMode(GROVE_POWER_EN, OUTPUT);
+    digitalWrite(GROVE_POWER_EN, HIGH);
+    delay(200);
+    rfid2WireGrove();
+    Wire.beginTransmission(0x28);
+    byte err = Wire.endTransmission();
+    rfid2WireRestore();
+    rfid2Available = (err == 0);
+    snprintf(buf, sizeof(buf), "[RFID2] 0x28 -> err=%d  available=%s", err, rfid2Available ? "YES" : "no");
+    serialWritelnAll(buf);
+    if (!rfid2Available && currentFunction != FUNCTION_RFID2) digitalWrite(GROVE_POWER_EN, LOW);
+  } else {
+    printHelpRFID2();
+  }
+}
+
+
