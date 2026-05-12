@@ -33,6 +33,7 @@
                 "D:\\packages\\arduino\\data\\packages\\esp32\\hardware\\esp32\\3.3.8\\libraries\\FS\\src",
                 "D:\\packages\\arduino\\data\\packages\\esp32\\hardware\\esp32\\3.3.8\\libraries\\WebServer\\src",
                 "D:\\packages\\arduino\\data\\packages\\esp32\\hardware\\esp32\\3.3.8\\libraries\\ESP_I2S\\src",
+                "D:\\packages\\arduino\\user\\libraries\\MFRC522_I2C\\src",
                 "D:\\packages\\arduino\\user\\libraries\\ArduinoJson\\src",
                 "D:\\packages\\arduino\\data\\packages\\esp32\\hardware\\esp32\\3.3.8\\libraries\\Hash\\src",
                 "D:\\packages\\arduino\\data\\packages\\esp32\\tools\\esp-rv32\\2601\\riscv32-esp-elf\\include\\c++\\14.2.0",
