@@ -1,646 +1,74 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for Claude Code when working in this repository. Full user documentation is in [README.md](README.md).
 
 ## Project Overview
 
-**Nesso_base** is Arduino firmware for the **Arduino Nesso N1** handheld controller — a WiFi-enabled base station that controls a remote robot platform via UDP. It features a 240×135px TFT display with a multi-mode menu, battery monitoring, gamepad input, and an IR remote control system backed by LittleFS file storage.
+**Nesso_base** is Arduino firmware for the **Arduino Nesso N1** (ESP32-C6) handheld controller. Single sketch: `Nesso_base.ino`. WiFi credentials in `arduino_secrets.h`.
 
-## Build & Flash
-
-This is a standard Arduino sketch (`.ino`). Build toolchain is **arduino-cli**.
-
-### Compile
+## Build Commands
 
 ```powershell
+# Compile
 arduino-cli compile --fqbn "esp32:esp32:arduino_nesso_n1" --build-path "D:/Nesso_base/build" Nesso_base.ino
-```
 
-> **Note:** `--build-path` is required with arduino-cli v1.x on this project. Without it, a caching bug in v1.4.1 corrupts the ESP32 BLE library archive (`BLE2901.cpp.o` gets a symbol table instead of an ELF), causing a linker error at the final link step.
-
-### Upload firmware
-
-```powershell
+# Upload
 arduino-cli upload --fqbn "esp32:esp32:arduino_nesso_n1" --port COM3 --build-path "D:/Nesso_base/build" Nesso_base.ino
+
+# Build LittleFS image
+& "D:\packages\arduino\data\packages\esp32\tools\mklittlefs\4.0.2-db0513a\mklittlefs.exe" -c data -b 4096 -p 256 -s 0x9E0000 littlefs.bin
+
+# Flash LittleFS
+& "D:\packages\arduino\data\packages\esp32\tools\esptool_py\5.2.0\esptool.exe" --chip esp32c6 --port COM3 --baud 460800 write_flash 0x610000 littlefs.bin
 ```
 
-### Build & flash LittleFS image
+`--build-path` is required — arduino-cli v1.4.1 has a caching bug that corrupts the ESP32 BLE library archive without it.
 
-The `data/` directory is the LittleFS filesystem root. After adding or changing files under `data/`, rebuild and reflash the image.
+## Key Implementation Notes
 
-```powershell
-# Build image (size matches the spiffs partition: 0x9E0000 bytes)
-& "D:\packages\arduino\data\packages\esp32\tools\mklittlefs\4.0.2-db0513a\mklittlefs.exe" `
-    -c data -b 4096 -p 256 -s 0x9E0000 littlefs.bin
+### Arduino preprocessor type ordering
 
-# Flash image to spiffs partition offset 0x610000
-& "D:\packages\arduino\data\packages\esp32\tools\esptool_py\5.2.0\esptool.exe" `
-    --chip esp32c6 --port COM3 --baud 460800 write_flash 0x610000 littlefs.bin
-```
+`enum IRFileProto`, `struct IRButton`, `struct IRFileEntry`, `enum BtnType`, `struct IRBtnPos`, and `struct IRLearnData` are all defined **before** `#include <ArduinoJson.h>` (the last `#include` in the sketch). Arduino auto-generates function prototypes after the last `#include`; these types must be visible at that point. Do not move them below that include.
 
-Adjust `COM3` to the actual port shown in Device Manager. The LittleFS flash step is only needed when `data/` contents change; firmware uploads do not touch it.
+### Sprite / header architecture (`g_spriteY`)
 
-### Partition layout (`partitions.csv`)
+Most screens push `statusSprite` at `y = SPRITE_Y` (22 px), leaving the top 22 px for the battery/WiFi/BT header. IR and RF433 use the full display height (`g_spriteY = 0`).
 
-| Name     | Offset     | Size       | Notes                  |
-|----------|------------|------------|------------------------|
-| nvs      | 0x9000     | 0x5000     | NVS key-value store    |
-| app0     | 0x10000    | 0x300000   | Firmware (OTA slot 0)  |
-| app1     | 0x310000   | 0x300000   | Firmware (OTA slot 1)  |
-| spiffs   | 0x610000   | 0x9E0000   | LittleFS data          |
+`renderFunction()` checks the desired `g_spriteY` value every frame (unconditionally — not gated on `lastFunction`) and resizes the sprite if it changed. This makes it immune to `updateOrientation()` setting `lastFunction = −1` mid-navigation. `initIR()` and `initRF433()` call `display.fillScreen()` before pushing the sprite at `y = 0`. All touch coordinate transforms in IR/RF433 use `sy − g_spriteY`.
 
-### Arduino IDE (alternative)
+### Battery percentage
 
-1. Install the **Nesso N1 board support package**
-2. Install required libraries: `Adafruit seesaw`, `Arduino_Nesso_N1`
-3. Select the Nesso N1 board, set baud to **115200**
-4. Compile & Upload via Arduino IDE
+Use `voltageToPercent()` (piecewise linear LiPo curve, 3.0V→0% / 4.2V→100%). Do **not** use `battery.getChargeLevel()` — tested at 3.89V it returned 98% while voltage-based correctly gave ~63%. The library value is kept only as a debug label on the battery screen.
 
-To enable debug output, change `#define DEBUG 0` to `#define DEBUG 1` near the top of `Nesso_base.ino`.
+### ESP32-C6 I2C constraint (RFID2)
 
-## Python Scripts
+ESP32-C6 has only one HP I2C controller (`Wire`). The LP I2C SDA is hardware-locked to GPIO 6, unusable for GPIO 5. RFID2 operations briefly switch `Wire` to GPIO 5/4 via `rfid2WireGrove()` / `rfid2WireRestore()`, which call `Wire.end()` + `Wire.begin()`. `Wire.end()` is mandatory before `Wire.begin()` with different pins — omitting it leaves the bus silently stuck on the old pins.
 
-All scripts run with standard Python 3. Only `nesso_terminal.py` requires a third-party package.
+### Speaker (MAX98357A I2S)
 
-### `build_littlefs.py` — build (and optionally flash) the LittleFS image
+Main-loop polling only — no FreeRTOS task. `spkUpdate()` is called every `loop()` iteration and writes up to 512 synthesised samples via `i2s_channel_write()` with `timeout_ms = 0` (non-blocking; samples drop rather than stall). A FreeRTOS task approach caused resets on the single-core ESP32-C6 and was replaced with this design.
 
-Copies a hardcoded list of files from the full `data/irdb/` library into a
-temporary staging directory, then runs `mklittlefs` to produce `littlefs.bin`.
+### RF433 TX pin must be LOW before GROVE power-on
 
-```powershell
-python build_littlefs.py           # build littlefs.bin only
-python build_littlefs.py --flash   # build + flash to COM3
-```
+The SYN115 keys its 433 MHz carrier whenever its DATA pin is high or floating. With TX and RX on a Y-cable, a floating GPIO 5 causes self-interference on the SYN531R. `rf433LearnStart()` drives `RF433_TX_PIN` LOW before enabling GROVE power.
 
-Edit the `INCLUDE_FILES` list at the top of the script to add or remove files.
-Paths are relative to `data/` (the LittleFS root), e.g.:
-```
-"irdb/TV/Samsung/Samsung_BN59-01315B.ir"
-```
+### IR / RF433 mutual exclusion
 
-### `gen_irdb_all.py` — download the full IR file library
+Both use GPIO 4 via different ISR handlers. `irLearnStart()` refuses if `rf433LearnMode` is active; `rf433LearnStart()` refuses if `irLearnMode` is active.
 
-Downloads `.ir` files from **Flipper-IRDB** (`Lucaslhm/Flipper-IRDB`) into
-`data/irdb/<Type>/<Brand>/<Model>.ir`. Existing files are never overwritten,
-so the script is safe to re-run after the repo adds new devices.
-
-```powershell
-python gen_irdb_all.py
-```
-
-The `_Converted_/` subtree inside Flipper-IRDB is intentionally skipped (it is
-a duplicate of `probonopd/irdb` data in a non-standard directory layout).
-Brands already present from Flipper-IRDB are also skipped when checking
-`probonopd/irdb`, so there is no duplication.
-
-> **Note:** The full library (~2800 files, ~9.9 MB) exceeds the 9.87 MB
-> LittleFS partition. Use `build_littlefs.py` to create a curated image.
-> Files not in the image can be pushed to the device at any time with the
-> `fs upload` serial command.
-
-### `nesso_terminal.py` — BLE UART terminal
-
-A PC-side terminal that connects to the Nesso N1 over Bluetooth (Nordic UART
-Service) instead of USB. Requires the `bleak` BLE library:
-
-```powershell
-pip install bleak
-python nesso_terminal.py
-```
-
-Once connected, all serial commands documented in the Serial Command Reference
-section work identically over BLE.
-
-### `gen_irdb.py` / `gen_irdb2.py` / `gen_irdb3.py` / `gen_irdb4.py` / `gen_irdb5.py` — legacy IR header generators (unused)
-
-These five scripts download IR codes from `probonopd/irdb` (CSV format) and
-output C struct initialisers for an `IREntry IRDB[]` array (`irdb.h`,
-`irdb_tv.h`, etc.). **The current firmware does not use these headers** — the
-IR system reads `.ir` files from LittleFS instead. The scripts are kept for
-reference but should not be run; use `gen_irdb_all.py` instead.
-
-## Architecture
-
-All firmware lives in a single sketch: `Nesso_base.ino`. `arduino_secrets.h` holds WiFi credentials.
-
-### Menu System
-
-Navigation uses KEY1 (forward) and KEY2 (backward) with 500ms debounce. Modes are defined in the `MainFunctions` enum:
-
-| Value | Mode | Description |
-|---|---|---|
-| 0 | `FUNCTION_MAIN` | Clock + WiFi status via NTP (UTC+3) |
-| 1 | `FUNCTION_CONTROLLER` | Gamepad → UDP motor commands |
-| 2 | `FUNCTION_BT` | Bluetooth scanner |
-| 3 | `FUNCTION_WIFI` | WiFi network scanner |
-| 4 | `FUNCTION_LORA` | LoRa / Meshtastic |
-| 5 | `FUNCTION_RFID2` | M5Stack RFID2 Unit — hidden from navigation when unit not connected |
-| 6 | `FUNCTION_IR` | IR remote control |
-| 7 | `FUNCTION_RF433` | 433 MHz RF remote — enabled in device settings (disabled by default) |
-| 8 | `FUNCTION_MEDIA` | Matrix rain / Vader / Obi-Wan |
-| 9 | `FUNCTION_BATTERY` | Battery + device settings (long-press KEY1); items: DIM TIMEOUT, SLEEP TIMEOUT, LOW BAT SLEEP, UI CLICKS, RF433, SPEAKER, VOLUME, RESET |
-
-### Speaker Hat 2 (MAX98357A I2S amplifier)
-
-Enabled from the Battery/Device settings screen (long-press KEY1 → SPEAKER item). When enabled, all audio (UI clicks and melodies) is routed through the I2S speaker instead of the onboard buzzer. Volume is set with the adjacent VOLUME item (25 / 50 / 75 / 100 %, default 75 %). Both settings are also exposed in the web file manager settings panel.
-
-**HAT port wiring:**
-
-| Signal | GPIO | `#define` | Notes |
-|---|---|---|---|
-| BCLK  | GPIO 7 (G7) | `SPK_BCLK_PIN` | Bit clock |
-| LRCLK | GPIO 6 (G6) | `SPK_LRC_PIN`  | Word select |
-| DATA  | GPIO 2 (G2) | `SPK_DOUT_PIN` | Serial data |
-
-**Audio quality improvements over buzzer:**
-- Sine wave synthesis instead of square wave — smooth, musical tones
-- 5 ms attack/release envelopes on melody notes — eliminates click artifacts
-- Linear decay envelope on UI clicks — natural "tap" feel
-- Vader March and Obi-Wan theme play at full audio quality
-
-**Boot chime:** Three-note ascending C major arpeggio (C5–E5–G5) plays once at startup when speaker is enabled.
-
-**Implementation:** Main-loop-driven polling — no FreeRTOS task or queue. `spkUpdate()` is called on every `loop()` iteration and writes up to 512 synthesised samples per call via `i2s_channel_write()` with `timeout_ms = 0` (non-blocking: samples are dropped rather than stalling the main loop if the DMA buffer is momentarily full). `uiClick()`, `startBuzzer()`, and `stopBuzzer()` set playback state (`spkPlayTone` / `spkPlayMelody` / `spkStop`); the buzzer timer still advances for UI-state tracking but skips `tone()` calls. The ESP32-C6 is single-core — a FreeRTOS task approach caused resets and was replaced by this polling design.
-
-**Volume:** `spkVolume` (1–4) maps to amplitude 7 500 / 15 000 / 22 500 / 30 000 (25–100 % of int16 headroom). Amplitude is applied per-sample as `spkVolume * 7500`.
-
-**NVS keys:** `spkOn` (bool), `spkVol` (uint8 1–4).
-
-**Sample rate:** 22 050 Hz, 16-bit stereo (both channels identical — the MAX98357A down-mixes to mono internally).
-
-### IR Remote System
-
-IR device files (`.ir` format) are stored in LittleFS under `/irdb/` and scanned at boot by `irScanFiles()`. The UI is two levels:
-
-1. **File list** — scrollable directory browser; navigate folders, tap a file to open the remote.
-2. **Remote** — contextual button layout for the selected device; tap a button to transmit. Swipe vertically to scroll.
-
-The active device is persisted to NVS as `irSel2` (path string). Tap the title bar to return to the file list.
-
-#### Remote button layout
-
-Buttons are classified by label and arranged in a fixed priority order regardless of how they appear in the `.ir` file. The layout is pre-computed once in `irBuildLayout()` when a device loads and stored in `irLayout[IR_MAX_BUTTONS]` as pixel-exact `{x, y, w, h}` per button. `irLayoutH` holds the total content height for the scroll bar.
-
-```
-┌──────────────────────────┐
-│         Power            │  full-width · red   · r=6
-├─────────────┬────────────┤
-│   Vol  +    │   Chan +   │  half each · green/blue · r=4
-├─────────────┼────────────┤
-│   Vol  -    │   Chan -   │
-├─────────────┴────────────┤
-│           Mute           │  full-width (pairs if >1) · r=4
-├──────────────────────────┤
-│       ▲  Up              │  ┐
-│ ◀ Left │  OK  │ Right ▶  │  ├ D-pad cross — third-width each,
-│       ▼  Down            │  ┘ corners blank, OK centred
-├──────────────────────────┤
-│   Menu    │    Home      │  half each
-├──────────────────────────┤
-│  ◀◀  │  ▶⏸  │  ▶▶       │  third-width · amber
-├──────────────────────────┤
-│  7   │   8   │   9       │  ┐
-│  4   │   5   │   6       │  ├ numpad · third-width · grey
-│  1   │   2   │   3       │  │
-│        0                 │  ┘ 0 centred in 3-col grid
-├──────────────────────────┤
-│ Source   │   Input       │  generic 2-per-row catch-all
-└──────────────────────────┘
-```
-
-Groups with no matching buttons are omitted entirely (no blank rows). The D-pad cross preserves blank corner cells even when some directions are absent, maintaining the + shape.
-
-**Button classification** (`irClassBtn` + `irBuildLayout` in `Nesso_base.ino`):
-
-| Group | Label match (case-insensitive) | Width | Color |
-|---|---|---|---|
-| Power | `pow`, `pwr`, `standby` | full | Red |
-| Mute | `mute`, `silent` | full / paired half | Orange-red |
-| Vol + | `vol` + (`+` / `up` / `inc`) | half | Green |
-| Vol − | `vol` + (`-` / `dn` / `down`) | half | Green |
-| Chan + | `ch`/`chan`/`prog` + (`+` / `up`) | half | Blue |
-| Chan − | `ch`/`chan`/`prog` + (`-` / `dn`) | half | Blue |
-| OK | exact `ok`, `enter`, `select` | full | Teal |
-| Nav Up/Down/Left/Right | `up`, `down`/`dn`, `left`, `right` | third (cross) | Cyan |
-| Menu / Home / Back | `menu`, `home`, `back`, `exit` | half | Cyan |
-| Media | `play`, `pause`, `stop`, `rewind`, `forward`, `ff`, `rew`, `next`, `prev`, `skip` | third | Amber |
-| Numbers | single digit `0`–`9` | third | Grey |
-| Generic | everything else | half | Amber |
-
-**Pixel-based scrolling:** `irBtnPageOff` is a pixel offset (not a row index). Swipe displacement maps 1:1 — a `dy`-pixel swipe scrolls `dy` pixels of content. Maximum scroll = `irLayoutH − areaH`.
-
-**Flash highlight:** stored as `irFlashIdx` (button index); the glow tracks the button correctly during scroll.
-
-#### Adding IR files
-
-**Over serial (no reflash needed):** use the `fs upload` command — see the Filesystem Serial Commands section below.
-
-**Via full reflash:** drop `.ir` files anywhere under `data/irdb/` (subdirectories are fine), then use `build_littlefs.py` to build and flash the image. No firmware change needed.
-
-**Via M5Stack IR Unit learn mode:** record signals from any physical remote directly onto the device — see [IR Learn Mode (M5Stack IR Unit)](#ir-learn-mode-m5stack-ir-unit) below.
-
-Two `.ir` formats are supported:
-
-- **Parsed** (`type: parsed`) — uses `protocol:`, `address:`, `command:` fields. Supported protocols: `NEC`, `SAMSUNG`/`SAMSUNG32`, `SIRC12`/`SIRC15`/`SIRC20`, `RC5`, `RC6`, `LG`, `JVC`.
-- **Raw** (`type: raw`) — uses a `data:` field with microsecond timings. Only the first frame is used (gap threshold > 15 000 µs).
-
-Address and command values in parsed files are **little-endian hex bytes**, e.g. `address: 30 00 00 00` → `0x00000030`.
-
-#### IR serial commands (115200 baud)
-
-| Command | Description |
-|---|---|
-| `ir list` | Print all scanned `.ir` files (`*` = currently loaded) |
-| `ir select <N>` | Load device N and open the remote UI |
-| `ir send <N> <label>` | Load device N and send the named button (exact label) |
-| `ir custom new [name]` | Create a new custom remote at `/irdb/Custom/<name>.ir` |
-| `ir custom list` | List all custom remotes |
-| `ir rename <new name>` | Rename the currently loaded custom remote file |
-| `ir del` | Delete the currently loaded remote file |
-| `ir reload` | Re-scan `/irdb/` without reboot |
-| `ir pin` | Show IR TX / RX GPIO numbers |
-| `ir btn del <label>` | Delete a button from the loaded custom remote |
-| `ir btn rename <old> <new>` | Rename a button in the loaded custom remote |
-| `ir learn start` | Power up GROVE port and arm M5 IR Unit receiver |
-| `ir learn stop` | Stop capture, cut GROVE power |
-| `ir learn bind <label>` | Bind last captured signal to a button label |
-| `ir learn show` | Print details of the last captured signal |
-
-#### Raw signal notes
-
-Raw signals (`type: raw`) are sent **3 times with 45 ms spacing** to match Sony's repeat requirement. Signals with `rawLen < 8` are silently skipped (too short to be valid — usually a bad capture).
-
-#### IR Learn Mode (M5Stack IR Unit)
-
-The **M5Stack IR Unit (U002)** plugs into the Nesso N1 GROVE port (PORT.CUSTOM) and provides a 38 kHz demodulated IR receiver for capturing signals from any physical remote.
-
-**GROVE port wiring (Nesso N1 PORT.CUSTOM):**
-
-| GROVE signal | Nesso N1 GPIO | Firmware constant | Direction |
-|---|---|---|---|
-| G4 (IR_RX) | GPIO 4 | `IR_RECV_PIN` | input — demodulated receive |
-| G5 (IR_TX) | GPIO 5 | `IR_UNIT_TX_PIN` | output — M5 unit transmitter |
-
-> **GROVE power:** the GROVE 5V rail is off by default (gated by `GROVE_POWER_EN`, an I2C expander pin on the PI4IOE5V6408 at 0x44). `irLearnStart()` calls `pinMode(GROVE_POWER_EN, OUTPUT)` + `digitalWrite(GROVE_POWER_EN, HIGH)` before arming the receiver ISR. `irLearnStop()` cuts GROVE power.
-
-**Custom remote workflow:**
-
-```
-ir custom new Living Room   # creates /irdb/Custom/Living_Room.ir, loads it
-ir learn start              # powers GROVE, arms receiver (amber dot blinks in title)
-<point remote at M5 unit, press Power>
-# serial prints: Captured: NEC  addr=0x0020  cmd=0x08
-ir learn bind Power         # saves button, UI switches to remote view
-<press Vol+ on remote>
-ir learn bind Vol+
-ir learn stop               # cuts GROVE power
-```
-
-**Adding buttons to an existing custom remote:**
-
-```
-ir custom list              # find the remote name
-ir select <N>               # load it (N from 'ir list')
-ir learn start
-ir learn bind <label>
-ir learn stop
-```
-
-**IR Actions settings overlay (long-press KEY1):** same 7-item menu as RF433 — NEW REMOTE, SELECT REMOTE, DEL REMOTE, CAPTURE BUTTON, AUTO BIND, DELETE BUTTON, RESET — in the same contextual order (remote management first, button management second).
-
-**Touch-to-bind:** while learn mode is active and a signal has been captured (green `BIND` indicator), tapping an existing button in the remote UI **rebinds** that button to the captured signal instead of transmitting.
-
-**Delete mode:** in DELETE BUTTON mode a pulsing red `DEL` dot appears in the title bar and all buttons glow red — tapping any button removes it from the custom remote immediately.
-
-**Auto-bind:** AUTO BIND mode auto-names each captured signal Btn_01, Btn_02, … without requiring a `bind` command. A learn bar at the bottom shows LISTENING… / RETRY / NEW BUTTON states.
-
-**Duplicate detection (decoded signals only):**
-- Same IR code on a different button → a warning is printed (`[IR] Note: same code already assigned to '...'`); the existing button is left unchanged and the new label is added/updated normally.
-- Same label → existing button's code is overwritten.
-- Library files (outside `/irdb/Custom/`) are write-protected; `ir learn bind` refuses with an error.
-
-**Signal storage:**
-- If IRremote decodes a known protocol (NEC, SAMSUNG32, SIRC, RC5, RC6, LG, JVC), the button is saved as `type: parsed` — compact and reliable.
-- Unknown protocols fall back to `type: raw` with 38 000 Hz frequency.
-
-#### Key constants (top of sketch, before last `#include`)
+### Key constants
 
 ```cpp
-#define IR_MAX_FILES   128  // max .ir files scanned at boot
-#define IR_MAX_BUTTONS 48   // max buttons per device
-#define IR_MAX_RAW_LEN 128  // max raw timing entries
-#define IR_RECV_PIN    4    // GROVE G4 — M5 IR Unit demodulated receive
-#define IR_UNIT_TX_PIN 5    // GROVE G5 — M5 IR Unit transmitter (reference)
-```
+#define IR_MAX_FILES   128
+#define IR_MAX_BUTTONS 48
+#define IR_MAX_RAW_LEN 128
+#define IR_RECV_PIN    4    // GROVE G4
+#define IR_UNIT_TX_PIN 5    // GROVE G5
 
-> **Arduino preprocessor note:** `enum IRFileProto`, `struct IRButton`, `struct IRFileEntry`, `enum BtnType`, `struct IRBtnPos`, and `struct IRLearnData` are all defined *before* `#include <ArduinoJson.h>` (the last `#include` in the sketch). This is required so the auto-generated function prototypes that Arduino inserts after the last `#include` can reference these types. Do not move them below that include.
-
-### RF433 Remote System
-
-433 MHz OOK ASK remote control using M5Stack Unit RF433T (SYN115 transmitter) and RF433R (SYN531R receiver) connected via a Y-cable to the GROVE port.
-
-**GROVE wiring:**
-
-| GROVE signal | GPIO | Firmware constant | Module |
-|---|---|---|---|
-| G4 (Yellow) | GPIO 4 | `RF433_RX_PIN` | RF433R — demodulated RX output |
-| G5 (White) | GPIO 5 | `RF433_TX_PIN` | RF433T — TX data input |
-
-GROVE 5V power (`GROVE_POWER_EN`) is enabled only during learn mode and briefly during transmission.
-
-> **TX pin must be LOW before GROVE power-on.** The SYN115 transmitter keys its 433 MHz carrier whenever its DATA pin is high or floating. With TX and RX on a Y-cable, a floating GPIO 5 causes severe self-interference on the SYN531R. `rf433LearnStart()` drives `RF433_TX_PIN` LOW before enabling GROVE power to prevent this.
-
-**Feature enable:** RF433 is **disabled by default** and hidden from navigation. Enable it from the Battery/Device settings screen (long-press KEY1 on battery screen → RF433 item) or via `rf433 enable` serial command.
-
-**File format:** Custom remotes are saved as `.sub` files in `/rf433db/Custom/`. Legacy `.433` files are also read. Format:
-
-```
-Filetype: Nesso SubGhz Remote
-Version: 1
-Frequency: 433920000
-#
-name: Button1
-type: raw
-RAW_Data: 450 -1350 450 -450 1350 -450 ...
-```
-
-Only `type: raw` is used. `RAW_Data` values follow Flipper SubGhz convention: positive = HIGH pulse duration (µs), negative = LOW pulse duration. Values alternate HIGH/LOW starting from the first mark. The reader also accepts the legacy `data:` field (all-positive, unsigned).
-
-**UI:** Two-level browser identical to IR — file list → remote button grid (2 columns, green accent). Tap title bar to go back to list.
-
-**Learn workflow (manual):**
-
-```
-rf433 custom new Garage          # creates /rf433db/Custom/Garage.sub, loads it
-rf433 learn start                # drives TX LOW, powers GROVE, arms ISR on GPIO 4
-<press button on remote>
-# serial prints: [RF433] Captured: 512 pulses T=300us (sync gap)
-#                [RF433] Decoded: 0x555503 (24-bit, T=300 us, ratio 1:3)
-rf433 learn bind Open            # saves button, updates file
-rf433 learn stop                 # cuts GROVE power
-```
-
-**Auto-bind workflow (UI):** Long-press KEY1 → RF433 settings → AUTO BIND. Each captured signal is automatically named Btn_01, Btn_02, … without requiring a `bind` command. After each bind a 2-second pause discards edges before the next capture. Stop with `rf433 learn stop` or long-press KEY1.
-
-**Signal capture details:**
-- ISR fires on every edge of GPIO 4 (CHANGE interrupt), records µs edge durations into a 512-entry ISR buffer (`RF433_MAX_ISR_LEN`).
-- Buffer processes immediately when full; otherwise waits for 30 ms silence (end-of-packet gap).
-- Two acceptance criteria, checked in order:
-  1. **Sync gap** (8 000–15 000 µs): a pulse of this duration anywhere in the capture proves a real OOK packet (PT2262/EV1527 ~10 300 µs; NEC ~9 000 µs). Required `cleanedLen ≥ 60` after quantization.
-  2. **High-T** (T ≥ 600 µs): protocols with slow bit-clock (e.g. some garage openers) are accepted even without a sync gap. Required `cleanedLen ≥ 16`.
-  - Signals that satisfy neither criterion are silently discarded as ambient ISM noise — important because quantized noise data at T≈300 µs can coincidentally decode as OOK bits and must not be accepted.
-- If the remote signal arrived after ambient ISM already filled the first half of the buffer, the firmware falls back to storing the last 256 entries and re-checks for a decodable code.
-- **Polarity normalization:** the ISR CHANGE interrupt captures both edges, so the first edge may be falling (inverted polarity). The firmware finds the first gap > 5 000 µs; if it sits at an even index (even = HIGH carrier in transmit), the array is shifted left by one to correct polarity.
-- Leading pre-signal silence (> 10 ms) and trailing gap (> 15 ms) are trimmed automatically.
-- Minimum valid capture: 8 pulses after trim.
-- Signal is transmitted 3 × with 10 ms inter-frame gap.
-
-**IR / RF433 mutual exclusion:** `irLearnStart()` refuses if `rf433LearnMode` is active, and `rf433LearnStart()` refuses if `irLearnMode` is active. Both use GPIO 4 via different ISR handlers.
-
-**Key constants:**
-
-```cpp
 #define RF433_MAX_FILES   64
 #define RF433_MAX_BUTTONS 32
-#define RF433_MAX_RAW_LEN 256  // max pulses stored per button / learn capture
-#define RF433_MAX_ISR_LEN 512  // ISR capture window (learn mode only — wider to outlast ambient fill)
-#define RF433_RX_PIN      4    // GROVE G4
-#define RF433_TX_PIN      5    // GROVE G5
+#define RF433_MAX_RAW_LEN 256
+#define RF433_MAX_ISR_LEN 512
+#define RF433_RX_PIN      4
+#define RF433_TX_PIN      5
 ```
-
-**NVS keys:** `rf433On` (bool), `rf433Path` (string — last loaded remote path).
-
-**Touch-to-bind:** While learn mode is active and a signal has been captured (green `BIND` indicator in title bar), tapping an existing button in the remote UI **rebinds** that button to the captured signal.
-
-**Delete button (UI):** Long-press KEY1 → RF433 settings → DELETE BUTTON → returns to the remote view; tapping any button deletes it.
-
-**Delete remote (UI):** Long-press KEY1 → RF433 settings → DEL REMOTE → deletes the loaded remote file immediately and returns to the file list.
-
-#### RF433 serial commands (`rf433`)
-
-| Command | Description |
-|---|---|
-| `rf433 list` | List all scanned `.sub` / `.433` files |
-| `rf433 select <N>` | Load remote N and open UI |
-| `rf433 send <N> <label>` | Transmit button from remote N |
-| `rf433 custom new [name]` | Create new custom remote (`.sub`) |
-| `rf433 custom list` | List custom remotes |
-| `rf433 rename <new name>` | Rename the loaded custom remote file |
-| `rf433 del` | Delete the currently loaded remote file |
-| `rf433 reload` | Re-scan `/rf433db/` |
-| `rf433 btn del <label>` | Delete a button from the loaded custom remote |
-| `rf433 btn rename <old> <new>` | Rename a button in the loaded custom remote |
-| `rf433 learn start` | Drive TX LOW, power GROVE, arm SYN531R receiver |
-| `rf433 learn stop` | Stop capture, cut GROVE power |
-| `rf433 learn bind <label>` | Bind last capture to button label |
-| `rf433 learn show` | Print last captured signal info |
-| `rf433 enable` | Enable RF433 function |
-| `rf433 disable` | Disable RF433 function |
-
-### Serial Command Reference
-
-Connect at **115200 baud**. Type `help` for the full list. Commands work over both USB serial and BLE UART.
-
-#### Navigation / General
-
-| Command | Description |
-|---|---|
-| `help` | Print full command reference |
-| `status` | Current state summary (screen, WiFi, BT, BLE-UART) |
-| `next` | Advance to next screen (same as KEY1) |
-| `prev` | Go to previous screen (same as KEY2) |
-| `goto <screen>` | Jump directly to a screen — valid names: `main`, `controller`, `bt`, `wifi`, `lora`, `rfid2`, `ir`, `rf433`, `media`, `matrix`, `vader`, `obiwan`, `battery` |
-| `clock` | Print current date/time (NTP) |
-| `battery` | Print voltage, percentage, charge state, uptime |
-| `webfm` | Print web file manager URL (WiFi required) |
-
-#### Filesystem (`fs`)
-
-| Command | Description |
-|---|---|
-| `fs info` | LittleFS total / used / free bytes |
-| `fs ls [path]` | List directory contents (default `/`) |
-| `fs cat <path>` | Print file contents to terminal |
-| `fs rm <path>` | Delete a file |
-| `fs mkdir <path>` | Create a directory (parent must exist) |
-| `fs mv <src> <dst>` | Rename or move a file |
-| `fs upload <path>` | Upload a text file — paste content then send `---END---` on its own line |
-
-**Upload workflow** — add a new `.ir` file without reflashing:
-```
-fs mkdir /irdb/Soundbars/Sony
-fs upload /irdb/Soundbars/Sony/MyRemote.ir
-<paste file contents>
----END---
-```
-The device prints byte count and auto-rescans `/irdb` on success.
-
-**Implementation notes:**
-- `fsUploadFeed()` processes upload bytes char-by-char so long `data:` lines (hundreds of chars) never overflow the 160-byte command buffer.
-- The `---END---` sentinel is detected in a 12-byte line buffer; if a line exceeds that, it is streamed directly to LittleFS and cannot be the sentinel.
-- After any `fs rm`, `fs mv`, or `fs upload` of a `.ir` file, `/irdb` is automatically rescanned.
-
-#### IR Remote (`ir`)
-
-| Command | Description |
-|---|---|
-| `ir list` | Print all scanned `.ir` files (`*` = currently loaded) |
-| `ir select <N>` | Load device N and open the remote UI |
-| `ir send <N> <label>` | Load device N and send the named button (exact label) |
-| `ir custom new [name]` | Create a new custom remote at `/irdb/Custom/<name>.ir` |
-| `ir custom list` | List all custom remotes |
-| `ir rename <new name>` | Rename the currently loaded custom remote file |
-| `ir del` | Delete the currently loaded remote file |
-| `ir reload` | Re-scan `/irdb/` without reboot |
-| `ir pin` | Show IR TX / RX GPIO numbers |
-| `ir btn del <label>` | Delete a button from the loaded custom remote |
-| `ir btn rename <old> <new>` | Rename a button in the loaded custom remote |
-| `ir learn start` | Power GROVE port and arm M5 IR Unit receiver |
-| `ir learn stop` | Stop capture, cut GROVE power |
-| `ir learn bind <label>` | Bind last captured signal to a button label |
-| `ir learn show` | Print details of last captured signal |
-
-### RFID2 Unit (M5Stack Unit RFID2, WS1850S chip)
-
-Reads ISO/IEC 14443-A cards (MIFARE Classic, Ultralight, NTAG, etc.) over I2C. Scanned UIDs are saved to `.rfid` files in LittleFS under `/rfid2db/`.
-
-**GROVE PORT.CUSTOM wiring:**
-
-| GROVE signal | Nesso N1 GPIO | Constant | Direction |
-|---|---|---|---|
-| Yellow (SDA) | GPIO 5 | `GROVE_IO_0` | I2C data |
-| Gray (SCL) | GPIO 4 | `GROVE_IO_1` | I2C clock |
-
-**I2C address:** 0x28 (WS1850S fixed)
-
-**Library:** `MFRC522_I2C` v1.0.0 (install via arduino-cli: `arduino-cli lib install "MFRC522_I2C"`)
-
-**ESP32-C6 I2C constraint:** ESP32-C6 has only ONE HP I2C controller (`Wire`, default SDA=GPIO10 SCL=GPIO8). The second bus (`TwoWire(1)`) is LP I2C whose SDA is hardware-locked to GPIO 6 — unusable for GPIO 5. Solution: briefly switch `Wire` to GPIO 5/4 for each MFRC522 operation via `rfid2WireGrove()` / `rfid2WireRestore()`, which call `Wire.end()` + `Wire.begin()` with new pins. `Wire.end()` is mandatory before `Wire.begin()` with different pins on ESP32-C6; omitting it leaves the bus on the old pins silently.
-
-**Detection:** `initRFID2()` runs a live I2C probe on every screen entry with 150 ms GROVE power stabilisation delay, so connecting the unit after boot is supported without reboot.
-
-#### UI levels
-
-The RFID2 screen has three levels:
-
-| Level | Constant | Description |
-|---|---|---|
-| Main | `RFID2_LEVEL_MAIN` | Default. NFC icon + "WAITING…"; shows UID + card type for 3 s after a read. Blinking `REC` dot when record mode is active. |
-| File list | `RFID2_LEVEL_LIST` | Scrollable browser of `.rfid` files in `/rfid2db/`. Tap a file to open its card list. Tap title bar to return to Main. |
-| Card list | `RFID2_LEVEL_CARDS` | Cards stored in the loaded file. Tap title bar to return to file list. In delete mode, tapping a card removes it immediately. |
-
-Long-press KEY1 opens the settings overlay (6 items: NEW FILE, VIEW FILES, DEL FILE, RECORD CARD, DELETE CARD, RESET). Vertical swipe scrolls the cursor in settings mode; vertical swipe scrolls the list in normal mode at LIST/CARDS levels.
-
-#### .rfid file format
-
-Files are stored under `/rfid2db/` (custom files in `/rfid2db/<name>.rfid`). Format:
-
-```
-Filetype: Nesso RFID Database
-Version: 1
-#
-name: Card_01
-uid: E3:ED:B5:19
-sak: 08
-type: MIFARE 1KB
-#
-name: Card_02
-uid: A1:B2:C3:D4
-sak: 00
-type: MIFARE Ultralight
-```
-
-Each card block is separated by `#`. Fields: `name` (label up to 23 chars), `uid` (hex colon-separated), `sak` (hex byte), `type` (string).
-
-#### Record mode
-
-When record mode is active (`rfid2RecordMode = true`), every new card tap is auto-saved to the loaded file as `Card_01`, `Card_02`, … A blinking amber `REC` dot appears in the top-right corner of the Main screen. Enable via the settings overlay (RECORD CARD) or `rfid2 record start` serial command.
-
-**Serial output on card read:**
-```
-[RFID2] UID(4): E3:ED:B5:19  SAK: 0x08  Type: MIFARE 1KB
-```
-
-**NVS key:** `rfid2Path` (string — last loaded file path, reloaded on next entry to RFID2 screen).
-
-#### Serial commands
-
-| Command | Description |
-|---|---|
-| `rfid2 list` | List all `.rfid` files in `/rfid2db/` (`*` = currently loaded) |
-| `rfid2 reload` | Re-scan `/rfid2db/` without reboot |
-| `rfid2 select <N>` | Load file N and open RFID screen |
-| `rfid2 new [name]` | Create new `.rfid` file and start record mode |
-| `rfid2 del` | Delete the currently loaded file |
-| `rfid2 rename <new name>` | Rename the loaded file |
-| `rfid2 card list` | List cards in the loaded file |
-| `rfid2 card del <label>` | Delete a card by label (or UID) from the loaded file |
-| `rfid2 card rename <old> <new>` | Rename a card in the loaded file |
-| `rfid2 record start` | Start auto-saving scanned cards to the loaded file |
-| `rfid2 record stop` | Stop record mode |
-| `rfid2 scan` | I2C bus scan on GROVE port (SDA=GPIO5 SCL=GPIO4) — lists all found addresses |
-| `rfid2 probe` | Probe specifically 0x28, prints error code, updates `rfid2Available` |
-
-### Web File Manager
-
-A browser-based file manager starts automatically when WiFi connects (port 80). Navigate to `http://<device-ip>/` in any browser.
-
-| Feature | Details |
-|---|---|
-| Browse | Click folders to enter; breadcrumb / `..` row to go up |
-| Upload | Click **↑ Upload** button; supports multiple files at once |
-| Download | Click **dl** link next to any file |
-| Delete | Click **del** — directories must be empty |
-| New folder | Click **+ Folder**, enter name in prompt |
-| Rename/move | Click a file row to select it, type new name in the "new name" box, click **Rename** |
-| URL command | Type `webfm` in the serial terminal to print the current URL |
-
-Uploading or deleting `.ir` files auto-triggers a rescan of `/irdb/`. The HTML is embedded in firmware (`web_fm_html.h`); it does not need a file in LittleFS.
-
-**Implementation notes:**
-- `webFMPendingStart` flag is set in `WiFiEvent` (FreeRTOS task) and consumed in `loop()` to safely call `WebServer.begin()` from the main task.
-- HTML is stored in `web_fm_html.h` as a PROGMEM constant to avoid confusing the Arduino ctags preprocessor (which would misparse JS function signatures in the `.ino` file).
-
-### Robot Control Protocol
-
-The controller mode reads an **Adafruit seesaw mini gamepad** (I2C address `0x50`) and transmits a `ControlCommand` struct (two `int16_t` values, range −255 to +255) via **UDP to 192.168.1.27:8889**.
-
-- Horizontal stick → synchronized forward/reverse (both motors same power)
-- Vertical stick → differential steering (motors opposite → rotation)
-- Joystick zero point is calibrated on first read
-
-### Key Hardware Abstractions
-
-- `NessoBattery` — battery voltage, charge %, and charge state management
-- `NessoDisplay` / `LGFX_Sprite` — display rendering; sprite used for battery and controller modes for efficiency
-- `WiFiEvent` callback runs on a FreeRTOS task for async WiFi state handling
-
-### Sprite / Header Architecture
-
-Most screens push `statusSprite` at `y = SPRITE_Y` (22 px), leaving the top 22 px for the battery/WiFi/BT header drawn directly on `display` by `renderHeader()`.
-
-**IR and RF433 use the full display height** — no header bar. This is managed by `g_spriteY` (an `int` global, initialised to `SPRITE_Y`):
-
-- `createStatusSprite()` creates the sprite as `display.width() × (display.height() − g_spriteY)`.
-- At the top of `renderFunction()` every frame, the desired value is computed: `0` for IR/RF433, `SPRITE_Y` for all other functions. If it differs from the current `g_spriteY`, the sprite is resized immediately and `irLayoutH` is reset to force a button-layout rebuild.
-- This check runs unconditionally — it does **not** depend on `lastFunction` — so it is immune to `updateOrientation()` setting `lastFunction = −1` mid-navigation.
-- `initIR()` and `initRF433()` call `display.fillScreen()` to clear the display including the header area; the sprite is then pushed at `y = 0`, covering the full screen.
-- All touch coordinate transforms in IR/RF433 handlers use `sy − g_spriteY` (which equals `sy` when `g_spriteY = 0`).
-
-### Battery Percentage Calculation
-
-Battery percentage is calculated from voltage using `voltageToPercent()` — a piecewise linear LiPo discharge curve (3.0V→0%, 4.2V→100%). The raw `battery.getChargeLevel()` from the library is **not used for display or logic** because it is unreliable: tested at 3.89V it reported 98% while the voltage-based curve correctly returned ~63%. The library value is kept in `chargeLevel` and shown as a tiny `lib:XX%` debug label on the battery screen for comparison.
-
-### Battery Charging Logic
-
-Charging is enabled when external power is detected (`VIN_DETECT`). Voltage color thresholds: green >3.7V, orange 3.3–3.7V, red <3.3V.
-
-### Network Configuration (hardcoded)
-
-| Setting | Value |
-|---|---|
-| UDP target | `192.168.1.27:8889` |
-| NTP server | `pool.ntp.org` |
-| Timezone offset | UTC+3 (10800 s) |
-
-Credentials are in `arduino_secrets.h` (`SECRET_SSID`, `SECRET_PASS`).
