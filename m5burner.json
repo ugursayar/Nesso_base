@@ -1,0 +1,18 @@
+{
+  "name": "Nesso_base",
+  "description": "Firmware for the Arduino Nesso N1 (ESP32-C6) handheld controller. Features: clock/NTP, BLE scanner, WiFi scanner, LoRa (Meshtastic), IR remote (Flipper-compatible .ir files), RF433 sub-GHz, robot gamepad, media screens, web file manager, and serial command interface.",
+  "keywords": "ESP32-C6, Nesso, N1, handheld, IR, BLE, LoRa, WiFi, RF433, Arduino",
+  "author": "ugursayar",
+  "repository": "https://github.com/ugursayar/Nesso_base",
+  "firmware_category": [
+    {
+      "Nesso-N1": {
+        "path": "firmware",
+        "device": ["Arduino Nesso N1"],
+        "default_baud": 921600
+      }
+    }
+  ],
+  "version": "1.0.0",
+  "framework": "Arduino"
+}
