@@ -1,5 +1,6 @@
 # Credentials - never commit real secrets
 arduino_secrets.h
+data/config.json
 
 # Claude Code memory (local only)
 .claude/
