@@ -16,8 +16,6 @@ build_temp/
 # Allow M5Burner release binaries to be committed
 !firmware/*.bin
 
-# Generated IR library — recreate with gen_irdb_all.py (2800+ files, ~9.9 MB)
-data/irdb/
 
 # Python
 __pycache__/
