@@ -1,6 +1,6 @@
 # Nesso_base
 
-Arduino firmware for the **Arduino Nesso N1** handheld controller — a WiFi-enabled base station that controls a remote robot platform via UDP. Features a 240×135px TFT display with a multi-mode menu, battery monitoring, gamepad input, IR and 433 MHz RF remote control, RFID card scanning, and a web-based file manager.
+Arduino firmware for the **Arduino Nesso N1** handheld controller — a WiFi-enabled base station that drives a remote robot platform over a selectable wireless link (WiFi-UDP/TCP, BLE, LoRa). Features a 240×135px TFT display with a multi-mode menu, battery monitoring, single- or dual-stick gamepad input (Adafruit seesaw and/or M5Stack Mini JoyC HAT), IR and 433 MHz RF remote control, RFID card scanning, and a web-based file manager.
 
 ## Table of Contents
 
@@ -26,10 +26,13 @@ Arduino firmware for the **Arduino Nesso N1** handheld controller — a WiFi-ena
   - M5Stack IR Unit (U002) — IR remote learn/transmit
   - M5Stack RF433T + RF433R units (Y-cable) — 433 MHz remote learn/transmit
   - M5Stack RFID2 Unit (WS1850S) — ISO/IEC 14443-A card scanning
-- Optional HAT:
+- Optional HATs (HAT bus, SDA=GPIO 6 / SCL=GPIO 7):
   - M5Stack Speaker Hat 2 (MAX98357A) — high-quality I2S audio output
+  - M5StickC Mini JoyC HAT (STM32F030, I2C `0x54`) — front-mounted joystick for robot control
+- Optional controller:
+  - Adafruit seesaw mini gamepad (I2C `0x50`) — stick + 6 buttons
 
-**Required libraries:** `Adafruit seesaw`, `Arduino_Nesso_N1`, `MFRC522_I2C` (for RFID2)
+**Required libraries:** `Adafruit seesaw`, `Arduino_Nesso_N1`, `MFRC522_I2C` (for RFID2), `NessoLink` (control-frame codec — [github.com/ugursayar/NessoLink](https://github.com/ugursayar/NessoLink), install into your Arduino `libraries/` folder)
 
 ---
 
@@ -108,7 +111,7 @@ Edit the `INCLUDE_FILES` list at the top of the script to add or remove files. P
 
 ### `gen_irdb_all.py` — download the full IR file library
 
-Downloads `.ir` files from **Flipper-IRDB** (`Lucaslhm/Flipper-IRDB`) into `data/irdb/<Type>/<Brand>/<Model>.ir`. Existing files are never overwritten, so the script is safe to re-run.
+The full `data/irdb/` library (2795 `.ir` files) is **committed to the repo**, so you only need this script to refresh or extend it. It downloads `.ir` files from **Flipper-IRDB** (`Lucaslhm/Flipper-IRDB`) into `data/irdb/<Type>/<Brand>/<Model>.ir`. Existing files are never overwritten, so the script is safe to re-run.
 
 ```powershell
 python gen_irdb_all.py
@@ -140,7 +143,7 @@ Navigate with **KEY1** (forward) and **KEY2** (backward), 500 ms debounce. **Lon
 | Mode | Description |
 |------|-------------|
 | `FUNCTION_MAIN` | Clock + WiFi status via NTP (UTC+3) |
-| `FUNCTION_CONTROLLER` | Gamepad → UDP motor commands |
+| `FUNCTION_CONTROLLER` | Gamepad / Mini JoyC → robot commands over selectable link (UDP/BLE/TCP/LoRa) |
 | `FUNCTION_BT` | Bluetooth scanner |
 | `FUNCTION_WIFI` | WiFi network scanner |
 | `FUNCTION_LORA` | LoRa / Meshtastic |
@@ -443,11 +446,60 @@ Uploading or deleting `.ir` files auto-triggers a rescan of `/irdb/`.
 
 ## Robot Control
 
-Controller mode reads an **Adafruit seesaw mini gamepad** (I2C address `0x50`) and sends a `ControlCommand` struct (two `int16_t`, range −255 to +255) via **UDP to 192.168.1.27:8889**.
+Controller mode reads a joystick and transmits motor + button commands to a remote robot over a selectable wireless link.
 
-- **Horizontal stick** → synchronized forward/reverse (both motors same power)
-- **Vertical stick** → differential steering (motors opposite → rotation)
-- Joystick zero point is calibrated on first read
+- **Forward/back** (vertical stick) → both motors same power
+- **Turn** (horizontal stick) → motors opposite (rotation)
+
+### Supported controllers
+
+| Controller | Bus | Notes |
+|---|---|---|
+| Adafruit seesaw mini gamepad | I2C `0x50` (main Wire) | Stick + A/B/X/Y/SELECT/START |
+| M5Stack Mini JoyC HAT (STM32F030) | I2C `0x54` (HAT bus, GPIO 6/7) | Stick + button; self-powered |
+
+One connected → it drives directly. **Both** connected → **dual-stick**: one stick drives the motors, the other is an **aux** stick (camera/turret → `auxX`/`auxY`). `PRIMARY` selects which drives (default: Mini JoyC). The Mini JoyC always follows screen rotation; the seesaw follows it only in attached `MOUNT` modes (see below).
+
+### Wire protocol — RemoteFrame v1
+
+Every link sends the same **15-byte little-endian frame** (the robot receiver must parse it; magic + version + CRC let it validate):
+
+| off | field | type | notes |
+|---|---|---|---|
+| 0 | magic | u8 | `0xA5` |
+| 1 | version | u8 | `1` |
+| 2 | seq | u8 | rolling sequence (dedup / loss detection) |
+| 3–4 | leftMotor | i16 | −255..255 |
+| 5–6 | rightMotor | i16 | −255..255 |
+| 7–8 | auxX | i16 | aux stick X (0 unless dual-stick) |
+| 9–10 | auxY | i16 | aux stick Y |
+| 11–12 | buttons | u16 | bitfield, 1 = pressed: A=0, B=1, X=2, Y=3, SELECT=4, START=5, STICK=6 |
+| 13 | flags | u8 | bit0 = aux stick present |
+| 14 | crc8 | u8 | poly `0x07`, init `0x00`, over bytes 0..13 |
+
+Sent continuously at ~10 Hz (even when centered) so the receiver can implement a failsafe (stop motors if no valid frame for N ms).
+
+### Transport links (`TX LINK`)
+
+| Link | Status | Notes |
+|---|---|---|
+| **WiFi-UDP** | default | to `robot_ip:udp_port` (8889); lowest latency, same LAN |
+| **BLE** | working | notifies the NESSO BLE UART characteristic; needs a connected central (WiFi contends — one radio) |
+| **WiFi-TCP** | minimal | lazy connect to `robot_ip:tcp_port` (8890) |
+| **LoRa** | not yet | stub — blocking TX + EU duty cycle make it unsuitable as a live link |
+
+### Configuration
+
+Open controller settings with **long-press KEY1**, or use the `ctrl …` serial commands. All settings persist to NVS.
+
+| Setting | Options |
+|---|---|
+| **CALIBRATE** | Mini JoyC: write center to its STM32 flash · seesaw: re-zero on next read |
+| **DEADZONE** | Mini JoyC deadzone: 8 / 16 / 30 / 50 |
+| **SWAP XY / INVERT X / INVERT Y** | drive-stick axis transforms |
+| **TX LINK** | wireless link (table above) |
+| **MOUNT** (seesaw) | `SIDE` / `BACK` — attached, follows screen rotation · `DET-PORT` / `DET-LAND` — detached, fixed to the stick |
+| **PRIMARY** (dual-stick) | which stick drives: `JOYC` / `PAD` |
 
 ---
 
@@ -467,6 +519,22 @@ Connect at **115200 baud**. Commands work over both USB serial and BLE UART (`ne
 | `clock` | Print current date/time (NTP) |
 | `battery` | Print voltage, percentage, charge state, uptime |
 | `webfm` | Print web file manager URL |
+
+### Controller (`ctrl`)
+
+| Command | Description |
+|---|---|
+| `controller` | Print joystick position + last motor values |
+| `send <L> <R>` | Send a motor command directly (−255..255) |
+| `ctrl` | Show device, axis flags, link, mount, primary |
+| `ctrl invertx on\|off` | Invert turn (X) axis |
+| `ctrl inverty on\|off` | Invert forward/back (Y) axis |
+| `ctrl swap on\|off` | Swap X/Y |
+| `ctrl dz 0-3` | Mini JoyC deadzone (8 / 16 / 30 / 50) |
+| `ctrl calibrate` | Calibrate Mini JoyC center → STM32 flash |
+| `ctrl link udp\|ble\|tcp\|lora` | Select wireless link |
+| `ctrl primary joyc\|pad` | Dual-stick: which stick drives |
+| `ctrl ssmount 0-3` | Seesaw mount: `side`/`back` (attached) · `detport`/`detland` (detached) |
 
 ### Filesystem (`fs`)
 
@@ -496,7 +564,8 @@ After any `fs rm`, `fs mv`, or `fs upload` of a `.ir` file, `/irdb` is automatic
 
 | Setting | Value |
 |---|---|
-| UDP target | `192.168.1.27:8889` |
+| UDP target | `192.168.1.27:8889` (config.json `robot_ip` / `udp_port`) |
+| TCP target | `192.168.1.27:8890` (config.json `robot_ip` / `tcp_port`) |
 | NTP server | `pool.ntp.org` |
 | Timezone offset | UTC+3 (10800 s) |
 

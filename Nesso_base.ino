@@ -23,6 +23,8 @@
 #include <BLEAdvertisedDevice.h>
 #include <BLEServer.h>
 #include <BLEAdvertising.h>
+#include <BLEHIDDevice.h>
+#include <NessoFrame.h>   // NessoLink control-frame codec (shared with the robot receiver)
 #include <Preferences.h>
 #include "esp_sleep.h"
 #include <IRremote.hpp>
@@ -231,9 +233,24 @@ char ntpServer[64]        = "pool.ntp.org";
 long gmtOffset_sec        = 3600 * 3;
 int  daylightOffset_sec   = 0;
 int  udpPort              = 8889;
+int  tcpPort              = 8890;
 char targetIpAddress[16]  = "192.168.1.27";
 
-NetworkUDP udp;
+NetworkUDP    udp;
+NetworkClient tcpClient;   // persistent connection for TX_WIFI_TCP
+
+// ── Remote control transport selection ───────────────────────────
+// All control commands flow through transmitRemoteCommand(); the active
+// link is chosen by remoteTransportIdx. WiFi-UDP is the default (unchanged).
+enum RemoteTransport {
+  TX_WIFI_UDP = 0,
+  TX_BLE      = 1,
+  TX_WIFI_TCP = 2,
+  TX_LORA     = 3,
+};
+static const char* REMOTE_TX_LABELS[] = { "WIFI-UDP", "BLE", "WIFI-TCP", "LORA" };
+static const int   REMOTE_TX_COUNT    = 4;
+int  remoteTransportIdx = TX_WIFI_UDP;   // persisted to NVS ("txLink")
 struct tm  timeinfo;
 int        lastMinute = -1;  // clock updates once per minute
 
@@ -326,11 +343,63 @@ uint32_t button_mask = (1UL << BUTTON_X) | (1UL << BUTTON_Y) | (1UL << BUTTON_ST
 
 int      zero_x = 0, zero_y = 0;
 bool     joystickAvailable   = false;  // set at boot by probing seesaw I2C address
+bool     miniJoyCAvailable   = false;  // set at boot by probing Mini JoyC (0x54) on Grove port
+bool     miniJoyCBtn         = false;  // current button state (true = pressed)
+uint32_t miniJoyCLedColor    = 0;      // last LED color written to Mini JoyC
+// Deadzone in calibrated ±512 units from STM32 registers 0x10/0x12
+static const int CTRL_DEADZONE_VALS[]  = {8, 16, 30, 50};
+static const int CTRL_DEADZONE_COUNT   = 4;
+int      ctrlDeadzoneIdx     = 1;      // index into CTRL_DEADZONE_VALS (default 16)
+// Mini JoyC HAT register mapping (from STM32 firmware source):
+//   Reg 0x10/0x11 = calibrated VERTICAL axis (PA.2): push-UP = negative, push-DOWN = positive
+//   Reg 0x12/0x13 = calibrated HORIZONTAL axis (PA.1): push-RIGHT = positive, push-LEFT = negative
+// Raw axes feed the shared seesaw rotation table; defaults are all OFF and verified
+// correct in portrait. The flags below override per-axis if landscape needs tuning.
+bool     ctrlSwapXY          = false;  // swap X/Y after rotation remap (drive stick)
+bool     ctrlInvertX         = false;  // invert final X (turn)
+bool     ctrlInvertY         = false;  // invert final Y (forward/back)
+// Seesaw physical mount orientation — a base transform of the raw seesaw axes into the
+// device's native-portrait frame. The shared screen-rotation table (applyStickRotation)
+// is then applied on top, so the seesaw reflects screen orientation. The Mini JoyC always
+// rotation-adapts (front-mounted) and is unaffected by this.
+// "Stick mount" — how the seesaw relates to the device, which decides whether the
+// screen-rotation table applies. ATTACHED (side/back) rotates with the device → rotation
+// adaptation ON. DETACHED (held separately) is independent of the device → rotation OFF,
+// fixed to how the stick itself is held.
+enum SeesawMount {
+  SS_STICK_SIDE        = 0,   // attached to side : bx=-px, by= py ; rotation ON
+  SS_STICK_BACK        = 1,   // attached to back : bx= px, by= py ; rotation ON
+  SS_DETACHED_PORTRAIT = 2,   // held separately, upright  : bx=-px, by= py ; rotation OFF
+  SS_DETACHED_LANDSCAPE= 3,   // held separately, sideways : bx= py, by= px ; rotation OFF
+};
+static const char* SEESAW_MOUNT_LABELS[] = { "SIDE", "BACK", "DET-PORT", "DET-LAND" };
+static const int   SEESAW_MOUNT_COUNT    = 4;
+int      seesawMountIdx      = SS_STICK_SIDE;  // persisted (NVS "ssMount")
 bool     controllerConnected = false;
 bool     calibrationComplete = false;
-int16_t  joyDisplayX = 0;       // -255..255, stored for the joystick visualization
+int16_t  joyDisplayX = 0;       // -515..515, drive stick — for the joystick visualization
 int16_t  joyDisplayY = 0;
 uint32_t gamepadButtons = 0xFFFFFFFF;  // all bits 1 = all released (active LOW)
+
+// Dual-stick: when seesaw AND Mini JoyC are both present, one drives (L/R motor mix)
+// and the other is the aux stick (camera/turret → auxX/auxY in the frame).
+bool     dualPrimaryMiniJoyC = true;   // true: Mini JoyC drives, seesaw = aux. Persisted.
+int16_t  aux2DisplayX = 0;             // -515..515, aux stick — for the second indicator
+int16_t  aux2DisplayY = 0;
+int16_t  remoteAuxX   = 0;             // fed into RemoteFrame auxX/auxY
+int16_t  remoteAuxY   = 0;
+bool     remoteHasAux = false;         // sets RemoteFrame flags bit0
+
+// ── BLE HID gamepad ("standard controller") ──────────────────────
+// When enabled, the controller acts as a standard BLE HID gamepad (PC/Android see it as
+// a controller) instead of sending RemoteFrames to a robot. OFF by default — when off no
+// HID code runs. HID-over-GATT needs bonding, so btInitStack() only switches BLE to
+// bonding mode when this is on. The HID device is created during BT init, so enabling it
+// takes effect after a reboot with BT started.
+bool     hidGamepadEnabled = false;    // persisted (NVS "hidPad")
+bool     bleHidReady       = false;
+class BLEHIDDevice* bleHid = nullptr;
+class BLECharacteristic* bleHidInput = nullptr;
 
 struct ControlCommand {
   int leftMotor;   // -255 to 255
@@ -731,6 +800,80 @@ static inline void rfid2WireRestore() {
   Wire.begin(SDA, SCL, 100000);  // SDA=GPIO10, SCL=GPIO8
 }
 
+// ── Mini JoyC (M5Stack HAT, STM32F030, I2C 0x54 on HAT bus G6/G7) ───
+// HAT bus: SDA=GPIO6, SCL=GPIO7. The module has its own battery and needs no
+// external power enable. Switch Wire to HAT pins before any Mini JoyC I2C op.
+#define MINIJOYC_ADDR 0x54
+static inline void miniJoyCWireHat() {
+  Wire.end();
+  Wire.begin(6, 7, 100000);  // SDA=GPIO6, SCL=GPIO7
+}
+static inline void miniJoyCWireRestore() {
+  Wire.end();
+  Wire.begin(SDA, SCL, 100000);  // SDA=GPIO10, SCL=GPIO8
+}
+static uint8_t miniJoyCReadByte(uint8_t reg) {
+  Wire.beginTransmission(MINIJOYC_ADDR);
+  Wire.write(reg);
+  Wire.endTransmission();
+  Wire.requestFrom((uint8_t)MINIJOYC_ADDR, (uint8_t)1);
+  return Wire.read();
+}
+static void miniJoyCWriteReg(uint8_t reg, const uint8_t* data, uint8_t len) {
+  Wire.beginTransmission(MINIJOYC_ADDR);
+  Wire.write(reg);
+  for (uint8_t i = 0; i < len; i++) Wire.write(data[i]);
+  Wire.endTransmission();
+}
+// Set the SK6812 RGB LED. rgb888: 0xRRGGBB.
+static void miniJoyCSetLED(uint32_t rgb888) {
+  uint8_t buf[3] = {(uint8_t)(rgb888 >> 16), (uint8_t)(rgb888 >> 8), (uint8_t)rgb888};
+  miniJoyCWriteReg(0x40, buf, 3);
+  miniJoyCLedColor = rgb888;
+}
+// Read raw 12-bit ADC. Reg 0x00 = PA.2 (vertical axis), 0x02 = PA.1 (horizontal axis).
+// Call with Wire already on HAT pins.
+static uint16_t miniJoyCReadADC(uint8_t reg) {
+  Wire.beginTransmission(MINIJOYC_ADDR);
+  Wire.write(reg);
+  Wire.endTransmission();
+  Wire.requestFrom((uint8_t)MINIJOYC_ADDR, (uint8_t)2);
+  return (uint16_t)Wire.read() | ((uint16_t)Wire.read() << 8);
+}
+// Read STM32 calibrated axis value (int16_t LE). Call with Wire on HAT.
+//   reg 0x10 → calibrated vertical (PA.2), push-UP = negative
+//   reg 0x12 → calibrated horizontal (PA.1), push-RIGHT = positive
+// Range: ±512 after STM32 midpoint compensation.
+static int16_t miniJoyCReadCal(uint8_t reg) {
+  Wire.beginTransmission(MINIJOYC_ADDR);
+  Wire.write(reg);
+  Wire.endTransmission();
+  Wire.requestFrom((uint8_t)MINIJOYC_ADDR, (uint8_t)2);
+  uint8_t lo = Wire.read(), hi = Wire.read();
+  return (int16_t)((uint16_t)lo | ((uint16_t)hi << 8));
+}
+// Write current joystick center to STM32 flash (regs 0x58/0x5A = x_mid/y_mid).
+// Averages 30 raw ADC samples. Call with Wire already on HAT pins.
+static void miniJoyCCalibrateHW() {
+  int32_t sv = 0, sh = 0;
+  for (int i = 0; i < 30; i++) {
+    sv += (int32_t)miniJoyCReadADC(0x00);  // PA.2 vertical
+    sh += (int32_t)miniJoyCReadADC(0x02);  // PA.1 horizontal
+    delay(5);
+  }
+  uint16_t vmid = (uint16_t)(sv / 30);
+  uint16_t hmid = (uint16_t)(sh / 30);
+  // Reg 0x58-0x59 = x_mid (PA.2 vertical midpoint, uint16_t LE)
+  uint8_t vbuf[2] = { (uint8_t)(vmid & 0xff), (uint8_t)(vmid >> 8) };
+  miniJoyCWriteReg(0x58, vbuf, 2);
+  // Reg 0x5A-0x5B = y_mid (PA.1 horizontal midpoint, uint16_t LE)
+  uint8_t hbuf[2] = { (uint8_t)(hmid & 0xff), (uint8_t)(hmid >> 8) };
+  miniJoyCWriteReg(0x5A, hbuf, 2);
+  zero_x = (int)vmid;  // repurpose zero_x/zero_y to display last cal result in settings
+  zero_y = (int)hmid;
+  calibrationComplete = true;
+}
+
 // ----------------------------------------------------------------
 // Navigation
 // ----------------------------------------------------------------
@@ -932,6 +1075,14 @@ void loadSettings() {
   sleepTimeoutIdx = p.getUChar("sleepTO",  0);
   lowBatIdx       = p.getUChar("lowBat",   0);
   uiClickEnabled  = p.getBool ("uiClick",  true);
+  ctrlDeadzoneIdx = p.getUChar("ctrlDZ",   1);
+  ctrlSwapXY      = p.getBool ("ctrlSXY",  false);
+  ctrlInvertX     = p.getBool ("ctrlIX",   false);
+  ctrlInvertY     = p.getBool ("ctrlIY",   false);
+  seesawMountIdx = constrain((int)p.getUChar("ssMount", SS_STICK_SIDE), 0, SEESAW_MOUNT_COUNT - 1);
+  remoteTransportIdx = constrain((int)p.getUChar("txLink", 0), 0, REMOTE_TX_COUNT - 1);
+  dualPrimaryMiniJoyC = p.getBool("dualPriMJC", true);
+  hidGamepadEnabled   = p.getBool("hidPad", false);
   p.end();
 }
 
@@ -961,6 +1112,14 @@ void saveSettings() {
   p.putUChar("sleepTO", (uint8_t)sleepTimeoutIdx);
   p.putUChar("lowBat",  (uint8_t)lowBatIdx);
   p.putBool ("uiClick", uiClickEnabled);
+  p.putUChar("ctrlDZ",  (uint8_t)ctrlDeadzoneIdx);
+  p.putBool ("ctrlSXY", ctrlSwapXY);
+  p.putBool ("ctrlIX",  ctrlInvertX);
+  p.putBool ("ctrlIY",  ctrlInvertY);
+  p.putUChar("ssMount", (uint8_t)seesawMountIdx);
+  p.putUChar("txLink",  (uint8_t)remoteTransportIdx);
+  p.putBool ("dualPriMJC", dualPrimaryMiniJoyC);
+  p.putBool ("hidPad", hidGamepadEnabled);
   p.end();
 }
 
@@ -989,6 +1148,7 @@ void loadConfig() {
   gmtOffset_sec      = doc["gmt_offset"]  | 10800L;
   daylightOffset_sec = doc["dst_offset"]  | 0;
   udpPort            = doc["udp_port"]    | 8889;
+  tcpPort            = doc["tcp_port"]    | 8890;
   strlcpy(targetIpAddress, doc["robot_ip"] | "192.168.1.27",  sizeof(targetIpAddress));
 }
 
@@ -1000,6 +1160,7 @@ void saveConfig() {
   doc["gmt_offset"] = gmtOffset_sec;
   doc["dst_offset"] = daylightOffset_sec;
   doc["udp_port"]   = udpPort;
+  doc["tcp_port"]   = tcpPort;
   doc["robot_ip"]   = targetIpAddress;
   File f = LittleFS.open("/config.json", "w");
   if (f) { serializeJson(doc, f); f.close(); }
@@ -1111,6 +1272,16 @@ void setup() {
   if (joystickAvailable) splashLog("> Joystick: found", COLOR_GREEN);
   else                   splashLog("> Joystick: not found", COLOR_GRAY);
 
+  // Probe Mini JoyC HAT on HAT bus (SDA=GPIO6, SCL=GPIO7, I2C addr 0x54).
+  // The module has its own battery; no Grove power needed.
+  miniJoyCWireHat();
+  Wire.beginTransmission(MINIJOYC_ADDR);
+  byte miniJoyCProbeErr = Wire.endTransmission();
+  miniJoyCWireRestore();
+  miniJoyCAvailable = (miniJoyCProbeErr == 0);
+  if (miniJoyCAvailable) splashLog("> MiniJoyC: found", COLOR_GREEN);
+  else                   splashLog("> MiniJoyC: not found", COLOR_GRAY);
+
   // Probe RFID2 unit on GROVE PORT.CUSTOM (SDA=GPIO5, SCL=GPIO4, I2C addr 0x28)
   // Wire is on GPIO 10/8 here — use it to enable GROVE power via I2C expander first,
   // then briefly switch Wire to GPIO 5/4 for the I2C probe, then restore.
@@ -1129,6 +1300,7 @@ void setup() {
     snprintf(rfidMsg, sizeof(rfidMsg), "> RFID2: not found (I2C err %d)", rfidProbeErr);
     splashLog(rfidMsg, COLOR_GRAY);
   }
+
   digitalWrite(GROVE_POWER_EN, LOW);
 
   if (LittleFS.begin(true)) {
@@ -1449,6 +1621,8 @@ static void transformTouch(int16_t& tx, int16_t& ty) {
 // Forward declarations
 void onTap(int16_t sx, int16_t sy);
 void onSwipe(int16_t dx, int16_t dy);
+void renderControllerSettings();
+void handleControllerSettingsTap(int16_t sx, int16_t sy);
 
 void checkTouch(unsigned long msNow) {
   if (!touchReady) return;
@@ -1620,6 +1794,8 @@ void onTap(int16_t sx, int16_t sy) {
     handleIRSettingsTap(sx, sy);
   } else if (navState == NAV_SETTINGS && currentFunction == FUNCTION_RFID2) {
     handleRFID2SettingsTap(sx, sy);
+  } else if (navState == NAV_SETTINGS && currentFunction == FUNCTION_CONTROLLER) {
+    handleControllerSettingsTap(sx, sy);
   } else if (currentFunction == FUNCTION_BT && navState == NAV_NORMAL) {
     if (btSelectedAddr[0] != '\0') {
       btSelectedAddr[0] = '\0';   // tap in detail view → back to list
@@ -2019,16 +2195,17 @@ void onSwipe(int16_t dx, int16_t dy) {
         (currentFunction == FUNCTION_LORA || currentFunction == FUNCTION_BT ||
          currentFunction == FUNCTION_WIFI  || currentFunction == FUNCTION_BATTERY ||
          currentFunction == FUNCTION_RF433 || currentFunction == FUNCTION_IR  ||
-         currentFunction == FUNCTION_RFID2)) {
+         currentFunction == FUNCTION_RFID2 || currentFunction == FUNCTION_CONTROLLER)) {
       // Move the cursor — the render function will update settingsScrollOffset to track it
       int maxCursor;
-      if      (currentFunction == FUNCTION_WIFI)    maxCursor = 2;  // 3 items
-      else if (currentFunction == FUNCTION_LORA)    maxCursor = 4;  // 5 items
-      else if (currentFunction == FUNCTION_BT)      maxCursor = 5;  // 6 items
-      else if (currentFunction == FUNCTION_RF433)   maxCursor = 6;  // 7 items
-      else if (currentFunction == FUNCTION_IR)      maxCursor = 6;  // 7 items
-      else if (currentFunction == FUNCTION_RFID2)   maxCursor = 5;  // 6 items
-      else /* BATTERY */                            maxCursor = 7;  // 8 items
+      if      (currentFunction == FUNCTION_WIFI)       maxCursor = 2;
+      else if (currentFunction == FUNCTION_LORA)       maxCursor = 4;
+      else if (currentFunction == FUNCTION_BT)         maxCursor = 5;
+      else if (currentFunction == FUNCTION_RF433)      maxCursor = 6;
+      else if (currentFunction == FUNCTION_IR)         maxCursor = 6;
+      else if (currentFunction == FUNCTION_RFID2)      maxCursor = 5;
+      else if (currentFunction == FUNCTION_CONTROLLER) maxCursor = controllerSettingsItemCount() - 1;
+      else /* BATTERY */                               maxCursor = 7;
       if (dy < 0) settingsCursor = min(settingsCursor + 1, maxCursor);
       else        settingsCursor = max(settingsCursor - 1, 0);
     } else if (currentFunction == FUNCTION_MEDIA && navState == NAV_NORMAL) {
@@ -2135,8 +2312,8 @@ void onKey1Short() {
   if (navState == NAV_NORMAL) {
     do {
       currentFunction = static_cast<MainFunctions>((currentFunction + 1) % mainFunctionCount);
-    } while ((currentFunction == FUNCTION_CONTROLLER && !joystickAvailable) ||
-             (currentFunction == FUNCTION_RF433      && !rf433Enabled)     ||
+    } while ((currentFunction == FUNCTION_CONTROLLER && !joystickAvailable && !miniJoyCAvailable) ||
+             (currentFunction == FUNCTION_RF433      && !rf433Enabled)                           ||
              (currentFunction == FUNCTION_RFID2      && !rfid2Available));
     debugln("KEY1 short: next function");
   } else if (navState == NAV_SETTINGS) {
@@ -2347,6 +2524,36 @@ void onKey1Short() {
           break;
         // case 5 = RESET — handled above
       }
+    } else if (currentFunction == FUNCTION_CONTROLLER) {
+      bool hasMJC = miniJoyCAvailable;  // Mini JoyC present (alone or in dual)
+      switch (settingsCursor) {
+        case 0:  // CALIBRATE — Mini JoyC HW cal if present, else seesaw lazy recal
+          if (hasMJC) {
+            miniJoyCWireHat();
+            miniJoyCCalibrateHW();  // averages 30 samples, writes x_mid/y_mid to STM32 flash
+            miniJoyCWireRestore();
+          } else {
+            calibrationComplete = false;  // seesaw: re-trigger lazy calibration
+          }
+          navState = NAV_NORMAL;
+          break;
+        case 1:  // DEADZONE — cycle values (Mini JoyC only)
+          if (hasMJC) ctrlDeadzoneIdx = (ctrlDeadzoneIdx + 1) % CTRL_DEADZONE_COUNT;
+          break;
+        case 2: ctrlSwapXY  = !ctrlSwapXY;  break;
+        case 3: ctrlInvertX = !ctrlInvertX;  break;
+        case 4: ctrlInvertY = !ctrlInvertY;  break;
+        case 5:  // TX LINK — cycle WiFi-UDP / BLE / WiFi-TCP / LoRa
+          if (remoteTransportIdx == TX_WIFI_TCP) tcpClient.stop();
+          remoteTransportIdx = (remoteTransportIdx + 1) % REMOTE_TX_COUNT;
+          break;
+        case 6:  // MOUNT — cycle stick mount (seesaw present)
+          seesawMountIdx = (seesawMountIdx + 1) % SEESAW_MOUNT_COUNT;
+          break;
+        case 7:  // PRIMARY — which stick drives (dual mode only)
+          dualPrimaryMiniJoyC = !dualPrimaryMiniJoyC;
+          break;
+      }
     }
   }
 }
@@ -2357,8 +2564,8 @@ void onKey2Short() {
   if (navState == NAV_NORMAL) {
     do {
       currentFunction = static_cast<MainFunctions>((currentFunction - 1 + mainFunctionCount) % mainFunctionCount);
-    } while ((currentFunction == FUNCTION_CONTROLLER && !joystickAvailable) ||
-             (currentFunction == FUNCTION_RF433      && !rf433Enabled)     ||
+    } while ((currentFunction == FUNCTION_CONTROLLER && !joystickAvailable && !miniJoyCAvailable) ||
+             (currentFunction == FUNCTION_RF433      && !rf433Enabled)                           ||
              (currentFunction == FUNCTION_RFID2      && !rfid2Available));
     debugln("KEY2 short: prev function");
   } else if (navState == NAV_SETTINGS) {
@@ -2376,6 +2583,9 @@ void onKey2Short() {
       settingsCursor = (settingsCursor + 1) % 7;  // NEW / SELECT / DEL REMOTE / CAPTURE / AUTO / DELETE / RESET
     else if (currentFunction == FUNCTION_RFID2)
       settingsCursor = (settingsCursor + 1) % 6;  // NEW FILE / SELECT FILE / DEL FILE / RECORD / DELETE CARD / RESET
+    else if (currentFunction == FUNCTION_CONTROLLER)
+      // CALIBRATE / DEADZONE / SWAP XY / INVERT X / INVERT Y / TX LINK (+ PRIMARY in dual)
+      settingsCursor = (settingsCursor + 1) % controllerSettingsItemCount();
   }
 }
 
@@ -2388,10 +2598,10 @@ void onKey1Long() {
     return;
   }
   if (navState == NAV_NORMAL) {
-    if (currentFunction == FUNCTION_LORA || currentFunction == FUNCTION_BT ||
-        currentFunction == FUNCTION_WIFI  || currentFunction == FUNCTION_BATTERY ||
-        currentFunction == FUNCTION_RF433 || currentFunction == FUNCTION_IR  ||
-        currentFunction == FUNCTION_RFID2) {
+    if (currentFunction == FUNCTION_LORA       || currentFunction == FUNCTION_BT         ||
+        currentFunction == FUNCTION_WIFI        || currentFunction == FUNCTION_BATTERY    ||
+        currentFunction == FUNCTION_RF433       || currentFunction == FUNCTION_IR         ||
+        currentFunction == FUNCTION_RFID2       || currentFunction == FUNCTION_CONTROLLER) {
       navState             = NAV_SETTINGS;
       settingsCursor       = 0;
       settingsScrollOffset = 0;
@@ -2402,6 +2612,7 @@ void onKey1Long() {
     else if (currentFunction == FUNCTION_LORA) applyLoraSettings();
     else if (currentFunction == FUNCTION_BT) applyBTSettings();
     else if (currentFunction == FUNCTION_BATTERY) applyDeviceSettings();
+    else if (currentFunction == FUNCTION_CONTROLLER) saveSettings();
     // RF433 / RFID2: no persistent settings to apply, just close
     navState = NAV_NORMAL;
     // No lastFunction = -1 here: sprite-based screens redraw every frame already.
@@ -2484,8 +2695,19 @@ static void printHelpNav() {
   serialWritelnAll("Information:");
   serialWritelnAll("  clock                 time and date (NTP UTC+3)");
   serialWritelnAll("  battery               voltage, level, charge status, uptime");
-  serialWritelnAll("  controller            joystick position and last motor values [Adafruit Gamepad QT]");
+  serialWritelnAll("  controller            joystick position and last motor values");
   serialWritelnAll("  send <L> <R>          transmit motor command  (-255..255)");
+  serialWritelnAll("Controller settings:");
+  serialWritelnAll("  ctrl                  show axis settings");
+  serialWritelnAll("  ctrl invertx on|off   invert X axis (turn)");
+  serialWritelnAll("  ctrl inverty on|off   invert Y axis (forward/back)");
+  serialWritelnAll("  ctrl swap on|off      swap X/Y axes");
+  serialWritelnAll("  ctrl dz 0-3           deadzone index (0=8 1=16 2=30 3=50) [Mini JoyC only]");
+  serialWritelnAll("  ctrl calibrate        write joystick center to STM32 flash [Mini JoyC only]");
+  serialWritelnAll("  ctrl link <type>      remote TX link: udp|ble|tcp|lora");
+  serialWritelnAll("  ctrl primary joyc|pad which stick drives when both connected (dual-stick)");
+  serialWritelnAll("  ctrl ssmount 0-3      seesaw mount: 0=side 1=back (attached) 2=detport 3=detland (detached)");
+  serialWritelnAll("  ctrl hid on|off       act as a standard BLE HID gamepad (PC/Android); reboot to apply");
 }
 
 static void printHelpWifi() {
@@ -2617,12 +2839,21 @@ void serialPrintFunctionHelp(int fn) {
         LOW_BAT_LABELS[lowBatIdx]);
       serialWritelnAll(buf);
       break;
-    case FUNCTION_CONTROLLER:
+    case FUNCTION_CONTROLLER: {
+      bool isMJC = miniJoyCAvailable && !joystickAvailable;
       snprintf(buf, sizeof(buf),
-        "[CONTROLLER] WiFi:%s | send <L> <R>  (-255..255)",
-        WiFi.isConnected() ? "CONNECTED" : "off");
+        "[CONTROLLER] device:%s  invertx:%s  inverty:%s  swap:%s  dz:%d  link:%s  WiFi:%s",
+        isMJC ? "minijoyc" : (joystickAvailable ? "seesaw" : "none"),
+        ctrlInvertX ? "ON" : "off",
+        ctrlInvertY ? "ON" : "off",
+        ctrlSwapXY  ? "ON" : "off",
+        isMJC ? CTRL_DEADZONE_VALS[ctrlDeadzoneIdx] : 0,
+        REMOTE_TX_LABELS[remoteTransportIdx],
+        WiFi.isConnected() ? "ok" : "off");
       serialWritelnAll(buf);
+      serialWritelnAll("  ctrl invertx|inverty|swap on|off | ctrl dz 0-3 | ctrl link udp|ble|tcp|lora | ctrl calibrate | send <L> <R>");
       break;
+    }
     case FUNCTION_IR: {
       snprintf(buf, sizeof(buf),
         "[IR] files:%d  loaded:%s  level:%s",
@@ -3663,6 +3894,103 @@ void serialHandleMusic(const char* arg) {
   }
 }
 
+void serialHandleController(const char* arg) {
+  bool isMJC = miniJoyCAvailable && !joystickAvailable;
+  bool dual  = joystickAvailable && miniJoyCAvailable;
+  if (!*arg) {
+    char buf[220];
+    const char* dev = dual ? "dual" : (isMJC ? "minijoyc" : (joystickAvailable ? "seesaw" : "none"));
+    char ssSeg[28] = "";
+    if (joystickAvailable) snprintf(ssSeg, sizeof(ssSeg), "  ssmount:%s", SEESAW_MOUNT_LABELS[seesawMountIdx]);
+    snprintf(buf, sizeof(buf),
+      "[CTRL] device:%s  invertx:%s  inverty:%s  swap:%s  dz:%d  link:%s%s%s",
+      dev,
+      ctrlInvertX ? "ON" : "off",
+      ctrlInvertY ? "ON" : "off",
+      ctrlSwapXY  ? "ON" : "off",
+      miniJoyCAvailable ? CTRL_DEADZONE_VALS[ctrlDeadzoneIdx] : 0,
+      REMOTE_TX_LABELS[remoteTransportIdx],
+      ssSeg,
+      dual ? (dualPrimaryMiniJoyC ? "  primary:joyc" : "  primary:pad") : "");
+    serialWritelnAll(buf);
+    if (hidGamepadEnabled)
+      serialWritelnAll("  HID gamepad mode: ON (BLE standard controller; reboot with BT to activate)");
+    return;
+  }
+  if (cmdIs(arg,"invertx")) {
+    const char* v = cmdArg(arg,"invertx");
+    if      (strcasecmp(v,"on") ==0) ctrlInvertX = true;
+    else if (strcasecmp(v,"off")==0) ctrlInvertX = false;
+    else { serialWritelnAll("Usage: ctrl invertx on|off"); return; }
+    saveSettings(); serialHandleController("");
+  } else if (cmdIs(arg,"inverty")) {
+    const char* v = cmdArg(arg,"inverty");
+    if      (strcasecmp(v,"on") ==0) ctrlInvertY = true;
+    else if (strcasecmp(v,"off")==0) ctrlInvertY = false;
+    else { serialWritelnAll("Usage: ctrl inverty on|off"); return; }
+    saveSettings(); serialHandleController("");
+  } else if (cmdIs(arg,"swap")) {
+    const char* v = cmdArg(arg,"swap");
+    if      (strcasecmp(v,"on") ==0) ctrlSwapXY = true;
+    else if (strcasecmp(v,"off")==0) ctrlSwapXY = false;
+    else { serialWritelnAll("Usage: ctrl swap on|off"); return; }
+    saveSettings(); serialHandleController("");
+  } else if (cmdIs(arg,"dz")) {
+    if (!miniJoyCAvailable) { serialWritelnAll("Deadzone applies to Mini JoyC only."); return; }
+    int idx = atoi(cmdArg(arg,"dz"));
+    if (idx < 0 || idx >= CTRL_DEADZONE_COUNT) {
+      char buf[60];
+      snprintf(buf, sizeof(buf), "Usage: ctrl dz 0-%d  (values: 8 16 30 50)", CTRL_DEADZONE_COUNT-1);
+      serialWritelnAll(buf); return;
+    }
+    ctrlDeadzoneIdx = idx;
+    saveSettings(); serialHandleController("");
+  } else if (cmdIs(arg,"calibrate")) {
+    if (!miniJoyCAvailable) { serialWritelnAll("Calibrate applies to Mini JoyC only."); return; }
+    miniJoyCWireHat();
+    miniJoyCCalibrateHW();
+    miniJoyCWireRestore();
+    serialWritelnAll("[CTRL] Mini JoyC calibrated.");
+  } else if (cmdIs(arg,"link")) {
+    const char* v = cmdArg(arg,"link");
+    int idx = -1;
+    if      (strcasecmp(v,"udp") ==0) idx = TX_WIFI_UDP;
+    else if (strcasecmp(v,"ble") ==0) idx = TX_BLE;
+    else if (strcasecmp(v,"tcp") ==0) idx = TX_WIFI_TCP;
+    else if (strcasecmp(v,"lora")==0) idx = TX_LORA;
+    if (idx < 0) { serialWritelnAll("Usage: ctrl link udp|ble|tcp|lora"); return; }
+    if (idx == TX_WIFI_TCP) tcpClient.stop();  // drop any stale connection on switch
+    remoteTransportIdx = idx;
+    saveSettings(); serialHandleController("");
+  } else if (cmdIs(arg,"primary")) {
+    const char* v = cmdArg(arg,"primary");
+    if      (strcasecmp(v,"joyc")==0 || strcasecmp(v,"minijoyc")==0) dualPrimaryMiniJoyC = true;
+    else if (strcasecmp(v,"pad") ==0 || strcasecmp(v,"seesaw")  ==0) dualPrimaryMiniJoyC = false;
+    else { serialWritelnAll("Usage: ctrl primary joyc|pad  (which stick drives in dual mode)"); return; }
+    saveSettings(); serialHandleController("");
+  } else if (cmdIs(arg,"ssmount")) {
+    const char* v = cmdArg(arg,"ssmount");
+    int idx = -1;
+    if      (strcasecmp(v,"side")   ==0 || strcasecmp(v,"0")==0) idx = SS_STICK_SIDE;
+    else if (strcasecmp(v,"back")   ==0 || strcasecmp(v,"1")==0) idx = SS_STICK_BACK;
+    else if (strcasecmp(v,"detport")==0 || strcasecmp(v,"2")==0) idx = SS_DETACHED_PORTRAIT;
+    else if (strcasecmp(v,"detland")==0 || strcasecmp(v,"3")==0) idx = SS_DETACHED_LANDSCAPE;
+    if (idx < 0) { serialWritelnAll("Usage: ctrl ssmount 0-3  (0=side 1=back 2=detport 3=detland)"); return; }
+    seesawMountIdx = idx;
+    saveSettings(); serialHandleController("");
+  } else if (cmdIs(arg,"hid")) {
+    const char* v = cmdArg(arg,"hid");
+    if      (strcasecmp(v,"on") ==0) hidGamepadEnabled = true;
+    else if (strcasecmp(v,"off")==0) hidGamepadEnabled = false;
+    else { serialWritelnAll("Usage: ctrl hid on|off  (BLE HID gamepad mode — reboot to apply)"); return; }
+    saveSettings();
+    serialWritelnAll("[CTRL] HID gamepad mode saved. Reboot with BT started to (de)activate.");
+    serialHandleController("");
+  } else {
+    serialWritelnAll("ctrl subcommands: invertx|inverty|swap on|off  dz 0-3  calibrate  link udp|ble|tcp|lora  primary joyc|pad  ssmount 0-3  hid on|off");
+  }
+}
+
 // ── Dispatcher ────────────────────────────────────────────────────
 
 void serialHandleCommand(const char* raw) {
@@ -3690,6 +4018,7 @@ void serialHandleCommand(const char* raw) {
   else if (cmdIs(raw,"fs"))    serialHandleFS(cmdArg(raw,"fs"));
   else if (cmdIs(raw,"bt"))    serialHandleBT(cmdArg(raw,"bt"));
   else if (cmdIs(raw,"wifi"))  serialHandleWiFi(cmdArg(raw,"wifi"));
+  else if (cmdIs(raw,"ctrl"))   serialHandleController(cmdArg(raw,"ctrl"));
   else if (cmdIs(raw,"ir"))     serialHandleIR(cmdArg(raw,"ir"));
   else if (cmdIs(raw,"rf433")) serialHandleRF433(cmdArg(raw,"rf433"));
   else if (cmdIs(raw,"lora"))  serialHandleLora(cmdArg(raw,"lora"));
@@ -3773,6 +4102,13 @@ void renderFunction() {
     if (!rf433LearnMode && !irLearnMode)
       digitalWrite(GROVE_POWER_EN, LOW);
   }
+  if (lastFunction == (int)FUNCTION_CONTROLLER && currentFunction != FUNCTION_CONTROLLER
+      && miniJoyCAvailable) {
+    miniJoyCWireHat();
+    miniJoyCSetLED(0x000000);  // LED off when leaving controller screen
+    miniJoyCWireRestore();
+    miniJoyCLedColor = 0;  // force re-send on next entry
+  }
 
   if (lastFunction != (int)currentFunction)
     display.fillScreen(0x0000);  // blank on every function/orientation transition
@@ -3850,16 +4186,20 @@ void renderFunction() {
         initController();
         initGamePad();
       }
-      renderController();
-      statusSprite.pushSprite(0, SPRITE_Y);
-
-      if (millis() - previousMillis >= 100) {
-        previousMillis = millis();
-        readGamePad();
-      }
-      if (millis() - previousMillisButtons >= 300) {
-        previousMillisButtons = millis();
-        readGamePadButtons();
+      if (navState == NAV_SETTINGS) {
+        renderControllerSettings();
+        statusSprite.pushSprite(0, SPRITE_Y);
+      } else {
+        renderController();
+        statusSprite.pushSprite(0, SPRITE_Y);
+        if (millis() - previousMillis >= 100) {
+          previousMillis = millis();
+          readGamePad();
+        }
+        if (millis() - previousMillisButtons >= 300) {
+          previousMillisButtons = millis();
+          readGamePadButtons();
+        }
       }
       break;
 
@@ -4603,6 +4943,93 @@ static void drawGamepadBtn(int x, int y, const char* label, bool pressed) {
   statusSprite.drawString(label, x, y);
 }
 
+// Draw one stick visualisation disc + dot. valFwd→vertical (up=fwd), valTurn→horizontal.
+// Values are in ±515 units. label (optional) is drawn under the disc.
+static void drawStickViz(int cx, int cy, int r, int16_t valFwd, int16_t valTurn, const char* label) {
+  statusSprite.fillCircle(cx, cy, r,     display.color565(18, 18, 18));
+  statusSprite.drawCircle(cx, cy, r,     COLOR_TEAL);
+  statusSprite.drawCircle(cx, cy, r - 1, display.color565(0, 30, 30));
+  statusSprite.drawFastHLine(cx - r + 5, cy, (r - 5) * 2, display.color565(35, 35, 35));
+  statusSprite.drawFastVLine(cx, cy - r + 5, (r - 5) * 2, display.color565(35, 35, 35));
+
+  int maxR = r - 6;
+  int dotX = cx + (int)((long)valTurn * maxR / 515);
+  int dotY = cy - (int)((long)valFwd  * maxR / 515);
+  float ddx = dotX - cx, ddy = dotY - cy, dd = sqrtf(ddx * ddx + ddy * ddy);
+  if (dd > maxR) { dotX = cx + (int)(ddx * maxR / dd); dotY = cy + (int)(ddy * maxR / dd); }
+  statusSprite.fillCircle(dotX, dotY, r > 28 ? 6 : 4, COLOR_ORANGE);
+
+  if (label && *label) {
+    statusSprite.setTextDatum(TC_DATUM);
+    statusSprite.setTextSize(1);
+    statusSprite.setTextColor(display.color565(0, 160, 210));
+    statusSprite.drawString(label, cx, cy + r + 2);
+  }
+}
+
+// Dual-stick view: drive + aux discs side by side (both orientations), info strip below.
+static void renderControllerDual(int sw, int sh, bool isLandscape) {
+  const char* drvName = dualPrimaryMiniJoyC ? "JOYC" : "PAD";
+  const char* auxName = dualPrimaryMiniJoyC ? "PAD"  : "JOYC";
+
+  // Side-by-side discs: drive at the left quarter, aux at the right quarter.
+  int r   = isLandscape ? 24 : constrain(sw / 4 - 8, 16, 30);
+  int cy  = r + (isLandscape ? 6 : 12);
+  int dcx = sw / 4, acx = sw - sw / 4;
+  drawStickViz(dcx, cy, r, joyDisplayX,  joyDisplayY,  drvName);
+  drawStickViz(acx, cy, r, aux2DisplayX, aux2DisplayY, auxName);
+
+  const int dead = 15;
+  const char* actionStr =
+    (joyDisplayX >  dead) ? "FORWARD"    :
+    (joyDisplayX < -dead) ? "REVERSE"    :
+    (joyDisplayY >  dead) ? "ROTATE CW"  :
+    (joyDisplayY < -dead) ? "ROTATE CCW" : "STOP";
+
+  bool bSel = !(gamepadButtons & (1UL << BUTTON_SELECT));
+  bool bSta = !(gamepadButtons & (1UL << BUTTON_START));
+
+  // Info strip below the discs (both orientations)
+  int iy = cy + r + (isLandscape ? 12 : 18);
+  statusSprite.drawFastHLine(8, iy - 4, sw - 16, COLOR_GRAY);
+  statusSprite.setTextDatum(TC_DATUM);
+  statusSprite.setTextSize(2);
+  statusSprite.setTextColor(COLOR_WHITE);
+  statusSprite.drawString(actionStr, sw / 2, iy);
+
+  statusSprite.setTextSize(1);
+  statusSprite.setTextColor(COLOR_TEAL);
+  char m[12];
+  statusSprite.setTextDatum(TL_DATUM);
+  sprintf(m, "L %4d", transmitCmd.leftMotor);
+  statusSprite.drawString(m, 10, iy + 20);
+  statusSprite.setTextDatum(TR_DATUM);
+  sprintf(m, "R %4d", transmitCmd.rightMotor);
+  statusSprite.drawString(m, sw - 10, iy + 20);
+
+  if (isLandscape) {
+    // Short height — just the SEL/STA + JoyC button row at the bottom.
+    int by = sh - 11;
+    drawGamepadBtn(sw / 2 - 30, by, "SEL", bSel);
+    drawGamepadBtn(sw / 2,      by, "STA", bSta);
+    drawGamepadBtn(sw / 2 + 30, by, "BTN", miniJoyCBtn);
+  } else {
+    bool bY = !(gamepadButtons & (1UL << BUTTON_Y));
+    bool bX = !(gamepadButtons & (1UL << BUTTON_X));
+    bool bA = !(gamepadButtons & (1UL << BUTTON_A));
+    bool bB = !(gamepadButtons & (1UL << BUTTON_B));
+    int btnY0 = iy + 40;
+    drawGamepadBtn(sw / 2 - 30, btnY0, "SEL", bSel);
+    drawGamepadBtn(sw / 2,      btnY0, "STA", bSta);
+    drawGamepadBtn(sw / 2 + 30, btnY0, "BTN", miniJoyCBtn);
+    int bdx = sw / 2, bdy = btnY0 + 36;
+    drawGamepadBtn(bdx,      bdy - 22, "Y", bY);
+    drawGamepadBtn(bdx - 22, bdy,      "X", bX);
+    drawGamepadBtn(bdx + 22, bdy,      "A", bA);
+    drawGamepadBtn(bdx,      bdy,      "B", bB);
+  }
+}
+
 void renderController() {
   int sw = statusSprite.width();
   int sh = statusSprite.height();
@@ -4610,6 +5037,8 @@ void renderController() {
 
   statusSprite.fillSprite(COLOR_BLACK);
   statusSprite.setFont(&fonts::Font0);
+
+  if (joystickAvailable && miniJoyCAvailable) { renderControllerDual(sw, sh, isLandscape); return; }
 
   // Joystick visualisation circle
   const int VIZ_R = 36;
@@ -4657,6 +5086,8 @@ void renderController() {
 
   uint16_t connColor = controllerConnected ? COLOR_GREEN : COLOR_RED;
 
+  bool isMiniJoyC = miniJoyCAvailable && !joystickAvailable;
+
   if (isLandscape) {
     // Info panel to the right of the joystick circle
     int ix = jcx + VIZ_R + 14;
@@ -4665,9 +5096,10 @@ void renderController() {
 
     statusSprite.setTextSize(1);
     statusSprite.setTextColor(connColor);
-    statusSprite.drawString(controllerConnected ? "CONNECTED" : "NO GAMEPAD", ix, 8);
+    const char* srcLabel = isMiniJoyC ? (controllerConnected ? "MINIJOYC" : "NO MINIJOYC")
+                                      : (controllerConnected ? "CONNECTED" : "NO GAMEPAD");
+    statusSprite.drawString(srcLabel, ix, 8);
 
-    // Divider
     statusSprite.drawFastHLine(ix, 22, sw - ix - 4, COLOR_GRAY);
 
     statusSprite.setTextSize(2);
@@ -4683,23 +5115,23 @@ void renderController() {
     sprintf(motorStr, "R %4d", transmitCmd.rightMotor);
     statusSprite.drawString(motorStr, ix, 74);
 
-    // Face buttons: SEL / STA on left side, Y/X/A/B diamond on right
-    bool bSel = !(gamepadButtons & (1UL << BUTTON_SELECT));
-    bool bSta = !(gamepadButtons & (1UL << BUTTON_START));
-    bool bY   = !(gamepadButtons & (1UL << BUTTON_Y));
-    bool bX   = !(gamepadButtons & (1UL << BUTTON_X));
-    bool bA   = !(gamepadButtons & (1UL << BUTTON_A));
-    bool bB   = !(gamepadButtons & (1UL << BUTTON_B));
-
-    drawGamepadBtn(ix + 10, sh - 14, "SEL", bSel);
-    drawGamepadBtn(ix + 35, sh - 14, "STA", bSta);
-
-    // Diamond: Y=top, X=left, A=right, B=bottom
-    int dx = sw - 42, dy = sh - 14;
-    drawGamepadBtn(dx,      dy - 22, "Y", bY);
-    drawGamepadBtn(dx - 22, dy,      "X", bX);
-    drawGamepadBtn(dx + 22, dy,      "A", bA);
-    drawGamepadBtn(dx,      dy,      "B", bB);
+    if (isMiniJoyC) {
+      drawGamepadBtn(ix + sw / 2 - ix / 2 - 9, sh - 14, "BTN", miniJoyCBtn);
+    } else {
+      bool bSel = !(gamepadButtons & (1UL << BUTTON_SELECT));
+      bool bSta = !(gamepadButtons & (1UL << BUTTON_START));
+      bool bY   = !(gamepadButtons & (1UL << BUTTON_Y));
+      bool bX   = !(gamepadButtons & (1UL << BUTTON_X));
+      bool bA   = !(gamepadButtons & (1UL << BUTTON_A));
+      bool bB   = !(gamepadButtons & (1UL << BUTTON_B));
+      drawGamepadBtn(ix + 10, sh - 14, "SEL", bSel);
+      drawGamepadBtn(ix + 35, sh - 14, "STA", bSta);
+      int bdx = sw - 42, bdy = sh - 14;
+      drawGamepadBtn(bdx,      bdy - 22, "Y", bY);
+      drawGamepadBtn(bdx - 22, bdy,      "X", bX);
+      drawGamepadBtn(bdx + 22, bdy,      "A", bA);
+      drawGamepadBtn(bdx,      bdy,      "B", bB);
+    }
 
   } else {
     // Info panel below the joystick circle (portrait)
@@ -4712,7 +5144,9 @@ void renderController() {
 
     statusSprite.setTextSize(1);
     statusSprite.setTextColor(connColor);
-    statusSprite.drawString(controllerConnected ? "CONNECTED" : "NO GAMEPAD", sw / 2, iy);
+    const char* srcLabel = isMiniJoyC ? (controllerConnected ? "MINIJOYC" : "NO MINIJOYC")
+                                      : (controllerConnected ? "CONNECTED" : "NO GAMEPAD");
+    statusSprite.drawString(srcLabel, sw / 2, iy);
 
     statusSprite.setTextSize(2);
     statusSprite.setTextColor(COLOR_WHITE);
@@ -4728,30 +5162,52 @@ void renderController() {
     sprintf(motorStr, "R %4d", transmitCmd.rightMotor);
     statusSprite.drawString(motorStr, sw - 10, iy + 38);
 
-    // Face buttons: SEL / STA row, then Y/X/A/B diamond
-    bool bSel = !(gamepadButtons & (1UL << BUTTON_SELECT));
-    bool bSta = !(gamepadButtons & (1UL << BUTTON_START));
-    bool bY   = !(gamepadButtons & (1UL << BUTTON_Y));
-    bool bX   = !(gamepadButtons & (1UL << BUTTON_X));
-    bool bA   = !(gamepadButtons & (1UL << BUTTON_A));
-    bool bB   = !(gamepadButtons & (1UL << BUTTON_B));
-
-    int btnY0 = iy + 60;   // SEL/STA row
-    drawGamepadBtn(sw / 2 - 18, btnY0, "SEL", bSel);
-    drawGamepadBtn(sw / 2 + 18, btnY0, "STA", bSta);
-
-    // Diamond: Y=top, X=left, A=right, B=bottom
-    int dx = sw / 2, dy = btnY0 + 38;
-    drawGamepadBtn(dx,      dy - 22, "Y", bY);
-    drawGamepadBtn(dx - 22, dy,      "X", bX);
-    drawGamepadBtn(dx + 22, dy,      "A", bA);
-    drawGamepadBtn(dx,      dy,      "B", bB);
+    if (isMiniJoyC) {
+      drawGamepadBtn(sw / 2, iy + 66, "BTN", miniJoyCBtn);
+    } else {
+      bool bSel = !(gamepadButtons & (1UL << BUTTON_SELECT));
+      bool bSta = !(gamepadButtons & (1UL << BUTTON_START));
+      bool bY   = !(gamepadButtons & (1UL << BUTTON_Y));
+      bool bX   = !(gamepadButtons & (1UL << BUTTON_X));
+      bool bA   = !(gamepadButtons & (1UL << BUTTON_A));
+      bool bB   = !(gamepadButtons & (1UL << BUTTON_B));
+      int btnY0 = iy + 60;
+      drawGamepadBtn(sw / 2 - 18, btnY0, "SEL", bSel);
+      drawGamepadBtn(sw / 2 + 18, btnY0, "STA", bSta);
+      int bdx = sw / 2, bdy = btnY0 + 38;
+      drawGamepadBtn(bdx,      bdy - 22, "Y", bY);
+      drawGamepadBtn(bdx - 22, bdy,      "X", bX);
+      drawGamepadBtn(bdx + 22, bdy,      "A", bA);
+      drawGamepadBtn(bdx,      bdy,      "B", bB);
+    }
   }
 }
 
 void initGamePad() {
   controllerConnected = false;
-  if (!joystickAvailable) return;  // not detected at boot, skip init
+  calibrationComplete = false;
+
+  // Mini JoyC init (runs whenever present — including alongside the seesaw for dual-stick).
+  if (miniJoyCAvailable) {
+    miniJoyCWireHat();
+    Wire.beginTransmission(MINIJOYC_ADDR);
+    bool ok = (Wire.endTransmission() == 0);
+    if (ok) {
+      delay(30);  // let STM32 ADC settle
+      miniJoyCSetLED(0x000010);  // dim blue = ready
+    }
+    miniJoyCWireRestore();
+    controllerConnected = ok;
+    miniJoyCBtn = false;
+    if (!joystickAvailable) {
+      // Mini JoyC is the only stick — STM32 holds its own calibration.
+      calibrationComplete = false;
+      zero_x = 0; zero_y = 0;
+      return;
+    }
+  } else if (!joystickAvailable) {
+    return;  // no controller at all
+  }
 
   // seesaw was already probed successfully at boot; re-init to configure pins
   ss.begin(0x50);
@@ -4770,41 +5226,117 @@ void initGamePad() {
   controllerConnected = true;
 }
 
-void readGamePad() {
+// Read seesaw stick → powerx/powery (seesaw sign convention; lazy-calibrates center).
+static void readSeesawAxes(int16_t& px, int16_t& py) {
   float x = 0, y = 0;
   for (int s = 0; s < 4; s++) {
     x += 1023 - ss.analogRead(JOY1_X);
     y += 1023 - ss.analogRead(JOY1_Y);
     delay(10);
   }
-  x /= 4.0;
-  y /= 4.0;
-
-  debug("x: "); debug(x); debug(", "); debug("y: "); debugln(y);
-
+  x /= 4.0; y /= 4.0;
   if (!calibrationComplete) {
-    zero_x              = x;
-    zero_y              = y;
+    zero_x = (int)x; zero_y = (int)y;
     calibrationComplete = true;
-    debugln("Calibration complete!");
   }
+  px = (int16_t)(x - zero_x);
+  py = (int16_t)(y - zero_y);
+}
 
-  int16_t powerx = x - zero_x;
-  int16_t powery = y - zero_y;
+// Read Mini JoyC stick → powerx/powery (front-mount: vert used as-is, deadzoned, ±515).
+static void readMiniJoyCAxes(int16_t& px, int16_t& py) {
+  miniJoyCWireHat();
+  int vert  = (int)miniJoyCReadCal(0x10);   // calibrated vertical (PA.2)
+  int horiz = (int)miniJoyCReadCal(0x12);   // calibrated horizontal (PA.1)
+  miniJoyCWireRestore();
+  int dz = CTRL_DEADZONE_VALS[ctrlDeadzoneIdx];
+  if (vert  > -dz && vert  < dz) vert  = 0;
+  if (horiz > -dz && horiz < dz) horiz = 0;
+  px = (int16_t)constrain(horiz * 515 / 512, -515, 515);
+  py = (int16_t)constrain(vert  * 515 / 512, -515, 515);
+}
 
-  // Remap joystick axes to match device orientation so "forward" always means
-  // toward the top of the display, regardless of how the device is rotated.
-  int16_t rx, ry;
+// Apply the shared rotation table so stick axes are screen-relative.
+static void applyStickRotation(int16_t px, int16_t py, int16_t& rx, int16_t& ry) {
   switch (currentRotation) {
-    case 1:  rx =  powery; ry = -powerx; break;  // landscape right
-    case 2:  rx = -powerx; ry = -powery; break;  // portrait flipped
-    case 3:  rx = -powery; ry =  powerx; break;  // landscape left
-    default: rx =  powerx; ry =  powery; break;  // portrait normal
+    case 1:  rx =  py; ry = -px; break;  // landscape right
+    case 2:  rx = -px; ry = -py; break;  // portrait flipped
+    case 3:  rx = -py; ry =  px; break;  // landscape left
+    default: rx =  px; ry =  py; break;  // portrait normal
+  }
+}
+
+// Map raw seesaw axes into the stick's base frame per the selected mount.
+static void applySeesawOrient(int16_t px, int16_t py, int16_t& bx, int16_t& by) {
+  switch (seesawMountIdx) {
+    case SS_STICK_BACK:         bx =  px; by =  py; break;  // back-mount: X mirror of side
+    case SS_DETACHED_LANDSCAPE: bx =  py; by =  px; break;  // sideways grip: axes swapped
+    case SS_DETACHED_PORTRAIT:  bx = -px; by =  py; break;  // upright grip
+    case SS_STICK_SIDE:
+    default:                    bx = -px; by =  py; break;
+  }
+}
+
+// Attached mounts rotate with the device → reflect screen rotation. Detached mounts are
+// held independently → keep the stick's own frame (no device-rotation adaptation).
+static bool seesawAppliesRotation() {
+  return seesawMountIdx == SS_STICK_SIDE || seesawMountIdx == SS_STICK_BACK;
+}
+
+void readGamePad() {
+  bool haveS = joystickAvailable;
+  bool haveM = miniJoyCAvailable;
+
+  int16_t sPx = 0, sPy = 0, mPx = 0, mPy = 0;
+  if (haveS) readSeesawAxes(sPx, sPy);
+  if (haveM) readMiniJoyCAxes(mPx, mPy);
+
+  // Screen-relative axes per physical stick.
+  //  Mini JoyC: always rotation-adapts (front-mounted, needs it for portrait).
+  //  Seesaw:    base mount transform → then screen rotation only for ATTACHED mounts
+  //             (side/back). DETACHED mounts keep the stick's own frame (no rotation).
+  int16_t mRx = 0, mRy = 0, sRx = 0, sRy = 0;
+  if (haveM) applyStickRotation(mPx, mPy, mRx, mRy);
+  if (haveS) {
+    int16_t bx, by;
+    applySeesawOrient(sPx, sPy, bx, by);
+    if (seesawAppliesRotation()) applyStickRotation(bx, by, sRx, sRy);
+    else                         { sRx = bx; sRy = by; }
   }
 
-  // Store remapped values so the visualisation label and dot match commands
+  // Assign drive (primary) and aux (secondary) from the adapted axes.
+  int16_t rx, ry, arx = 0, ary = 0;
+  remoteHasAux = (haveS && haveM);
+  if (remoteHasAux) {
+    if (dualPrimaryMiniJoyC) { rx = mRx; ry = mRy; arx = sRx; ary = sRy; }
+    else                     { rx = sRx; ry = sRy; arx = mRx; ary = mRy; }
+  } else if (haveM)          { rx = mRx; ry = mRy; }
+  else if (haveS)            { rx = sRx; ry = sRy; }
+  else                       { remoteHasAux = false; return; }
+
+  // ── Drive stick: user flags (apply to whichever stick drives) → motor mix ──
+  if (ctrlInvertX) rx = -rx;
+  if (ctrlInvertY) ry = -ry;
+  if (ctrlSwapXY)  { int16_t t = rx; rx = ry; ry = t; }
   joyDisplayX = rx;
   joyDisplayY = ry;
+
+  // ── Aux stick (screen-relative, no drive flags) ──
+  if (remoteHasAux) {
+    aux2DisplayX = arx; aux2DisplayY = ary;
+    remoteAuxX   = arx; remoteAuxY   = ary;
+  } else {
+    aux2DisplayX = 0; aux2DisplayY = 0;
+    remoteAuxX   = 0; remoteAuxY   = 0;
+  }
+
+  // Standard BLE HID gamepad mode — report axes/buttons to the host instead of
+  // sending robot RemoteFrames. transmitCmd stays 0 (no motor mix needed).
+  if (hidGamepadEnabled) {
+    if (rx != 0 || ry != 0) resetActivity();
+    hidSendGamepad();
+    return;
+  }
 
   if (rx < 0) {
     resetActivity();
@@ -4828,24 +5360,176 @@ void readGamePad() {
 }
 
 void readGamePadButtons() {
-  uint32_t buttons = ss.digitalReadBulk(button_mask);
-  if (buttons != button_mask) resetActivity();  // any button pressed
-  gamepadButtons = buttons;  // snapshot for renderController()
-
-  if (!(buttons & (1UL << BUTTON_A))) debugln("Button A pressed");
-  if (!(buttons & (1UL << BUTTON_B))) debugln("Button B pressed");
-  if (!(buttons & (1UL << BUTTON_Y))) debugln("Button Y pressed");
-  if (!(buttons & (1UL << BUTTON_X))) debugln("Button X pressed");
-  if (!(buttons & (1UL << BUTTON_SELECT))) {
-    debugln("Button SELECT pressed");
-    if (WiFi.status() != WL_CONNECTED) connectToWiFi();
+  // Both stick button sources are read when present (dual-stick).
+  if (joystickAvailable) {
+    uint32_t buttons = ss.digitalReadBulk(button_mask);
+    if (buttons != button_mask) resetActivity();
+    gamepadButtons = buttons;
+    if (!(buttons & (1UL << BUTTON_SELECT))) {
+      debugln("Button SELECT pressed");
+      if (WiFi.status() != WL_CONNECTED) connectToWiFi();
+    }
+    if (!(buttons & (1UL << BUTTON_START))) {
+      debugln("Button START pressed");
+      if (WiFi.status() != WL_CONNECTED) connectToWiFi();
+    }
   }
-  if (!(buttons & (1UL << BUTTON_START))) {
-    debugln("Button START pressed");
-    if (WiFi.status() != WL_CONNECTED) connectToWiFi();
+  if (miniJoyCAvailable) {
+    miniJoyCWireHat();
+    bool pressed = (miniJoyCReadByte(0x30) == 0);
+    if (pressed && !miniJoyCBtn) {
+      resetActivity();
+      debugln("MiniJoyC button pressed");
+      if (WiFi.status() != WL_CONNECTED) connectToWiFi();
+    }
+    miniJoyCBtn = pressed;
+    // LED reflects connection state; orange when button held
+    uint32_t newLed = pressed ? 0x101000 : (controllerConnected ? 0x001000 : 0x0A0000);
+    if (newLed != miniJoyCLedColor) miniJoyCSetLED(newLed);
+    miniJoyCWireRestore();
   }
 }
 
+// ================================================================
+// FUNCTION_CONTROLLER — Settings screen
+// ================================================================
+
+// Base 6 items, + MOUNT when a seesaw is present, + PRIMARY in dual mode.
+// Order: CALIBRATE, DEADZONE, SWAP XY, INVERT X, INVERT Y, TX LINK, [MOUNT], [PRIMARY].
+// Centralized so render / tap / cursor-wrap / swipe-bound all agree, and so the fixed
+// case indices in onKey1Short stay valid (index 6 only reachable with seesaw, 7 with dual).
+int controllerSettingsItemCount() {
+  return 6 + (joystickAvailable ? 1 : 0)
+           + ((joystickAvailable && miniJoyCAvailable) ? 1 : 0);
+}
+
+void renderControllerSettings() {
+  int sw = statusSprite.width(), sh = statusSprite.height();
+  bool isLandscape = sw > sh;
+  bool hasMJC      = miniJoyCAvailable;                       // present alone or in dual
+  bool isMiniJoyC  = miniJoyCAvailable && !joystickAvailable; // sole stick
+  bool dual        = joystickAvailable && miniJoyCAvailable;
+  statusSprite.fillSprite(COLOR_BLACK);
+  statusSprite.setFont(&fonts::Font0);
+
+  const int ITEM_COUNT = controllerSettingsItemCount();
+  const char* labels[8] = { "CALIBRATE", "DEADZONE", "SWAP XY", "INVERT X", "INVERT Y",
+                            "TX LINK", "MOUNT", "PRIMARY" };
+
+  char calVal[16], dzVal[8];
+  if (hasMJC)
+    snprintf(calVal, sizeof(calVal), calibrationComplete ? "%d,%d" : "TAP TO CAL", zero_x, zero_y);
+  else
+    snprintf(calVal, sizeof(calVal), "TAP TO CAL");
+  snprintf(dzVal, sizeof(dzVal), hasMJC ? "%d" : "N/A",
+           hasMJC ? CTRL_DEADZONE_VALS[ctrlDeadzoneIdx] : 0);
+  const char* values[8] = {
+    calVal,
+    dzVal,
+    ctrlSwapXY  ? "ON" : "OFF",
+    ctrlInvertX ? "ON" : "OFF",
+    ctrlInvertY ? "ON" : "OFF",
+    REMOTE_TX_LABELS[remoteTransportIdx],
+    SEESAW_MOUNT_LABELS[seesawMountIdx],
+    dualPrimaryMiniJoyC ? "JOYC" : "PAD",
+  };
+
+  uint16_t cyan = display.color565(0, 160, 210);
+
+  // Header
+  headerSprite.setFont(&fonts::Font0);
+  headerSprite.fillSprite(display.color565(0, 10, 18));
+  headerSprite.setTextDatum(TC_DATUM);
+  headerSprite.setTextSize(2);
+  headerSprite.setTextColor(cyan);
+  const char* title = dual ? "DUAL STICK SETTINGS"
+                           : (isMiniJoyC ? "MINIJOYC SETTINGS" : "GAMEPAD SETTINGS");
+  headerSprite.drawString(title, sw / 2, isLandscape ? 4 : 6);
+  headerSprite.drawFastHLine(8, SPRITE_Y - 1, sw - 16, display.color565(0, 80, 120));
+  headerSprite.pushSprite(0, 0);
+
+  // APPLY / CANCEL buttons
+  int btnH = isLandscape ? 20 : 30;
+  int btnY = sh - 6 - btnH;
+  int sepY = btnY - 6;
+  statusSprite.drawFastHLine(8, sepY, sw - 16, display.color565(40, 40, 40));
+  int bw = (sw - 24) / 2;
+  statusSprite.fillRect(8,       btnY, bw, btnH, display.color565(0, 60, 0));
+  statusSprite.fillRect(16 + bw, btnY, bw, btnH, display.color565(60, 0, 0));
+  statusSprite.drawRect(8,       btnY, bw, btnH, COLOR_GREEN);
+  statusSprite.drawRect(16 + bw, btnY, bw, btnH, COLOR_RED);
+  statusSprite.setTextSize(1);
+  statusSprite.setTextDatum(MC_DATUM);
+  statusSprite.setTextColor(COLOR_GREEN);
+  statusSprite.drawString("APPLY",  8  + bw / 2,      btnY + btnH / 2);
+  statusSprite.setTextColor(COLOR_RED);
+  statusSprite.drawString("CANCEL", 16 + bw + bw / 2, btnY + btnH / 2);
+
+  // Item rows
+  int startY   = 4;
+  int rowH     = isLandscape ? 20 : 26;
+  int rowsArea = sepY - startY;
+  int visRows  = constrain(rowsArea / rowH, 1, ITEM_COUNT);
+
+  settingsScrollOffset = constrain(settingsScrollOffset, 0, ITEM_COUNT - visRows);
+  if (settingsCursor < settingsScrollOffset) settingsScrollOffset = settingsCursor;
+  if (settingsCursor >= settingsScrollOffset + visRows) settingsScrollOffset = settingsCursor - visRows + 1;
+
+  for (int i = 0; i < visRows; i++) {
+    int idx  = i + settingsScrollOffset;
+    if (idx >= ITEM_COUNT) break;
+    int y    = startY + i * rowH;
+    bool sel = (idx == settingsCursor);
+    int textY = y + (rowH - 8) / 2;
+
+    bool disabled = (idx == 1 && !hasMJC);  // DEADZONE is N/A without a Mini JoyC
+
+    if (sel) statusSprite.fillRect(4, y, sw - 8, rowH - 2, display.color565(0, 10, 18));
+
+    statusSprite.setTextDatum(TL_DATUM);
+    statusSprite.setTextSize(1);
+    statusSprite.setTextColor(sel ? cyan : display.color565(60, 60, 60));
+    statusSprite.drawString(sel ? ">" : " ", 6, textY);
+    statusSprite.setTextColor(disabled ? display.color565(50, 50, 50)
+                                       : (sel ? COLOR_WHITE : COLOR_GRAY));
+    statusSprite.drawString(labels[idx], 14, textY);
+    statusSprite.setTextDatum(TR_DATUM);
+    statusSprite.setTextColor(disabled ? display.color565(40, 40, 40)
+                                       : (sel ? cyan : display.color565(40, 60, 80)));
+    statusSprite.drawString(values[idx], sw - 10, textY);
+
+    if (i < visRows - 1)
+      statusSprite.drawFastHLine(4, y + rowH - 1, sw - 8, display.color565(20, 20, 20));
+  }
+}
+
+void handleControllerSettingsTap(int16_t sx, int16_t sy) {
+  int sw = statusSprite.width(), sh = statusSprite.height();
+  bool isLandscape = sw > sh;
+  int  sprite_y    = sy - g_spriteY;
+  const int ITEM_COUNT = controllerSettingsItemCount();
+  int startY   = 4;
+  int btnH     = isLandscape ? 20 : 30;
+  int btnY     = sh - 6 - btnH;
+  int sepY     = btnY - 6;
+  int rowH     = isLandscape ? 20 : 26;
+  int rowsArea = sepY - startY;
+  int visRows  = constrain(rowsArea / rowH, 1, ITEM_COUNT);
+  for (int i = 0; i < visRows; i++) {
+    int idx  = i + settingsScrollOffset;
+    if (idx >= ITEM_COUNT) break;
+    int rowY = startY + i * rowH;
+    if (sprite_y >= rowY && sprite_y < rowY + rowH) {
+      if (settingsCursor == idx) onKey1Short();
+      else                       settingsCursor = idx;
+      return;
+    }
+  }
+  if (sprite_y >= btnY && sprite_y < btnY + btnH) {
+    if (sx < sw / 2) onKey1Long();
+    else             onKey2Long();
+  }
+}
 
 // ================================================================
 // Web File Manager
@@ -4984,6 +5668,7 @@ static void webFMHandleGetSettings() {
   doc["dst_offset"]    = daylightOffset_sec;
   doc["robot_ip"]      = targetIpAddress;
   doc["udp_port"]      = udpPort;
+  doc["tcp_port"]      = tcpPort;
   doc["dim_timeout"]   = dimTimeoutIdx;
   doc["sleep_timeout"] = sleepTimeoutIdx;
   doc["low_bat"]       = lowBatIdx;
@@ -5010,6 +5695,7 @@ static void webFMHandlePostSettings() {
   daylightOffset_sec = doc["dst_offset"]  | daylightOffset_sec;
   strlcpy(targetIpAddress, doc["robot_ip"]  | targetIpAddress,  sizeof(targetIpAddress));
   udpPort        = doc["udp_port"]    | udpPort;
+  tcpPort        = doc["tcp_port"]    | tcpPort;
   dimTimeoutIdx  = constrain((int)(doc["dim_timeout"]   | dimTimeoutIdx),   0, 3);
   sleepTimeoutIdx= constrain((int)(doc["sleep_timeout"] | sleepTimeoutIdx), 0, 3);
   lowBatIdx      = constrain((int)(doc["low_bat"]       | lowBatIdx),       0, 2);
@@ -5123,13 +5809,88 @@ void WiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
   }
 }
 
+// ── Transport backends ──────────────────────────────────────────
+// Each takes a raw payload buffer holding a RemoteFrame (see below).
+
+static void txWifiUdp(const uint8_t* buf, size_t len) {
+  udp.beginPacket(targetIpAddress, udpPort);
+  udp.write(buf, len);
+  udp.endPacket();
+}
+
+static void txBle(const uint8_t* buf, size_t len) {
+  // Reuse the NESSO BLE UART TX characteristic (notify to the connected central).
+  if (bleUartReady && pBLETxChar && btConnected) {
+    pBLETxChar->setValue((uint8_t*)buf, len);
+    pBLETxChar->notify();
+  }
+}
+
+static void txWifiTcp(const uint8_t* buf, size_t len) {
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (!tcpClient.connected()) {
+    tcpClient.stop();
+    if (!tcpClient.connect(targetIpAddress, tcpPort)) return;
+    tcpClient.setNoDelay(true);   // disable Nagle — control packets want low latency
+  }
+  tcpClient.write(buf, len);
+}
+
+static uint32_t loraTxLastMs = 0;
+static void txLora(const uint8_t* buf, size_t len) {
+  // TODO: LoRa control link not yet wired. lora.transmit() is blocking (100+ ms
+  // at SF11) and EU868 is duty-cycle limited, so this needs async startTransmit()
+  // + rate limiting before it's usable. Rate-gated no-op for now so selecting it
+  // doesn't stall the loop.
+  if (millis() - loraTxLastMs < 500) return;  // cap intent at 2 Hz
+  loraTxLastMs = millis();
+  (void)buf; (void)len;
+}
+
+// ── Remote control frame ────────────────────────────────────────
+// Encoded by the NessoLink library (NessoFrame.h) — the same codec the robot
+// receiver uses (15-byte CRC-8 frame; see the library for the wire layout).
+static uint8_t remoteSeq = 0;
+
+// Collect current button state into the NessoLink wire bitfield (1 = pressed).
+static uint16_t remoteButtonBits() {
+  uint16_t b = 0;
+  if (joystickAvailable) {
+    // seesaw gamepadButtons is active-LOW (bit clear = pressed)
+    if (!(gamepadButtons & (1UL << BUTTON_A)))      b |= (1 << NESSO_BTN_A);
+    if (!(gamepadButtons & (1UL << BUTTON_B)))      b |= (1 << NESSO_BTN_B);
+    if (!(gamepadButtons & (1UL << BUTTON_X)))      b |= (1 << NESSO_BTN_X);
+    if (!(gamepadButtons & (1UL << BUTTON_Y)))      b |= (1 << NESSO_BTN_Y);
+    if (!(gamepadButtons & (1UL << BUTTON_SELECT))) b |= (1 << NESSO_BTN_SELECT);
+    if (!(gamepadButtons & (1UL << BUTTON_START)))  b |= (1 << NESSO_BTN_START);
+  } else if (miniJoyCAvailable) {
+    if (miniJoyCBtn) b |= (1 << NESSO_BTN_STICK);
+  }
+  return b;
+}
+
+// ── Dispatcher ──────────────────────────────────────────────────
 void transmitRemoteCommand(int leftMotorPower, int rightMotorPower) {
   transmitCmd.leftMotor  = constrain(leftMotorPower,  -255, 255);
   transmitCmd.rightMotor = constrain(rightMotorPower, -255, 255);
 
-  udp.beginPacket(targetIpAddress, udpPort);
-  udp.write((uint8_t*)&transmitCmd, sizeof(transmitCmd));
-  udp.endPacket();
+  NessoFrame f;
+  f.leftMotor  = (int16_t)transmitCmd.leftMotor;
+  f.rightMotor = (int16_t)transmitCmd.rightMotor;
+  f.auxX       = remoteAuxX;
+  f.auxY       = remoteAuxY;
+  f.hasAux     = remoteHasAux;
+  f.buttons    = remoteButtonBits();
+  f.seq        = ++remoteSeq;
+  uint8_t frame[NESSO_FRAME_LEN];
+  size_t  len = nessoEncode(f, frame);
+  switch (remoteTransportIdx) {
+    case TX_BLE:      txBle(frame, len);     break;
+    case TX_WIFI_TCP: txWifiTcp(frame, len); break;
+    case TX_LORA:     txLora(frame, len);    break;
+    case TX_WIFI_UDP:
+    default:          txWifiUdp(frame, len); break;
+  }
 
   debug("L: "); debug(transmitCmd.leftMotor);
   debug(" | R: "); debugln(transmitCmd.rightMotor);
@@ -5899,7 +6660,13 @@ void applyBTSettings() {
     BLEAdvertising* pAdv = BLEDevice::getAdvertising();
     BLEAdvertisementData advData;
     advData.setFlags(0x06);   // LE General Discoverable | BR/EDR Not Supported
-    advData.setCompleteServices(BLEUUID(BLE_UART_SERVICE_UUID));
+    if (hidGamepadEnabled && bleHidReady) {
+      // Advertise as a HID gamepad so PC/Android recognise it as a controller.
+      advData.setAppearance(0x03C4);   // HID Gamepad
+      advData.setCompleteServices(bleHid->hidService()->getUUID());
+    } else {
+      advData.setCompleteServices(BLEUUID(BLE_UART_SERVICE_UUID));
+    }
     pAdv->setAdvertisementData(advData);
     BLEAdvertisementData scanResp;
     scanResp.setName("NESSO");
@@ -5959,6 +6726,54 @@ void btProcessPendingEvents() {
   }
 }
 
+// Standard gamepad HID report map: Report ID 1, 16 buttons + 4 × 16-bit axes (X/Y/Z/Rz).
+// Report payload (after ID) = 10 bytes: buttons[2], X[2], Y[2], Z[2], Rz[2].
+static const uint8_t HID_GAMEPAD_REPORT_MAP[] = {
+  0x05, 0x01,        // Usage Page (Generic Desktop)
+  0x09, 0x05,        // Usage (Game Pad)
+  0xA1, 0x01,        // Collection (Application)
+  0x85, 0x01,        //   Report ID (1)
+  0x05, 0x09,        //   Usage Page (Button)
+  0x19, 0x01,        //   Usage Minimum (Button 1)
+  0x29, 0x10,        //   Usage Maximum (Button 16)
+  0x15, 0x00,        //   Logical Minimum (0)
+  0x25, 0x01,        //   Logical Maximum (1)
+  0x75, 0x01,        //   Report Size (1)
+  0x95, 0x10,        //   Report Count (16)
+  0x81, 0x02,        //   Input (Data,Var,Abs)
+  0x05, 0x01,        //   Usage Page (Generic Desktop)
+  0x16, 0x01, 0x80,  //   Logical Minimum (-32767)
+  0x26, 0xFF, 0x7F,  //   Logical Maximum (32767)
+  0x75, 0x10,        //   Report Size (16)
+  0x95, 0x04,        //   Report Count (4)
+  0x09, 0x30,        //   Usage (X)
+  0x09, 0x31,        //   Usage (Y)
+  0x09, 0x32,        //   Usage (Z)
+  0x09, 0x35,        //   Usage (Rz)
+  0x81, 0x02,        //   Input (Data,Var,Abs)
+  0xC0               // End Collection
+};
+
+// Send one HID gamepad report from current stick/button state. Mapping:
+//   X = turn (joyDisplayY), Y = -forward (joyDisplayX; HID up = negative),
+//   Z/Rz = aux stick, buttons = same bitfield as RemoteFrame. Values scaled ±515 → ±32767.
+static void hidSendGamepad() {
+  if (!bleHidReady || !bleHidInput || !btConnected) return;
+  int16_t x  = (int16_t)constrain((long)joyDisplayY  * 63, -32767, 32767);
+  int16_t y  = (int16_t)constrain((long)-joyDisplayX * 63, -32767, 32767);
+  int16_t z  = (int16_t)constrain((long)aux2DisplayY * 63, -32767, 32767);
+  int16_t rz = (int16_t)constrain((long)aux2DisplayX * 63, -32767, 32767);
+  uint16_t btns = remoteButtonBits();
+  uint8_t rpt[10];
+  rpt[0] = btns & 0xff;  rpt[1] = (btns >> 8) & 0xff;
+  rpt[2] = x  & 0xff;    rpt[3] = (x  >> 8) & 0xff;
+  rpt[4] = y  & 0xff;    rpt[5] = (y  >> 8) & 0xff;
+  rpt[6] = z  & 0xff;    rpt[7] = (z  >> 8) & 0xff;
+  rpt[8] = rz & 0xff;    rpt[9] = (rz >> 8) & 0xff;
+  bleHidInput->setValue(rpt, sizeof(rpt));
+  bleHidInput->notify();
+}
+
 // Pure BLE stack init — no display output; safe to call from loop() or initBT().
 void btInitStack() {
   if (btInitialized || btInitFailed) return;
@@ -5983,9 +6798,24 @@ void btInitStack() {
   bleUartReady = true;
   debugln("BLE UART service started");
 
-  // No bonding — avoids stale-key GATT errors on reconnect after reboot.
+  // Optional BLE HID gamepad — standard controller for PC / Android.
+  if (hidGamepadEnabled) {
+    bleHid = new BLEHIDDevice(pServer);
+    bleHidInput = bleHid->inputReport(1);
+    bleHid->manufacturer()->setValue("Nesso");
+    bleHid->pnp(0x02, 0xE502, 0xA111, 0x0210);
+    bleHid->hidInfo(0x00, 0x01);
+    bleHid->reportMap((uint8_t*)HID_GAMEPAD_REPORT_MAP, sizeof(HID_GAMEPAD_REPORT_MAP));
+    bleHid->startServices();
+    bleHid->setBatteryLevel(100);
+    bleHidReady = true;
+    debugln("BLE HID gamepad service started");
+  }
+
+  // HID over GATT requires bonding/encryption. Otherwise stay NO_BOND, which avoids
+  // stale-key GATT errors on reconnect after reboot.
   BLESecurity* pSec = new BLESecurity();
-  pSec->setAuthenticationMode(ESP_LE_AUTH_NO_BOND);
+  pSec->setAuthenticationMode(hidGamepadEnabled ? ESP_LE_AUTH_REQ_SC_BOND : ESP_LE_AUTH_NO_BOND);
   pSec->setCapability(ESP_IO_CAP_NONE);
 
   pBLEScan = BLEDevice::getScan();
