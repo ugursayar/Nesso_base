@@ -24,7 +24,9 @@
 #include <BLEServer.h>
 #include <BLEAdvertising.h>
 #include <BLEHIDDevice.h>
-#include <NessoFrame.h>   // NessoLink control-frame codec (shared with the robot receiver)
+#include <NessoFrame.h>     // NessoLink control-frame codec (shared with the robot receiver)
+#include <NessoLinkBLE.h>   // NessoBleLink — BLE transport adapter (injected notify sink)
+#include <NessoLinkLoRa.h>  // NessoLoRaLink — async, duty-cycle-gated LoRa transport
 #include <Preferences.h>
 #include "esp_sleep.h"
 #include <IRremote.hpp>
@@ -5810,7 +5812,11 @@ void WiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
 }
 
 // ── Transport backends ──────────────────────────────────────────
-// Each takes a raw payload buffer holding a RemoteFrame (see below).
+// Each takes a raw payload buffer holding a RemoteFrame (see below). BLE and LoRa
+// route through the NessoLink library transport classes (the receiver reuses them).
+
+NessoBleLink  bleLink;    // adapter over the firmware's BLE UART TX characteristic
+NessoLoRaLink loraLink;   // async LoRa transport (safe no-op until a radio is wired)
 
 static void txWifiUdp(const uint8_t* buf, size_t len) {
   udp.beginPacket(targetIpAddress, udpPort);
@@ -5819,11 +5825,22 @@ static void txWifiUdp(const uint8_t* buf, size_t len) {
 }
 
 static void txBle(const uint8_t* buf, size_t len) {
-  // Reuse the NESSO BLE UART TX characteristic (notify to the connected central).
-  if (bleUartReady && pBLETxChar && btConnected) {
-    pBLETxChar->setValue((uint8_t*)buf, len);
-    pBLETxChar->notify();
+  // NessoBleLink notifies the existing NESSO BLE UART TX characteristic. The link
+  // never owns the BLE stack — we inject the notify + "ready" sinks once (lazily),
+  // and they read the firmware's BLE globals at call time.
+  static bool wired = false;
+  if (!wired) {
+    bleLink.begin(
+      [](const uint8_t* b, size_t n) -> bool {
+        if (!pBLETxChar) return false;
+        pBLETxChar->setValue((uint8_t*)b, n);
+        pBLETxChar->notify();
+        return true;
+      },
+      []() -> bool { return bleUartReady && pBLETxChar && btConnected; });
+    wired = true;
   }
+  bleLink.sendRaw(buf, len);
 }
 
 static void txWifiTcp(const uint8_t* buf, size_t len) {
@@ -5836,15 +5853,14 @@ static void txWifiTcp(const uint8_t* buf, size_t len) {
   tcpClient.write(buf, len);
 }
 
-static uint32_t loraTxLastMs = 0;
 static void txLora(const uint8_t* buf, size_t len) {
-  // TODO: LoRa control link not yet wired. lora.transmit() is blocking (100+ ms
-  // at SF11) and EU868 is duty-cycle limited, so this needs async startTransmit()
-  // + rate limiting before it's usable. Rate-gated no-op for now so selecting it
-  // doesn't stall the loop.
-  if (millis() - loraTxLastMs < 500) return;  // cap intent at 2 Hz
-  loraTxLastMs = millis();
-  (void)buf; (void)len;
+  // NessoLoRaLink does the async startTransmit() + duty-cycle gating. It is a safe
+  // no-op until a radio is wired via loraLink.begin(&lora, ...). That wiring is NOT
+  // done here on purpose: begin() installs a DIO1 action that would clobber the
+  // LoRa-scanner ISR, and the radio isn't brought up in the Controller context, so
+  // live LoRa TX still needs that radio-lifecycle handoff. Selecting it no longer
+  // stalls the loop, and the moment the radio is wired it transmits for real.
+  loraLink.sendRaw(buf, len);
 }
 
 // ── Remote control frame ────────────────────────────────────────
