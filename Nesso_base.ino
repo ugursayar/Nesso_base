@@ -5883,14 +5883,53 @@ static void txWifiTcp(const uint8_t* buf, size_t len) {
   tcpClient.write(buf, len);
 }
 
+// LoRa controller TX is gated by both NessoLoRaLink's rate limiter AND the SX1262's
+// own busy flag, so frames can't overlap. At SF11/BW250 a 15-byte frame is ~150-200 ms
+// of airtime, so the effective rate is only a few Hz — and EU868's ~1% duty cycle means
+// this interval should be far larger for anything but a bench test. (LoRa is a low-rate
+// command link, not a live joystick path.)
+#define LORA_TX_MIN_INTERVAL_MS 250
+
+bool loraTxArmed = false;   // radio is configured + handed to loraLink for TX
+
+// Bring the shared SX1262 up for Controller LoRa TX and hand it to NessoLoRaLink.
+// Lazy + idempotent. The LoRa scanner and the controller are mutually-exclusive
+// screens sharing one radio and one DIO1 line, so each re-installs its own action on
+// entry: loraLink.begin() here installs the TxDone action; initLora() re-installs the
+// scanner's RxDone loraISR and clears loraTxArmed so we re-arm on the way back.
+static bool loraTxArm() {
+  if (loraTxArmed)    return true;
+  if (loraInitFailed) return false;
+
+  pinMode(LORA_ENABLE, OUTPUT);
+  digitalWrite(LORA_ENABLE, HIGH);              // power the module (via expander)
+  delay(20);
+  SPI.begin(SCK, MISO, MOSI, LORA_CS);
+
+  if (!loraInitialized) {
+    int st = lora.begin(LORA_FREQ_LIST[loraFreqIdx], LORA_PRESETS[loraPresetIdx].bw,
+                        LORA_PRESETS[loraPresetIdx].sf, LORA_CR, LORA_SYNC_WORD, 10);
+    if (st != RADIOLIB_ERR_NONE) { loraInitFailed = true; return false; }
+    loraInitialized = true;
+  } else {
+    lora.standby();
+  }
+
+  pinMode(LORA_ANTENNA_SWITCH, OUTPUT);
+  digitalWrite(LORA_ANTENNA_SWITCH, HIGH);      // TX path (controller only transmits)
+  pinMode(LORA_LNA_ENABLE, OUTPUT);
+  digitalWrite(LORA_LNA_ENABLE, HIGH);
+
+  loraLink.begin(&lora, LORA_TX_MIN_INTERVAL_MS);  // installs the TxDone DIO1 action
+  loraTxArmed = true;
+  debugln("[LoRa] controller TX armed");
+  return true;
+}
+
 static void txLora(const uint8_t* buf, size_t len) {
-  // NessoLoRaLink does the async startTransmit() + duty-cycle gating. It is a safe
-  // no-op until a radio is wired via loraLink.begin(&lora, ...). That wiring is NOT
-  // done here on purpose: begin() installs a DIO1 action that would clobber the
-  // LoRa-scanner ISR, and the radio isn't brought up in the Controller context, so
-  // live LoRa TX still needs that radio-lifecycle handoff. Selecting it no longer
-  // stalls the loop, and the moment the radio is wired it transmits for real.
-  loraLink.sendRaw(buf, len);
+  if (!loraTxArm()) return;             // bring the radio up for TX (lazy); no radio -> no-op
+  SPI.begin(SCK, MISO, MOSI, LORA_CS);  // re-arm the shared bus (the display reconfigures it)
+  loraLink.sendRaw(buf, len);           // async startTransmit + rate/duty gate
 }
 
 // ── Remote control frame ────────────────────────────────────────
@@ -5953,12 +5992,15 @@ void initLora() {
   renderHeader();
 
   loraListening = false;   // user must tap LISTEN; no auto-resume on entry
+  loraTxArmed   = false;   // controller LoRa TX (if it owned the radio) must re-arm after this
   if (loraInitialized) {
     // Hardware already up — re-arm SPI (LovyanGFX reconfigures the shared bus between renders)
     // and re-enable LNA that was disabled when leaving this screen.
     SPI.begin(SCK, MISO, MOSI, LORA_CS);
     pinMode(LORA_LNA_ENABLE, OUTPUT);
     digitalWrite(LORA_LNA_ENABLE, HIGH);
+    digitalWrite(LORA_ANTENNA_SWITCH, LOW);  // RX path (controller may have left it on TX)
+    lora.setDio1Action(loraISR);             // reclaim DIO1 from the controller's TxDone action
     return;
   }
   if (loraInitFailed) return;
