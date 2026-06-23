@@ -486,7 +486,7 @@ Sent continuously at ~10 Hz (even when centered) so the receiver can implement a
 | **WiFi-UDP** | default | to `robot_ip:udp_port` (8889); lowest latency, same LAN |
 | **BLE** | working | notifies the NESSO BLE UART characteristic; needs a connected central (WiFi contends — one radio) |
 | **WiFi-TCP** | minimal | lazy connect to `robot_ip:tcp_port` (8890) |
-| **LoRa** | working (low-rate) | async (non-blocking) via NessoLink; the SX1262 is shared with the LoRa scanner, so it's armed on demand (`loraTxArm()`) and the two screens hand the radio back and forth. SF11/BW250 + EU868 ~1% duty cycle cap it at a few Hz — a command link, not live driving. Matching receiver: the **Nesso_ADV_Receiver** project (M5 Cardputer ADV + Cap LoRa 1262) |
+| **LoRa** | working (low-rate) | async (non-blocking) via NessoLink; the SX1262 is shared with the LoRa scanner, so it's armed on demand (`loraTxArm()`) and the two screens hand the radio back and forth. SF11/BW250 + EU868 ~1% duty cycle cap it at a few Hz — a command link, not live driving. Matching receiver: the NessoLink **`CardputerAdvLoRaReceiver`** example (M5 Cardputer ADV + Cap LoRa 1262) |
 
 ### Configuration
 
