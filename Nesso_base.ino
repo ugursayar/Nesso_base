@@ -488,7 +488,6 @@ unsigned long loraAckDeadlineMs = 0;      // give up waiting after this timestam
 bool          loraLastAckOk     = false;  // did last auto-reply get acknowledged?
 
 unsigned long previousMillis        = 0;
-unsigned long previousMillisButtons = 0;
 
 // ----------------------------------------------------------------
 // WiFi scan screen
@@ -1228,6 +1227,14 @@ static bool rfid2SaveFile();
 void setup() {
   Serial.setRxBufferSize(8192);
   Serial.begin(115200);
+  // Serial is USB-CDC (ARDUINO_USB_CDC_ON_BOOT=1). When the TX ring fills with no
+  // host draining it, write() blocks up to ~20 * tx_timeout_ms per call. Right
+  // after flashing the CDC still reads as "connected" but nothing reads it, so the
+  // large serialPrintHelp() dump below would stall boot for minutes — the splash
+  // "hangs until you reset" symptom. timeout 0 = drop bytes when no reader is
+  // keeping up, so boot never blocks on serial. (A manual reset masked it because
+  // the CDC then enumerates as not-connected and writes are dropped immediately.)
+  Serial.setTxTimeoutMs(0);
   debugln("N#1 initializing...");
   loadSettings();
 
@@ -4196,11 +4203,12 @@ void renderFunction() {
         statusSprite.pushSprite(0, SPRITE_Y);
         if (millis() - previousMillis >= 100) {
           previousMillis = millis();
-          readGamePad();
-        }
-        if (millis() - previousMillisButtons >= 300) {
-          previousMillisButtons = millis();
+          // Sample buttons in lockstep with the frame: readGamePad() builds and
+          // sends the RemoteFrame, so the button bits must be refreshed *first*.
+          // (Polling them on a slower, separate timer left up to ~300 ms of stale
+          // "pressed" frames after release — buttons looked stuck on the receiver.)
           readGamePadButtons();
+          readGamePad();
         }
       }
       break;
@@ -4697,11 +4705,18 @@ static const int      SPK_BOOT_CHIME_LEN = 3;
 void spkPlayBootChime() {
   if (!spkInitialized) return;
   spkPlayMelody(SPK_BOOT_CHIME, SPK_BOOT_CHIME_LEN, false);
-  // Block until chime finishes — called during setup splash where blocking is OK.
-  while (g_spkMelody != nullptr || g_spkSamplesLeft > 0) {
+  // Block until the chime finishes — called during the setup splash where
+  // blocking is OK. Hard-cap the wait: if the I2S DMA never drains (e.g. a
+  // bad-state peripheral right after a flash-reset) the melody would never
+  // complete and boot would hang here. The chime is ~0.3 s, so a 1.5 s ceiling
+  // is generous; on timeout drop the melody so the main-loop spkUpdate() starts
+  // clean rather than replaying a stuck note.
+  uint32_t t0 = millis();
+  while ((g_spkMelody != nullptr || g_spkSamplesLeft > 0) && millis() - t0 < 1500) {
     spkUpdate();
     delay(5);
   }
+  if (g_spkMelody != nullptr || g_spkSamplesLeft > 0) spkStop();
 }
 
 // ================================================================
@@ -5245,12 +5260,28 @@ static void readSeesawAxes(int16_t& px, int16_t& py) {
   py = (int16_t)(y - zero_y);
 }
 
-// Read Mini JoyC stick → powerx/powery (front-mount: vert used as-is, deadzoned, ±515).
+// Read Mini JoyC stick → powerx/powery (front-mount: vert used as-is, deadzoned, ±515)
+// AND the stick button — all in ONE HAT-bus window so the JoyC is re-pinned once per
+// cycle and axes+button come from the same instant. The button reads via reg 0x30
+// (active-LOW); a failed I2C read returns 0xFF, so it fails safe to "released" and
+// can never stick on (unlike the seesaw's uninitialised-buffer bulk read).
 static void readMiniJoyCAxes(int16_t& px, int16_t& py) {
   miniJoyCWireHat();
-  int vert  = (int)miniJoyCReadCal(0x10);   // calibrated vertical (PA.2)
-  int horiz = (int)miniJoyCReadCal(0x12);   // calibrated horizontal (PA.1)
+  int  vert    = (int)miniJoyCReadCal(0x10);    // calibrated vertical (PA.2)
+  int  horiz   = (int)miniJoyCReadCal(0x12);    // calibrated horizontal (PA.1)
+  bool pressed = (miniJoyCReadByte(0x30) == 0); // stick button
+  uint32_t newLed = pressed ? 0x101000 : (controllerConnected ? 0x001000 : 0x0A0000);
+  if (newLed != miniJoyCLedColor) miniJoyCSetLED(newLed);  // orange while held
   miniJoyCWireRestore();
+
+  // Button edge side-effects (outside the bus window).
+  if (pressed && !miniJoyCBtn) {
+    resetActivity();
+    debugln("MiniJoyC button pressed");
+    if (WiFi.status() != WL_CONNECTED) connectToWiFi();
+  }
+  miniJoyCBtn = pressed;
+
   int dz = CTRL_DEADZONE_VALS[ctrlDeadzoneIdx];
   if (vert  > -dz && vert  < dz) vert  = 0;
   if (horiz > -dz && horiz < dz) horiz = 0;
@@ -5362,34 +5393,33 @@ void readGamePad() {
 }
 
 void readGamePadButtons() {
-  // Both stick button sources are read when present (dual-stick).
+  // Seesaw face buttons (A/B/X/Y/SELECT/START). The Mini JoyC stick button is
+  // handled in readMiniJoyCAxes() instead — see the note at the end of this fn.
   if (joystickAvailable) {
-    uint32_t buttons = ss.digitalReadBulk(button_mask);
-    if (buttons != button_mask) resetActivity();
-    gamepadButtons = buttons;
-    if (!(buttons & (1UL << BUTTON_SELECT))) {
-      debugln("Button SELECT pressed");
-      if (WiFi.status() != WL_CONNECTED) connectToWiFi();
-    }
-    if (!(buttons & (1UL << BUTTON_START))) {
-      debugln("Button START pressed");
-      if (WiFi.status() != WL_CONNECTED) connectToWiFi();
+    // The seesaw shares the HP I2C with the Mini JoyC, which transiently re-pins
+    // the bus (G6/G7). digitalReadBulk() reads into an UNINITIALISED buffer and
+    // ignores the transaction result — on a NAK it returns stack garbage, and
+    // since buttons are active-LOW that latches random "pressed" bits into
+    // gamepadButtons (stuck buttons on screen *and* in the TX frame). Guard it:
+    // probe 0x50 first and only trust the read when the seesaw ACKs; otherwise
+    // keep the last good snapshot rather than corrupting it.
+    Wire.beginTransmission(0x50);
+    if (Wire.endTransmission() == 0) {
+      uint32_t buttons = ss.digitalReadBulk(button_mask);
+      if (buttons != button_mask) resetActivity();
+      gamepadButtons = buttons;
+      if (!(buttons & (1UL << BUTTON_SELECT))) {
+        debugln("Button SELECT pressed");
+        if (WiFi.status() != WL_CONNECTED) connectToWiFi();
+      }
+      if (!(buttons & (1UL << BUTTON_START))) {
+        debugln("Button START pressed");
+        if (WiFi.status() != WL_CONNECTED) connectToWiFi();
+      }
     }
   }
-  if (miniJoyCAvailable) {
-    miniJoyCWireHat();
-    bool pressed = (miniJoyCReadByte(0x30) == 0);
-    if (pressed && !miniJoyCBtn) {
-      resetActivity();
-      debugln("MiniJoyC button pressed");
-      if (WiFi.status() != WL_CONNECTED) connectToWiFi();
-    }
-    miniJoyCBtn = pressed;
-    // LED reflects connection state; orange when button held
-    uint32_t newLed = pressed ? 0x101000 : (controllerConnected ? 0x001000 : 0x0A0000);
-    if (newLed != miniJoyCLedColor) miniJoyCSetLED(newLed);
-    miniJoyCWireRestore();
-  }
+  // The Mini JoyC stick button + LED are read together with its axes in
+  // readMiniJoyCAxes() (one shared HAT-bus window), so nothing to do here.
 }
 
 // ================================================================
@@ -5879,9 +5909,11 @@ static uint16_t remoteButtonBits() {
     if (!(gamepadButtons & (1UL << BUTTON_Y)))      b |= (1 << NESSO_BTN_Y);
     if (!(gamepadButtons & (1UL << BUTTON_SELECT))) b |= (1 << NESSO_BTN_SELECT);
     if (!(gamepadButtons & (1UL << BUTTON_START)))  b |= (1 << NESSO_BTN_START);
-  } else if (miniJoyCAvailable) {
-    if (miniJoyCBtn) b |= (1 << NESSO_BTN_STICK);
   }
+  // Mini JoyC stick button merges in independently — NOT 'else if', so it is still
+  // sent in dual-stick mode when a seesaw is also present (screen reads miniJoyCBtn
+  // directly, but the frame must carry it too for the receiver).
+  if (miniJoyCAvailable && miniJoyCBtn) b |= (1 << NESSO_BTN_STICK);
   return b;
 }
 
