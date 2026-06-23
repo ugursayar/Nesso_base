@@ -462,7 +462,7 @@ One connected → it drives directly. **Both** connected → **dual-stick**: one
 
 ### Wire protocol — RemoteFrame v1
 
-Every link sends the same **15-byte little-endian frame** (the robot receiver must parse it; magic + version + CRC let it validate):
+Every link sends the same **15-byte little-endian frame**, encoded by the shared **[NessoLink](https://github.com/ugursayar/NessoLink)** library (`nessoEncode()`); the robot receiver decodes it with the same library (`nessoDecode()`). Magic + version + CRC let it validate:
 
 | off | field | type | notes |
 |---|---|---|---|
@@ -486,7 +486,7 @@ Sent continuously at ~10 Hz (even when centered) so the receiver can implement a
 | **WiFi-UDP** | default | to `robot_ip:udp_port` (8889); lowest latency, same LAN |
 | **BLE** | working | notifies the NESSO BLE UART characteristic; needs a connected central (WiFi contends — one radio) |
 | **WiFi-TCP** | minimal | lazy connect to `robot_ip:tcp_port` (8890) |
-| **LoRa** | not yet | stub — blocking TX + EU duty cycle make it unsuitable as a live link |
+| **LoRa** | not yet | async (non-blocking) via NessoLink, but the radio isn't wired in the Controller context (DIO1 conflicts with the LoRa scanner); EU duty cycle also makes it a low-rate command link, not live driving |
 
 ### Configuration
 

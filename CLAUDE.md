@@ -26,6 +26,10 @@ arduino-cli upload --fqbn "esp32:esp32:arduino_nesso_n1" --port COM3 --build-pat
 
 ## Key Implementation Notes
 
+### USB-CDC serial must not block boot
+
+`Serial` is USB Serial/JTAG (`ARDUINO_USB_CDC_ON_BOOT=1`, `ARDUINO_USB_MODE=1`), **not** a UART. When its TX ring fills with no host draining it, `HWCDC::write()` blocks up to ~20 × `tx_timeout_ms` (default 100 ms) **per call**. Right after flashing the CDC still reads as "connected" but nothing reads it, so the boot-time `serialPrintHelp()` dump would stall `setup()` for *minutes* at the splash ("hangs until you reset it" — a manual reset masked it because the CDC then enumerated as not-connected and writes dropped). `setup()` calls **`Serial.setTxTimeoutMs(0)` immediately after `Serial.begin()`** so a full ring drops bytes instead of blocking. Keep that call — any large boot-time serial output depends on it.
+
 ### Arduino preprocessor type ordering
 
 `enum IRFileProto`, `struct IRButton`, `struct IRFileEntry`, `enum BtnType`, `struct IRBtnPos`, and `struct IRLearnData` are all defined **before** `#include <ArduinoJson.h>` (the last `#include` in the sketch). Arduino auto-generates function prototypes after the last `#include`; these types must be visible at that point. Do not move them below that include.
@@ -47,6 +51,8 @@ ESP32-C6 has only one HP I2C controller (`Wire`). The LP I2C SDA is hardware-loc
 ### Speaker (MAX98357A I2S)
 
 Main-loop polling only — no FreeRTOS task. `spkUpdate()` is called every `loop()` iteration and writes up to 512 synthesised samples via `i2s_channel_write()` with `timeout_ms = 0` (non-blocking; samples drop rather than stall). A FreeRTOS task approach caused resets on the single-core ESP32-C6 and was replaced with this design.
+
+`spkPlayBootChime()` (called from `setup()`, where blocking is acceptable) waits for the chime to drain but is **hard-capped at 1.5 s** with a `spkStop()` cleanup on timeout, so a stalled I2S DMA can never hang boot. Only runs when `spkEnabled` (NVS `spkOn`, default off).
 
 ### RF433 TX pin must be LOW before GROVE power-on
 
@@ -110,9 +116,9 @@ All control commands flow through `transmitRemoteCommand(L, R)` → a transport 
 
 Sent at the readGamePad rate (~10 Hz) including when centered, so the receiver can implement a failsafe timeout. **The receiver firmware must parse this frame** — use the same NessoLink library (`nessoDecode()`). Backends:
 - **`TX_WIFI_UDP`** (default, fully working) — `udp` to `targetIpAddress:udpPort`. Unchanged from the original single-path implementation.
-- **`TX_BLE`** (working) — notifies the existing NESSO BLE UART TX characteristic (`pBLETxChar`); requires a connected central (`btConnected`).
+- **`TX_BLE`** (working) — routes through the library's `NessoBleLink` (`#include <NessoLinkBLE.h>`, global `bleLink`). `txBle()` lazily injects two sinks into `bleLink.begin()`: a notify sink (writes/notifies the existing NESSO BLE UART TX characteristic `pBLETxChar`) and a ready predicate (`bleUartReady && pBLETxChar && btConnected`). The link never owns the BLE stack.
 - **`TX_WIFI_TCP`** (minimal) — lazy `NetworkClient` connect to `targetIpAddress:tcpPort` (default 8890, in config.json `tcp_port`), `setNoDelay(true)`.
-- **`TX_LORA`** (stub) — rate-gated no-op. `lora.transmit()` is blocking (100+ ms at SF11) and EU868 is duty-cycle limited, so it needs async `startTransmit()` + rate limiting before it's a usable control link. Not for live driving.
+- **`TX_LORA`** (not yet live) — routes through the library's `NessoLoRaLink` (`#include <NessoLinkLoRa.h>`, global `loraLink`), which already does the async `startTransmit()` + duty-cycle rate gating (non-blocking; drops frames rather than stalling). Selecting it no longer stalls the loop. It stays a **safe no-op until a radio is wired** via `loraLink.begin(&lora, ...)` — deliberately NOT done in `txLora()` because `begin()` installs a DIO1 action that would clobber the LoRa-scanner ISR, and the SX1262 isn't brought up in the Controller context. Live LoRa TX still needs that radio-lifecycle handoff. Even wired, EU868 ~1% duty cycle makes it a low-rate command/telemetry link, not a live joystick path.
 
 Selectable from Controller settings ("TX LINK" row, item 6) or serial `ctrl link udp|ble|tcp|lora`. ESP32-C6 has one radio — BLE and WiFi coexist but contend, so BLE mode generally wants WiFi off.
 
@@ -134,6 +140,13 @@ When both are present (`joystickAvailable && miniJoyCAvailable`) the controller 
 Bus cost: reading both per cycle includes the seesaw's 40 ms `analogRead` averaging **plus** a Mini JoyC `Wire.end()/begin()` HAT-bus switch — fine at the ~10 Hz poll.
 
 `renderControllerDual()` draws the two discs **side by side** (left = drive, right = aux) in both portrait and landscape, with an info strip below; landscape uses smaller discs (r=24) and a compact button row to fit the short height.
+
+### Controller button reading (don't let it stick or drop)
+
+Three traps, all fixed and all easy to reintroduce:
+- **Seesaw read must be probe-guarded.** `Adafruit_seesaw::digitalReadBulk()` reads into an *uninitialised* buffer and ignores the I2C result — on a NAK it returns stack garbage, which (buttons are active-LOW) latches random "pressed" bits into `gamepadButtons` that persist on screen *and* in the TX frame (stuck buttons). `readGamePadButtons()` probes `0x50` with `Wire.endTransmission()` first and only trusts `digitalReadBulk()` when the seesaw ACKs; otherwise it keeps the last good snapshot. The Mini JoyC HAT-bus re-pinning makes these NAKs more likely.
+- **Sample buttons in lockstep with the frame.** `readGamePadButtons()` runs in the same 100 ms tick as `readGamePad()` and **before** it (which builds/sends the frame). A slower separate timer left up to its period of stale "pressed" frames after release.
+- **`remoteButtonBits()` must MERGE both sources, not `else if`.** The seesaw block and the Mini JoyC `STICK` bit are independent `if`s — with `else if` the JoyC stick button is silently dropped from the frame in dual-stick mode (the device screen still showed it because it reads `miniJoyCBtn` directly). The Mini JoyC button is read inside `readMiniJoyCAxes()` (the same HAT-bus window as its axes — one re-pin per cycle) and fails safe to "released" on a bad read (`miniJoyCReadByte` → `0xFF`), so it can't stick on the way the seesaw can.
 
 ### BLE HID gamepad mode ("standard controller")
 
