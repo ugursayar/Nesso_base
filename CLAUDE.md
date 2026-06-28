@@ -77,6 +77,9 @@ Both use GPIO 4 via different ISR handlers. `irLearnStart()` refuses if `rf433Le
 #define RF433_MAX_ISR_LEN 512
 #define RF433_RX_PIN      4
 #define RF433_TX_PIN      5
+
+#define MINIJOYC_ADDR   0x54   // Mini JoyC HAT, HAT bus G6/G7
+#define JOYSTICK2_ADDR  0x63   // Unit JoyStick2, Grove bus G5/G4 (+ GROVE_POWER_EN)
 ```
 
 ### Mini JoyC HAT (M5Stack, STM32F030, I2C 0x54)
@@ -97,24 +100,40 @@ Runtime reads use **calibrated registers 0x10/0x12** (not raw ADC). The raw `hor
 
 Default axis transforms (`ctrlSwapXY`/`ctrlInvertX`/`ctrlInvertY`/`ctrlDeadzoneIdx`) are all OFF / default and **persisted to NVS** (keys `ctrlSXY`/`ctrlIX`/`ctrlIY`/`ctrlDZ`) on APPLY. Adjustable from the Controller settings screen (KEY1 long-press) or via serial: `ctrl invertx|inverty|swap on|off`, `ctrl dz 0-3`, `ctrl calibrate`. The flags are global (all rotations); landscape may need per-axis tuning since they can't differ per-rotation.
 
+### Unit JoyStick2 (M5Stack, STM32G030, I2C 0x63)
+
+A **third** joystick input. It's a Grove I2C unit, so it shares the **Grove bus (SDA=GPIO5, SCL=GPIO4)** and `GROVE_POWER_EN` (5V) with the RFID2 unit — different addresses (0x63 vs 0x28), but physically only one device fits the Grove port, so in practice JoyStick2 / RFID2 / IR / RF433 are mutually exclusive there. It reuses `rfid2WireGrove()`/`rfid2WireRestore()` (aliased `joystick2WireGrove()`/`joystick2WireRestore()`) to re-pin `Wire` to GPIO5/4 around each access. Probed at boot (`joystick2Available`) inside the same GROVE-power window as the RFID2 probe. GROVE power is held **HIGH for the whole controller session** (`initGamePad()` powers it; the leave-controller block drops it unless IR/RF433 hold it).
+
+**Cold-boot settle gotcha (this is what made it "not appear"):** the STM32G030 needs **~300 ms after power-on** before it ACKs on I2C — far longer than the RFID2's ~100 ms. A single probe ~150 ms in NAKs and the unit gets marked absent *for the whole session* (boot-only probe). So **both** probe sites retry: the boot probe loops up to 6× (`delay(60)` between tries, ~360 ms total), and `initGamePad()` waits 120 ms + retries 6× after powering GROVE (GROVE power is *cold* on every controller-screen entry). Keep these retry loops — without them detection is flaky. The `i2c` serial command (scans all three buses) is the diagnostic for this; its GROVE scan waits 400 ms for the same reason.
+
+Register map (M5Unit-JoyStick2 library):
+- **Reg 0x50** → offset/centered **12-bit axes**, `int16` LE X (0x50/0x51) then Y (0x52/0x53), ~±2048, auto-centered by the unit's stored calibration (**no software zeroing**). Read in one 4-byte transaction by `joystick2ReadAxes()`.
+- **Reg 0x20** → button, 1 byte (0=pressed). Read fail-safe to "released" on NAK (0xFF).
+- **Reg 0x30** → RGB LED, uint32 LE (cosmetic idle/pressed indicator; channel order not verified).
+
+`readJoystick2Axes()` normalises the ±2048 reading to the ±512 scale the **shared deadzone** (`CTRL_DEADZONE_VALS`) expects, then to ±515 like the other sticks, in the **same (px=horizontal-right-positive, py=vertical-up-negative) convention as the Mini JoyC** so it feeds the shared `applyStickRotation()` table identically (always rotation-adapts, like the front-mounted Mini JoyC). **Axis mapping (verified on hardware):** the unit's **Y register drives screen-horizontal and its X register screen-vertical (interchanged), and both are inverted** — i.e. `horiz = jy/4`, `vert = -jx/4`. If a future unit reads differently, that one function is where to adjust.
+
 ### Remote control transport layer
 
-All control commands flow through `transmitRemoteCommand(L, R)` → a transport dispatcher selected by `remoteTransportIdx` (`enum RemoteTransport`, persisted to NVS key `txLink`). The payload is the **15-byte versioned RemoteFrame v1**, encoded by the **NessoLink library** (`#include <NessoFrame.h>` → `NessoFrame` + `nessoEncode()`) — the same codec the robot receiver uses (repo: `github.com/ugursayar/NessoLink`, installed at `D:\packages\arduino\user\libraries\NessoLink`). The firmware only fills a `NessoFrame` (motors from `transmitCmd`, `remoteAux*`, `remoteButtonBits()`, `++remoteSeq`); the byte layout, CRC-8, and `NESSO_*` constants live in the library. Wire layout (little-endian, CRC-8 checked):
+All control commands flow through `transmitRemoteCommand(L, R)` → a transport dispatcher selected by `remoteTransportIdx` (`enum RemoteTransport`, persisted to NVS key `txLink`). The payload is the **versioned RemoteFrame**, encoded by the **NessoLink library** (`#include <NessoFrame.h>` → `NessoFrame` + `nessoEncode()`) — the same codec the robot receiver uses (repo: `github.com/ugursayar/NessoLink`, installed at `D:\packages\arduino\user\libraries\NessoLink`). The firmware only fills a `NessoFrame` (motors from `transmitCmd`, `remoteAux*`/`remoteAux2*`, `remoteButtonBits()`, `++remoteSeq`); the byte layout, CRC-8, and `NESSO_*` constants live in the library. `nessoEncode()` emits the **minimal** version that fits the data: **v1 (15 bytes)** for drive + ≤1 aux stick, **v2 (19 bytes)** only when a second aux stick is present (three-joystick mode). `nessoDecode()` accepts either, so a 1-/2-stick setup stays byte-compatible with existing v1 receivers. Wire layout (little-endian, CRC-8 checked):
 
 | off | field | type | notes |
 |----|----|----|----|
 | 0 | magic | u8 | `0xA5` |
-| 1 | version | u8 | `NESSO_PROTO_VER` (1) |
+| 1 | version | u8 | `1` (v1) or `2` (v2) |
 | 2 | seq | u8 | rolling, for dedup/loss detection |
 | 3–4 | leftMotor | i16LE | -255..255 |
 | 5–6 | rightMotor | i16LE | -255..255 |
-| 7–8 | auxX | i16LE | right-stick X, -515..515 (0 until dual-stick) |
-| 9–10 | auxY | i16LE | right-stick Y (0 until dual-stick) |
-| 11–12 | buttons | u16LE | bitfield, 1=pressed: A=0,B=1,X=2,Y=3,SEL=4,START=5,STICK=6 |
-| 13 | flags | u8 | bit0=right-stick present; rest reserved |
-| 14 | crc8 | u8 | poly 0x07, init 0x00, over bytes 0..13 |
+| 7–8 | auxX | i16LE | aux stick 1 X, -515..515 (0 unless `hasAux`) |
+| 9–10 | auxY | i16LE | aux stick 1 Y (0 unless `hasAux`) |
+| 11–12 | buttons | u16LE | bitfield, 1=pressed: A=0,B=1,X=2,Y=3,SEL=4,START=5,STICK=6,STICK2=7 |
+| 13 | flags | u8 | bit0=aux1 present, bit1=aux2 present; rest reserved |
+| 14 | crc8 (v1) | u8 | poly 0x07, init 0x00, over bytes 0..13 — **v1 ends here** |
+| 14–15 | aux2X (v2) | i16LE | aux stick 2 X (0 unless `hasAux2`) |
+| 16–17 | aux2Y (v2) | i16LE | aux stick 2 Y |
+| 18 | crc8 (v2) | u8 | poly 0x07, init 0x00, over bytes 0..17 |
 
-Sent at the readGamePad rate (~10 Hz) including when centered, so the receiver can implement a failsafe timeout. **The receiver firmware must parse this frame** — use the same NessoLink library (`nessoDecode()`). Backends:
+Size send/decode buffers with `NESSO_FRAME_MAX_LEN` (19) and use the length `nessoEncode()` returns. Sent at the readGamePad rate (~10 Hz) including when centered, so the receiver can implement a failsafe timeout. **The receiver firmware must parse this frame** — use the same NessoLink library (`nessoDecode()`). Backends:
 - **`TX_WIFI_UDP`** (default, fully working) — `udp` to `targetIpAddress:udpPort`. Unchanged from the original single-path implementation.
 - **`TX_BLE`** (working) — routes through the library's `NessoBleLink` (`#include <NessoLinkBLE.h>`, global `bleLink`). `txBle()` lazily injects two sinks into `bleLink.begin()`: a notify sink (writes/notifies the existing NESSO BLE UART TX characteristic `pBLETxChar`) and a ready predicate (`bleUartReady && pBLETxChar && btConnected`). The link never owns the BLE stack.
 - **`TX_WIFI_TCP`** (minimal) — lazy `NetworkClient` connect to `targetIpAddress:tcpPort` (default 8890, in config.json `tcp_port`), `setNoDelay(true)`.
@@ -122,9 +141,11 @@ Sent at the readGamePad rate (~10 Hz) including when centered, so the receiver c
 
 Selectable from Controller settings ("TX LINK" row, item 6) or serial `ctrl link udp|ble|tcp|lora`. ESP32-C6 has one radio — BLE and WiFi coexist but contend, so BLE mode generally wants WiFi off.
 
-### Dual-stick (seesaw + Mini JoyC together)
+### Multi-stick (1–3 joysticks: seesaw + Mini JoyC + Unit JoyStick2)
 
-When both are present (`joystickAvailable && miniJoyCAvailable`) the controller runs **dual-stick**: one stick drives (full pipeline → `leftMotor`/`rightMotor`), the other is the **aux** stick (no drive flags → `auxX`/`auxY` + frame `flags` bit0). `readGamePad()` reads both each cycle via `readSeesawAxes()` / `readMiniJoyCAxes()`, computes a **screen-relative (rx,ry) per physical stick**, then assigns drive/aux roles. `dualPrimaryMiniJoyC` (NVS `dualPriMJC`, default true = Mini JoyC drives) selects which is primary; set via serial `ctrl primary joyc|pad`. Both stick buttons are read and merged into the frame bitfield. `renderController()` branches to `renderControllerDual()` showing two stick discs (DRIVE/AUX) when both are connected.
+Up to **three** joysticks can be connected at once — they live on three separate I2C buses (seesaw = main GPIO10/8, Mini JoyC = HAT GPIO6/7, JoyStick2 = Grove GPIO5/4) so any combination coexists. `connectedStickCount()` (0..3) drives controller-screen visibility, the role logic, and the settings rows.
+
+**Roles** (resolved every `readGamePad()` cycle): one stick **drives** (full pipeline → `leftMotor`/`rightMotor`), the rest become **aux** sticks. The `CtrlStickDev` enum (`SEESAW=0, MINIJOYC=1, JOYSTICK2=2`) is the **canonical order** used for aux assignment. The drive device is `ctrlPrimaryDev` (NVS `ctrlPrim`, default `MINIJOYC`; migrated from the old `dualPriMJC` bool) **if it's connected**, else the first connected device; the remaining connected devices become **aux1, aux2** in canonical order. Aux1 → `auxX`/`auxY` + `flags` bit0; aux2 → `aux2X`/`aux2Y` + `flags` bit1 (which promotes the frame to v2). `readGamePad()` reads each connected stick into a per-device screen-relative `(rx,ry)` (`devRx[]`/`devRy[]`), then assigns roles. `ctrlDriveLabel`/`ctrlAux1Label`/`ctrlAux2Label` (device names) are resolved for the render. Set the primary via the "PRIMARY" settings row (cycles connected devices, shown when ≥2 sticks) or serial `ctrl primary pad|joyc|joy2`. All stick click-buttons merge into the frame (Mini JoyC → `STICK`, JoyStick2 → `STICK2`). `renderController()` branches to `renderControllerMulti(n)` showing **n stick discs** (drive + aux1 [+ aux2]) when ≥2 are connected.
 
 **Per-stick rotation adaptation:** the Mini JoyC *always* rotation-adapts (front-mounted). The seesaw uses a **stick-mount** model (`seesawMountIdx`, NVS `ssMount`): a base transform (`applySeesawOrient()`) → then, **only for ATTACHED mounts**, the screen-rotation table (`applyStickRotation()`). The attached/detached distinction is the key insight — an attached stick rotates *with* the device so it must reflect screen orientation; a detached stick is held independently so it must **not** follow device rotation.
 
@@ -135,18 +156,18 @@ When both are present (`joystickAvailable && miniJoyCAvailable`) the controller 
 | 2 `SS_DETACHED_PORTRAIT` | DET-PORT | bx=−px, by=py | OFF (detached) |
 | 3 `SS_DETACHED_LANDSCAPE` | DET-LAND | bx=py, by=px | OFF (detached) |
 
-`seesawAppliesRotation()` returns true for side/back only. SIDE/BACK are confirmed working (rotation-adapting). The DETACHED base signs are best-guesses — verify by testing. Selectable via the "MOUNT" settings row (shown only when a seesaw is present) or serial `ctrl ssmount 0-3` (side/back/detport/detland). The Mini JoyC is unaffected.
+`seesawAppliesRotation()` returns true for side/back only. SIDE/BACK are confirmed working (rotation-adapting). The DETACHED base signs are best-guesses — verify by testing. Selectable via the "MOUNT" settings row (shown only when a seesaw is present) or serial `ctrl ssmount 0-3` (side/back/detport/detland). The Mini JoyC and JoyStick2 are unaffected (both always rotation-adapt).
 
-Bus cost: reading both per cycle includes the seesaw's 40 ms `analogRead` averaging **plus** a Mini JoyC `Wire.end()/begin()` HAT-bus switch — fine at the ~10 Hz poll.
+Bus cost: reading all connected sticks per cycle includes the seesaw's 40 ms `analogRead` averaging **plus** a `Wire.end()/begin()` switch for each of the Mini JoyC (HAT bus) and JoyStick2 (Grove bus) — fine at the ~10 Hz poll. Order: seesaw (main bus) → Mini JoyC (HAT, restore) → JoyStick2 (Grove, restore), so `Wire` is back on the main bus at cycle end.
 
-`renderControllerDual()` draws the two discs **side by side** (left = drive, right = aux) in both portrait and landscape, with an info strip below; landscape uses smaller discs (r=24) and a compact button row to fit the short height.
+`renderControllerMulti(n)` draws **n discs evenly across the width** (disc 1 = drive, 2 = aux1, 3 = aux2, each labelled with its device name) in both orientations: radius shrinks with stick count so three fit the 135px portrait width (and the 240px landscape width). Below them: the drive action string, L/R motor values, and a button row. **Button layout differs by orientation:** portrait draws a `SEL/STA/JC/J2` row plus the seesaw face cluster (Y/X/A/B) as a diamond below; landscape (only ~113px tall — no room for the diamond) **flattens everything into one bottom row** (`SEL STA A B X Y JC J2`) with the spacing auto-shrinking (`constrain((sw-28)/nb, 16, 26)`) to fit. Forgetting the landscape case is how face buttons "disappear" when rotating.
 
 ### Controller button reading (don't let it stick or drop)
 
 Three traps, all fixed and all easy to reintroduce:
 - **Seesaw read must be probe-guarded.** `Adafruit_seesaw::digitalReadBulk()` reads into an *uninitialised* buffer and ignores the I2C result — on a NAK it returns stack garbage, which (buttons are active-LOW) latches random "pressed" bits into `gamepadButtons` that persist on screen *and* in the TX frame (stuck buttons). `readGamePadButtons()` probes `0x50` with `Wire.endTransmission()` first and only trusts `digitalReadBulk()` when the seesaw ACKs; otherwise it keeps the last good snapshot. The Mini JoyC HAT-bus re-pinning makes these NAKs more likely.
 - **Sample buttons in lockstep with the frame.** `readGamePadButtons()` runs in the same 100 ms tick as `readGamePad()` and **before** it (which builds/sends the frame). A slower separate timer left up to its period of stale "pressed" frames after release.
-- **`remoteButtonBits()` must MERGE both sources, not `else if`.** The seesaw block and the Mini JoyC `STICK` bit are independent `if`s — with `else if` the JoyC stick button is silently dropped from the frame in dual-stick mode (the device screen still showed it because it reads `miniJoyCBtn` directly). The Mini JoyC button is read inside `readMiniJoyCAxes()` (the same HAT-bus window as its axes — one re-pin per cycle) and fails safe to "released" on a bad read (`miniJoyCReadByte` → `0xFF`), so it can't stick on the way the seesaw can.
+- **`remoteButtonBits()` must MERGE all sources, not `else if`.** The seesaw block, the Mini JoyC `STICK` bit, and the JoyStick2 `STICK2` bit are independent `if`s — with `else if` a thumbstick button would be silently dropped from the frame in multi-stick mode (the device screen still showed it because it reads `miniJoyCBtn`/`joystick2Btn` directly). Each thumbstick button is read inside its own axes read (`readMiniJoyCAxes()` / `readJoystick2Axes()`, same bus window as the axes — one re-pin per cycle) and fails safe to "released" on a bad read (`0xFF`), so neither can stick the way the seesaw can.
 
 ### BLE HID gamepad mode ("standard controller")
 
@@ -158,4 +179,4 @@ Non-obvious constraints (the reasons it's gated, not free-running):
 - **No USB HID.** ESP32-C6 has only a fixed-function USB Serial/JTAG controller (no USB-OTG), so a USB gamepad is impossible on this silicon — BLE HID is the only standard-controller path. C6 is also BLE-only (no Classic BT), so consoles won't pair; works on PC (DirectInput — Steam Input maps it) / Android.
 - **Untested on hardware** as written — report-map/axis-sign/bonding details may need iteration with a real host.
 
-The Controller **settings screen** is device-aware: `controllerSettingsItemCount()` = base 6 (CALIBRATE, DEADZONE, SWAP XY, INVERT X, INVERT Y, TX LINK) **+ MOUNT** when a seesaw is present (index 6) **+ PRIMARY** in dual mode (index 7). Fixed case indices stay valid because index 6 is only reachable with a seesaw and 7 only in dual. Title is "DUAL STICK SETTINGS" when both present. CALIBRATE/DEADZONE are active whenever `miniJoyCAvailable`. The count is centralized in that helper — render, tap, cursor-wrap (`onKey2Short`), and swipe-bound (`onSwipe`) all call it. Serial equivalents: `ctrl primary joyc|pad`, `ctrl ssmount 0-3`, `ctrl dz`, `ctrl calibrate`.
+The Controller **settings screen** is device-aware: `controllerSettingsItemCount()` = base 6 (CALIBRATE, DEADZONE, SWAP XY, INVERT X, INVERT Y, TX LINK) **+ MOUNT** when a seesaw is present **+ PRIMARY** when ≥2 sticks are connected. The optional rows are **dynamically indexed** (MOUNT before PRIMARY) — `renderControllerSettings()` builds the label/value arrays in order, and `onKey1Short`'s `default:` case walks the same order from index 6, so PRIMARY landing at index 6 (no seesaw) or 7 (with seesaw) both resolve correctly. Title is "TRIPLE/DUAL STICK SETTINGS" by count, else "MINIJOYC/JOYSTICK2/GAMEPAD SETTINGS". CALIBRATE/DEADZONE are active whenever a tunable stick is present (`ctrlHasTunableStick()` = Mini JoyC **or** JoyStick2; the seesaw lazy-calibrates and JoyStick2 self-centres). The count is centralized in that helper — render, tap, cursor-wrap (`onKey2Short`), and swipe-bound (`onSwipe`) all call it. Serial equivalents: `ctrl primary pad|joyc|joy2`, `ctrl ssmount 0-3`, `ctrl dz`, `ctrl calibrate`.

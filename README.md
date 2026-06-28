@@ -1,6 +1,6 @@
 # Nesso_base
 
-Arduino firmware for the **Arduino Nesso N1** handheld controller — a WiFi-enabled base station that drives a remote robot platform over a selectable wireless link (WiFi-UDP/TCP, BLE, LoRa). Features a 240×135px TFT display with a multi-mode menu, battery monitoring, single- or dual-stick gamepad input (Adafruit seesaw and/or M5Stack Mini JoyC HAT), IR and 433 MHz RF remote control, RFID card scanning, and a web-based file manager.
+Arduino firmware for the **Arduino Nesso N1** handheld controller — a WiFi-enabled base station that drives a remote robot platform over a selectable wireless link (WiFi-UDP/TCP, BLE, LoRa). Features a 240×135px TFT display with a multi-mode menu, battery monitoring, 1–3 stick gamepad input (Adafruit seesaw, M5Stack Mini JoyC HAT, and/or M5Stack Unit JoyStick2), IR and 433 MHz RF remote control, RFID card scanning, and a web-based file manager.
 
 ## Table of Contents
 
@@ -22,15 +22,18 @@ Arduino firmware for the **Arduino Nesso N1** handheld controller — a WiFi-ena
 ## Hardware Requirements
 
 - **Arduino Nesso N1** board (ESP32-C6)
-- Optional accessories (GROVE PORT.CUSTOM):
+- Optional accessories (GROVE PORT.CUSTOM, SDA=GPIO 5 / SCL=GPIO 4):
   - M5Stack IR Unit (U002) — IR remote learn/transmit
   - M5Stack RF433T + RF433R units (Y-cable) — 433 MHz remote learn/transmit
   - M5Stack RFID2 Unit (WS1850S) — ISO/IEC 14443-A card scanning
+  - M5Stack Unit JoyStick2 (STM32G030, I2C `0x63`) — joystick for robot control (shares the GROVE port with the units above, so one at a time)
 - Optional HATs (HAT bus, SDA=GPIO 6 / SCL=GPIO 7):
   - M5Stack Speaker Hat 2 (MAX98357A) — high-quality I2S audio output
   - M5StickC Mini JoyC HAT (STM32F030, I2C `0x54`) — front-mounted joystick for robot control
 - Optional controller:
-  - Adafruit seesaw mini gamepad (I2C `0x50`) — stick + 6 buttons
+  - Adafruit seesaw mini gamepad (I2C `0x50`, main Wire) — stick + 6 buttons
+
+The three joysticks live on separate I2C buses, so up to **three** can be connected at once for multi-stick control.
 
 **Required libraries:** `Adafruit seesaw`, `Arduino_Nesso_N1`, `MFRC522_I2C` (for RFID2), `NessoLink` (control-frame codec — [github.com/ugursayar/NessoLink](https://github.com/ugursayar/NessoLink), install into your Arduino `libraries/` folder)
 
@@ -457,25 +460,37 @@ Controller mode reads a joystick and transmits motor + button commands to a remo
 |---|---|---|
 | Adafruit seesaw mini gamepad | I2C `0x50` (main Wire) | Stick + A/B/X/Y/SELECT/START |
 | M5Stack Mini JoyC HAT (STM32F030) | I2C `0x54` (HAT bus, GPIO 6/7) | Stick + button; self-powered |
+| M5Stack Unit JoyStick2 (STM32G030) | I2C `0x63` (GROVE bus, GPIO 5/4) | Stick + button; GROVE 5V powered |
 
-One connected → it drives directly. **Both** connected → **dual-stick**: one stick drives the motors, the other is an **aux** stick (camera/turret → `auxX`/`auxY`). `PRIMARY` selects which drives (default: Mini JoyC). The Mini JoyC always follows screen rotation; the seesaw follows it only in attached `MOUNT` modes (see below).
+They sit on three separate buses, so **1, 2, or 3** can be used together:
 
-### Wire protocol — RemoteFrame v1
+- **1 stick** → it drives the motors directly.
+- **2 sticks** → one drives, the other is an **aux** stick (camera/turret → `auxX`/`auxY`).
+- **3 sticks** → one drives + **two** aux sticks (`auxX`/`auxY` and `aux2X`/`aux2Y`, the second carried in a v2 frame).
 
-Every link sends the same **15-byte little-endian frame**, encoded by the shared **[NessoLink](https://github.com/ugursayar/NessoLink)** library (`nessoEncode()`); the robot receiver decodes it with the same library (`nessoDecode()`). Magic + version + CRC let it validate:
+`PRIMARY` selects which stick drives (default: Mini JoyC); the rest become aux1/aux2 in the order seesaw → Mini JoyC → JoyStick2. The Controller screen shows one disc per connected stick (drive first). The Mini JoyC and JoyStick2 always follow screen rotation; the seesaw follows it only in attached `MOUNT` modes (see below).
+
+### Wire protocol — RemoteFrame (v1 / v2)
+
+Every link sends the same little-endian frame, encoded by the shared **[NessoLink](https://github.com/ugursayar/NessoLink)** library (`nessoEncode()`); the robot receiver decodes it with the same library (`nessoDecode()`). Magic + version + CRC let it validate. There are two versions — the firmware sends the **minimal** one and `nessoDecode()` accepts either, so existing v1 receivers keep working for 1–2 stick setups:
+
+- **v1 (15 bytes)** — drive + up to one aux stick. Sent unless a third stick is connected.
+- **v2 (19 bytes)** — adds a second aux stick (`aux2X`/`aux2Y`). Sent only in three-joystick mode.
 
 | off | field | type | notes |
 |---|---|---|---|
 | 0 | magic | u8 | `0xA5` |
-| 1 | version | u8 | `1` |
+| 1 | version | u8 | `1` (v1) or `2` (v2) |
 | 2 | seq | u8 | rolling sequence (dedup / loss detection) |
 | 3–4 | leftMotor | i16 | −255..255 |
 | 5–6 | rightMotor | i16 | −255..255 |
-| 7–8 | auxX | i16 | aux stick X (0 unless dual-stick) |
-| 9–10 | auxY | i16 | aux stick Y |
-| 11–12 | buttons | u16 | bitfield, 1 = pressed: A=0, B=1, X=2, Y=3, SELECT=4, START=5, STICK=6 |
-| 13 | flags | u8 | bit0 = aux stick present |
-| 14 | crc8 | u8 | poly `0x07`, init `0x00`, over bytes 0..13 |
+| 7–8 | auxX | i16 | aux stick 1 X (0 unless aux present) |
+| 9–10 | auxY | i16 | aux stick 1 Y |
+| 11–12 | buttons | u16 | bitfield, 1 = pressed: A=0, B=1, X=2, Y=3, SELECT=4, START=5, STICK=6, STICK2=7 |
+| 13 | flags | u8 | bit0 = aux1 present, bit1 = aux2 present |
+| 14 | crc8 (v1) | u8 | poly `0x07`, init `0x00`, over bytes 0..13 — **v1 ends here** |
+| 14–17 | aux2X / aux2Y (v2) | i16×2 | aux stick 2 X/Y |
+| 18 | crc8 (v2) | u8 | poly `0x07`, init `0x00`, over bytes 0..17 |
 
 Sent continuously at ~10 Hz (even when centered) so the receiver can implement a failsafe (stop motors if no valid frame for N ms).
 
@@ -494,12 +509,12 @@ Open controller settings with **long-press KEY1**, or use the `ctrl …` serial 
 
 | Setting | Options |
 |---|---|
-| **CALIBRATE** | Mini JoyC: write center to its STM32 flash · seesaw: re-zero on next read |
-| **DEADZONE** | Mini JoyC deadzone: 8 / 16 / 30 / 50 |
+| **CALIBRATE** | Mini JoyC: write center to its STM32 flash · seesaw: re-zero on next read · JoyStick2: self-centres (no manual cal) |
+| **DEADZONE** | Mini JoyC / JoyStick2 deadzone: 8 / 16 / 30 / 50 |
 | **SWAP XY / INVERT X / INVERT Y** | drive-stick axis transforms |
 | **TX LINK** | wireless link (table above) |
 | **MOUNT** (seesaw) | `SIDE` / `BACK` — attached, follows screen rotation · `DET-PORT` / `DET-LAND` — detached, fixed to the stick |
-| **PRIMARY** (dual-stick) | which stick drives: `JOYC` / `PAD` |
+| **PRIMARY** (2+ sticks) | which stick drives: `PAD` / `JOYC` / `JOY2` (cycles connected sticks) |
 
 ---
 
@@ -519,6 +534,7 @@ Connect at **115200 baud**. Commands work over both USB serial and BLE UART (`ne
 | `clock` | Print current date/time (NTP) |
 | `battery` | Print voltage, percentage, charge state, uptime |
 | `webfm` | Print web file manager URL |
+| `i2c` | Scan all three I2C buses (main / HAT / GROVE) and list responders — handy for checking joystick/unit detection |
 
 ### Controller (`ctrl`)
 
@@ -530,10 +546,10 @@ Connect at **115200 baud**. Commands work over both USB serial and BLE UART (`ne
 | `ctrl invertx on\|off` | Invert turn (X) axis |
 | `ctrl inverty on\|off` | Invert forward/back (Y) axis |
 | `ctrl swap on\|off` | Swap X/Y |
-| `ctrl dz 0-3` | Mini JoyC deadzone (8 / 16 / 30 / 50) |
+| `ctrl dz 0-3` | Mini JoyC / JoyStick2 deadzone (8 / 16 / 30 / 50) |
 | `ctrl calibrate` | Calibrate Mini JoyC center → STM32 flash |
 | `ctrl link udp\|ble\|tcp\|lora` | Select wireless link |
-| `ctrl primary joyc\|pad` | Dual-stick: which stick drives |
+| `ctrl primary pad\|joyc\|joy2` | Which stick drives (2+ sticks connected) |
 | `ctrl ssmount 0-3` | Seesaw mount: `side`/`back` (attached) · `detport`/`detland` (detached) |
 
 ### Filesystem (`fs`)
