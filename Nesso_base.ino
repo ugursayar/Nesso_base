@@ -5669,25 +5669,18 @@ void readGamePad() {
     return;
   }
 
-  if (rx < 0) {
-    resetActivity();
-    int16_t p = map(rx, 0, -515, 0, -255);
-    transmitRemoteCommand(p, p);
-  } else if (rx > 0) {
-    resetActivity();
-    int16_t p = map(rx, 0, 515, 0, 255);
-    transmitRemoteCommand(p, p);
-  } else if (ry < 0) {
-    resetActivity();
-    int16_t p = map(ry, 0, -515, 0, -255);
-    transmitRemoteCommand(p, -p);
-  } else if (ry > 0) {
-    resetActivity();
-    int16_t p = map(ry, 0, 515, 0, 255);
-    transmitRemoteCommand(p, -p);
-  } else {
-    transmitRemoteCommand(0, 0);
-  }
+  // Arcade mix using BOTH axes so throttle and turn combine every frame (fixes the
+  // old one-axis-at-a-time if/else). The axis roles match the rest of the firmware
+  // — the drive disc, the FORWARD/ROTATE labels, and the aux-stick model all treat
+  // the stick's X field (rx) as forward/back and its Y field (ry) as rotation. Working
+  // on the already-rotated rx/ry keeps it identical in every orientation.
+  //   rx > 0  = FORWARD        ry > 0 = ROTATE CW (turn right)
+  int16_t thr  = map(constrain((int)rx, -515, 515), -515, 515, -255, 255);  // forward = rx
+  int16_t turn = map(constrain((int)ry, -515, 515), -515, 515, -255, 255);  // turn    = ry
+  int16_t l = constrain(thr + turn, -255, 255);
+  int16_t r = constrain(thr - turn, -255, 255);
+  if (l != 0 || r != 0) resetActivity();
+  transmitRemoteCommand(l, r);
 }
 
 void readGamePadButtons() {
