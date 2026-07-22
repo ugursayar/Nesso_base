@@ -19,7 +19,7 @@ arduino-cli upload --fqbn "esp32:esp32:arduino_nesso_n1" --port COM3 --build-pat
 & "D:\packages\arduino\data\packages\esp32\tools\mklittlefs\4.0.2-db0513a\mklittlefs.exe" -c data -b 4096 -p 256 -s 0x9E0000 littlefs.bin
 
 # Flash LittleFS
-& "D:\packages\arduino\data\packages\esp32\tools\esptool_py\5.2.0\esptool.exe" --chip esp32c6 --port COM3 --baud 460800 write_flash 0x610000 littlefs.bin
+& "D:\packages\arduino\data\packages\esp32\tools\esptool_py\5.3.0\esptool.exe" --chip esp32c6 --port COM3 --baud 460800 write_flash 0x610000 littlefs.bin
 ```
 
 `--build-path` is required — arduino-cli v1.4.1 has a caching bug that corrupts the ESP32 BLE library archive without it.
