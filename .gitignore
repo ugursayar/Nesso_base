@@ -29,3 +29,6 @@ Thumbs.db
 # Build artifacts and tool databases
 *.zip
 ruvector.db
+
+# Local AI tooling state (ruflo)
+.claude-flow/
