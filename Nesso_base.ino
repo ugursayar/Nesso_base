@@ -6166,11 +6166,21 @@ static void txBle(const uint8_t* buf, size_t len) {
   bleLink.sendRaw(buf, len);
 }
 
+// TCP TX must NEVER stall the ~10 Hz control loop. NetworkClient::connect() blocks, so
+// if the robot isn't accepting (down, or a dual-link receiver mid-BLE-window) calling it
+// every frame freezes the controller. Rate-limit attempts and time-box each one; once the
+// connection is up, send() is a cheap non-blocking write.
+#define TCP_RECONNECT_MS       1000   // min gap between connect attempts while disconnected
+#define TCP_CONNECT_TIMEOUT_MS 300    // per-attempt blocking cap (ms)
+
 static void txWifiTcp(const uint8_t* buf, size_t len) {
   if (WiFi.status() != WL_CONNECTED) return;
   if (!tcpClient.connected()) {
+    static uint32_t lastTcpTry = 0;
+    if (millis() - lastTcpTry < TCP_RECONNECT_MS) return;   // don't hammer connect()
+    lastTcpTry = millis();
     tcpClient.stop();
-    if (!tcpClient.connect(targetIpAddress, tcpPort)) return;
+    if (!tcpClient.connect(targetIpAddress, tcpPort, TCP_CONNECT_TIMEOUT_MS)) return;
     tcpClient.setNoDelay(true);   // disable Nagle — control packets want low latency
   }
   tcpClient.write(buf, len);
