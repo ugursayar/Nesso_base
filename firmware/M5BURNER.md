@@ -28,6 +28,14 @@ and deadzone settings), IR and 433 MHz RF remote control, RFID card scanning,
 Speaker Hat 2 (MAX98357A) audio, an experimental BLE HID gamepad mode, and a
 web-based file manager.
 
+Robot side: control frames are encoded by the **NessoLink** Arduino library —
+install it from the IDE Library Manager (or `arduino-cli lib install NessoLink`,
+source: github.com/ugursayar/NessoLink) and decode with `nessoDecode()`. The
+library ships ready-made receiver examples for ESP32 (`RobotReceiverUDP/TCP/BLE`),
+Arduino Uno R4 WiFi (`UnoR4ReceiverUDP/TCP/BLE`), and M5 Cardputer ADV + Cap
+LoRa 1262 (`CardputerAdvLoRaReceiver`), so a robot can be up and driving with a
+few lines around `applyMotors()`.
+
 ## What's new in v1.1.0
 
 - Selectable robot TX link: WiFi-UDP / TCP / BLE / LoRa (NessoLink RemoteFrame v1/v2)
