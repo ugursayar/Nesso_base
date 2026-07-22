@@ -35,7 +35,7 @@ Arduino firmware for the **Arduino Nesso N1** handheld controller — a WiFi-ena
 
 The three joysticks live on separate I2C buses, so up to **three** can be connected at once for multi-stick control.
 
-**Required libraries:** `Adafruit seesaw`, `Arduino_Nesso_N1`, `MFRC522_I2C` (for RFID2), `NessoLink` (control-frame codec — [github.com/ugursayar/NessoLink](https://github.com/ugursayar/NessoLink), install into your Arduino `libraries/` folder)
+**Required libraries:** `Adafruit seesaw`, `Arduino_Nesso_N1`, `MFRC522_I2C` (for RFID2), `NessoLink` (control-frame codec — install from the Arduino IDE Library Manager / `arduino-cli lib install NessoLink`, or clone [github.com/ugursayar/NessoLink](https://github.com/ugursayar/NessoLink) into your Arduino `libraries/` folder)
 
 ---
 
