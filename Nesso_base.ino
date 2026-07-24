@@ -29,6 +29,7 @@
 #include <NessoLinkLoRa.h>  // NessoLoRaLink — async, duty-cycle-gated LoRa transport
 #include <Preferences.h>
 #include "esp_sleep.h"
+#include "esp_heap_caps.h"
 #include <IRremote.hpp>
 #include <LittleFS.h>
 #include <WebServer.h>
@@ -299,6 +300,7 @@ const uint8_t BRIGHTNESS_DIM  =  3;
 unsigned long lastActivityMs = 0;
 bool          displayDimmed  = false;
 bool          displayOff     = false;
+bool          spriteAllocFailed = false;  // createStatusSprite() couldn't get heap — retried each frame
 
 // ── Touch tracking ───────────────────────────────────────────────
 bool          touchReady   = false;
@@ -1589,12 +1591,30 @@ void loop() {
 void createStatusSprite() {
   statusSprite.deleteSprite();   // free both before allocating either —
   headerSprite.deleteSprite();   // avoids fragmentation when portrait needs more bytes than landscape
-  statusSprite.createSprite(display.width(), display.height() - g_spriteY);
-  headerSprite.createSprite(display.width(), SPRITE_Y);
+  bool ok = statusSprite.createSprite(display.width(), display.height() - g_spriteY) != nullptr;
+  ok = (headerSprite.createSprite(display.width(), SPRITE_Y) != nullptr) && ok;
+  // Portrait needs ~59KB contiguous vs ~54KB landscape; after hours of WiFi/BLE heap
+  // churn the alloc can fail. Silent failure = permanently empty screen (the old bug),
+  // so flag it and let renderFunction() retry every frame until the heap allows it.
+  if (!ok && !spriteAllocFailed) {
+    char buf[96];
+    snprintf(buf, sizeof(buf), "[DISPLAY] sprite alloc FAILED (%dx%d, largest free block %u) — retrying",
+             display.width(), display.height() - g_spriteY,
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+    serialWritelnAll(buf);
+  } else if (ok && spriteAllocFailed) {
+    serialWritelnAll("[DISPLAY] sprite alloc recovered");
+  }
+  spriteAllocFailed = !ok;
 }
 
 void updateOrientation() {
   if (key1Down || key2Down || touchActive) return;  // suppress during any input — avoids rotation during swipe
+  // Frozen while the display is dark: every rotation flap reallocates ~65KB of
+  // sprites, and hours of that churn alongside WiFi/BLE fragments the heap until
+  // the (larger) portrait alloc fails — the "empty screen after long sleep" bug.
+  // resetActivity() forces an immediate re-check on wake.
+  if (displayOff || displayDimmed) return;
   float ax, ay, az;
   if (!IMU.accelerationAvailable()) return;
   IMU.readAcceleration(ax, ay, az);
@@ -3081,6 +3101,9 @@ void serialPrintHelp() {
   serialWritelnAll("IMU / Orientation:");
   serialWritelnAll("  imu                    single accelerometer snapshot");
   serialWritelnAll("  imu debug on|off       stream readings every 300 ms");
+  serialWritelnAll("Diagnostics:");
+  serialWritelnAll("  heap                   free heap, largest block, sprite alloc state");
+  serialWritelnAll("  i2c                    scan all three I2C buses");
   serialWritelnAll("Web File Manager:");
   serialWritelnAll("  webfm                  print web file manager URL (WiFi required)");
   serialWritelnAll("===================================");
@@ -4181,6 +4204,16 @@ void serialHandleCommand(const char* raw) {
   if (!*raw) return;
 
   if      (cmdIs(raw,"i2c"))  serialHandleI2c(cmdArg(raw,"i2c"));
+  else if (cmdIs(raw,"heap")) {
+    char buf[112];
+    snprintf(buf, sizeof(buf), "[HEAP] free:%u  min-ever:%u  largest-block:%u  sprite:%s (%dx%d)",
+      (unsigned)esp_get_free_heap_size(),
+      (unsigned)esp_get_minimum_free_heap_size(),
+      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+      spriteAllocFailed ? "ALLOC-FAILED" : "ok",
+      statusSprite.width(), statusSprite.height());
+    serialWritelnAll(buf);
+  }
   else if (cmdIs(raw,"help")||cmdIs(raw,"?")) serialPrintHelp();
   else if (cmdIs(raw,"status"))     serialPrintStatus();
   else if (cmdIs(raw,"next"))       { onKey1Short(); serialPrintFunctionHelp((int)currentFunction); }
@@ -4254,6 +4287,15 @@ void serialCheckInput() {
 }
 
 void renderFunction() {
+
+  if (spriteAllocFailed) {
+    createStatusSprite();               // retry every frame until the heap has a big enough block
+    if (!spriteAllocFailed) {
+      lastFunction = -1;                // recovered: force a full redraw
+    } else if (currentFunction != FUNCTION_MAIN && currentFunction != FUNCTION_MEDIA) {
+      return;                           // sprite screens have nothing to render into yet;
+    }                                   // MAIN/MEDIA draw direct to the display — let them run
+  }
 
   if (lastFunction == (int)FUNCTION_LORA && currentFunction != FUNCTION_LORA && loraInitialized) {
     lora.standby();
@@ -7698,6 +7740,7 @@ bool resetActivity() {
     displayOff    = false;
     digitalWrite(LCD_BACKLIGHT, HIGH);  // restore backlight
     lastFunction = -1;   // force full redraw on next loop
+    lastOrientationMs = 0;  // orientation was frozen during sleep — re-check before the redraw
     if (btScanRequested && btInitialized && !btScanning && !btConnected) btStartScan();
   }
   return wasOff;
