@@ -300,7 +300,6 @@ const uint8_t BRIGHTNESS_DIM  =  3;
 unsigned long lastActivityMs = 0;
 bool          displayDimmed  = false;
 bool          displayOff     = false;
-bool          spriteAllocFailed = false;  // createStatusSprite() couldn't get heap — retried each frame
 
 // ── Touch tracking ───────────────────────────────────────────────
 bool          touchReady   = false;
@@ -1588,24 +1587,19 @@ void loop() {
 // IMU Orientation
 // ================================================================
 
+// Static sprite buffers, sized for the larger (portrait) orientation:
+// status 135x218 (landscape 240x113 fits inside), header 240x22.
+// Rotation changes just re-point the sprites at these fixed buffers, so
+// orientation switches never touch the heap. The portrait status sprite
+// needs 58,860 *contiguous* bytes and the measured largest free block sat
+// within ~520 bytes of that after normal use — heap fragmentation made the
+// realloc fail silently, which was the "empty screen after long sleep" bug.
+alignas(4) static uint8_t statusSpriteBuf[135 * (240 - SPRITE_Y) * 2];
+alignas(4) static uint8_t headerSpriteBuf[240 * SPRITE_Y * 2];
+
 void createStatusSprite() {
-  statusSprite.deleteSprite();   // free both before allocating either —
-  headerSprite.deleteSprite();   // avoids fragmentation when portrait needs more bytes than landscape
-  bool ok = statusSprite.createSprite(display.width(), display.height() - g_spriteY) != nullptr;
-  ok = (headerSprite.createSprite(display.width(), SPRITE_Y) != nullptr) && ok;
-  // Portrait needs ~59KB contiguous vs ~54KB landscape; after hours of WiFi/BLE heap
-  // churn the alloc can fail. Silent failure = permanently empty screen (the old bug),
-  // so flag it and let renderFunction() retry every frame until the heap allows it.
-  if (!ok && !spriteAllocFailed) {
-    char buf[96];
-    snprintf(buf, sizeof(buf), "[DISPLAY] sprite alloc FAILED (%dx%d, largest free block %u) — retrying",
-             display.width(), display.height() - g_spriteY,
-             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-    serialWritelnAll(buf);
-  } else if (ok && spriteAllocFailed) {
-    serialWritelnAll("[DISPLAY] sprite alloc recovered");
-  }
-  spriteAllocFailed = !ok;
+  statusSprite.setBuffer(statusSpriteBuf, display.width(), display.height() - g_spriteY);
+  headerSprite.setBuffer(headerSpriteBuf, display.width(), SPRITE_Y);
 }
 
 void updateOrientation() {
@@ -4206,11 +4200,10 @@ void serialHandleCommand(const char* raw) {
   if      (cmdIs(raw,"i2c"))  serialHandleI2c(cmdArg(raw,"i2c"));
   else if (cmdIs(raw,"heap")) {
     char buf[112];
-    snprintf(buf, sizeof(buf), "[HEAP] free:%u  min-ever:%u  largest-block:%u  sprite:%s (%dx%d)",
+    snprintf(buf, sizeof(buf), "[HEAP] free:%u  min-ever:%u  largest-block:%u  sprite:static (%dx%d)",
       (unsigned)esp_get_free_heap_size(),
       (unsigned)esp_get_minimum_free_heap_size(),
       (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
-      spriteAllocFailed ? "ALLOC-FAILED" : "ok",
       statusSprite.width(), statusSprite.height());
     serialWritelnAll(buf);
   }
@@ -4287,15 +4280,6 @@ void serialCheckInput() {
 }
 
 void renderFunction() {
-
-  if (spriteAllocFailed) {
-    createStatusSprite();               // retry every frame until the heap has a big enough block
-    if (!spriteAllocFailed) {
-      lastFunction = -1;                // recovered: force a full redraw
-    } else if (currentFunction != FUNCTION_MAIN && currentFunction != FUNCTION_MEDIA) {
-      return;                           // sprite screens have nothing to render into yet;
-    }                                   // MAIN/MEDIA draw direct to the display — let them run
-  }
 
   if (lastFunction == (int)FUNCTION_LORA && currentFunction != FUNCTION_LORA && loraInitialized) {
     lora.standby();
