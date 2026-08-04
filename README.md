@@ -496,6 +496,15 @@ Every link sends the same little-endian frame, encoded by the shared **[NessoLin
 
 Sent continuously at ~10 Hz (even when centered) so the receiver can implement a failsafe (stop motors if no valid frame for N ms).
 
+### Stopping
+
+Two things guarantee the robot stops, so a receiver failsafe is a backstop rather than the primary mechanism:
+
+- **Releasing the stick** mixes to `L=0, R=0`, and frames keep flowing at ~10 Hz — so the stop is transmitted immediately and repeatedly. The rest-position deadzone (all three sticks) is what makes a released stick read as *exactly* zero rather than a small non-zero creep.
+- **An explicit all-stop** (motors 0, aux centred, buttons cleared) is transmitted whenever the controller stops driving: navigating away from the Controller screen, opening its settings panel, or losing the drive stick. It's re-sent until the transport confirms the frame went out (bounded attempts, so it can't stall a screen change), since a single dropped stop would leave the robot running.
+
+> **Note for autonomous robots:** the all-stop is a *command*, not a disable. A receiver that falls back to autonomous behaviour when the remote link goes quiet will stop on the frame, then resume autonomously once its own remote-timeout expires. That's the receiver's arbitration policy to decide, not something the controller can express in a v1/v2 frame.
+
 ### Transport links (`TX LINK`)
 
 | Link | Status | Notes |
@@ -512,7 +521,7 @@ Open controller settings with **long-press KEY1**, or use the `ctrl …` serial 
 | Setting | Options |
 |---|---|
 | **CALIBRATE** | Mini JoyC: write center to its STM32 flash · seesaw: re-zero on next read · JoyStick2: self-centres (no manual cal) |
-| **DEADZONE** | Mini JoyC / JoyStick2 deadzone: 8 / 16 / 30 / 50 |
+| **DEADZONE** | Rest-position deadzone applied to **all** sticks: 8 / 16 / 30 / 50 |
 | **SWAP XY / INVERT X / INVERT Y** | drive-stick axis transforms |
 | **TX LINK** | wireless link (table above) |
 | **MOUNT** (seesaw) | `SIDE` / `BACK` — attached, follows screen rotation · `DET-PORT` / `DET-LAND` — detached, fixed to the stick |
@@ -537,6 +546,7 @@ Connect at **115200 baud**. Commands work over both USB serial and BLE UART (`ne
 | `battery` | Print voltage, percentage, charge state, uptime |
 | `webfm` | Print web file manager URL |
 | `i2c` | Scan all three I2C buses (main / HAT / GROVE) and list responders — handy for checking joystick/unit detection |
+| `heap` | Free / minimum-ever / largest-block heap, plus the sprite backing store and size |
 
 ### Controller (`ctrl`)
 
@@ -548,7 +558,7 @@ Connect at **115200 baud**. Commands work over both USB serial and BLE UART (`ne
 | `ctrl invertx on\|off` | Invert turn (X) axis |
 | `ctrl inverty on\|off` | Invert forward/back (Y) axis |
 | `ctrl swap on\|off` | Swap X/Y |
-| `ctrl dz 0-3` | Mini JoyC / JoyStick2 deadzone (8 / 16 / 30 / 50) |
+| `ctrl dz 0-3` | Stick deadzone, all sticks (8 / 16 / 30 / 50) |
 | `ctrl calibrate` | Calibrate Mini JoyC center → STM32 flash |
 | `ctrl link udp\|ble\|tcp\|lora` | Select wireless link |
 | `ctrl primary pad\|joyc\|joy2` | Which stick drives (2+ sticks connected) |

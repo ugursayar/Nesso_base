@@ -423,9 +423,14 @@ const char* ctrlAux2Label  = "";
 static inline int connectedStickCount() {
   return (joystickAvailable ? 1 : 0) + (miniJoyCAvailable ? 1 : 0) + (joystick2Available ? 1 : 0);
 }
-// True when a stick with a software deadzone / settable centre is present (Mini JoyC or
-// Unit JoyStick2 — the seesaw lazy-calibrates instead). Gates the DEADZONE/CALIBRATE rows.
-static inline bool ctrlHasTunableStick() { return miniJoyCAvailable || joystick2Available; }
+// True when a stick with a software deadzone / settable centre is present. Gates the
+// DEADZONE/CALIBRATE rows. All three sticks qualify: the deadzone is shared by all of
+// them (the seesaw needs it most — its centre is only lazy-captured, so without one a
+// released stick never mixes to a clean stop), and CALIBRATE re-centres whichever is
+// there (Mini JoyC HW cal, seesaw lazy recal; JoyStick2 self-centres).
+static inline bool ctrlHasTunableStick() {
+  return joystickAvailable || miniJoyCAvailable || joystick2Available;
+}
 // Short text describing the connected controller setup, for serial output.
 static const char* controllerDeviceDesc() {
   int n = connectedStickCount();
@@ -466,6 +471,16 @@ struct ControlCommand {
   int rightMotor;  // -255 to 255
 };
 ControlCommand transmitCmd;
+
+// True while the controller's drive loop is feeding the link and no all-stop has
+// followed. Set by readGamePad(), cleared by transmitRemoteStop() — so the stop is a
+// no-op when nothing was driving, and fires exactly once when something was.
+bool remoteTxActive = false;
+
+// True while the controller screen owns the stick LEDs and GROVE 5V (set by
+// initGamePad(), cleared by the exit cleanup in renderFunction()). Edge-triggers that
+// cleanup without depending on lastFunction — see the comment at the cleanup block.
+bool ctrlSessionActive = false;
 
 // ----------------------------------------------------------------
 // LoRa (SX1262)
@@ -4311,20 +4326,32 @@ void renderFunction() {
     if (!rf433LearnMode && !irLearnMode)
       digitalWrite(GROVE_POWER_EN, LOW);
   }
-  if (lastFunction == (int)FUNCTION_CONTROLLER && currentFunction != FUNCTION_CONTROLLER) {
-    if (miniJoyCAvailable) {
-      miniJoyCWireHat();
-      miniJoyCSetLED(0x000000);  // LED off when leaving controller screen
-      miniJoyCWireRestore();
-      miniJoyCLedColor = 0;  // force re-send on next entry
-    }
-    if (joystick2Available) {
-      joystick2WireGrove();
-      joystick2SetLED(0x000000);  // LED off when leaving controller screen
-      joystick2WireRestore();
-      joystick2LedColor = 0xFFFFFFFF;  // force re-send on next entry
-      // Drop GROVE power (JoyStick2 powered it for this screen) unless IR/RF433 hold it.
-      if (!rf433LearnMode && !irLearnMode) digitalWrite(GROVE_POWER_EN, LOW);
+  // ── Leaving the controller screen ──
+  // Deliberately NOT gated on lastFunction like the cleanup blocks above it: three paths
+  // set lastFunction = -1 *before* renderFunction() gets to compare it — serialGoto()
+  // (which sets it alongside currentFunction, so `goto <screen>` would ALWAYS miss),
+  // resetActivity() on wake (a swipe that both wakes a dimmed screen and navigates away,
+  // since checkTouch() runs first), and updateOrientation() on rotation. Each piece is
+  // edge-triggered by its own "I own this" flag instead, so it runs exactly once however
+  // the screen was left.
+  if (currentFunction != FUNCTION_CONTROLLER) {
+    transmitRemoteStop();          // no-op unless the drive loop was feeding the link
+    if (ctrlSessionActive) {       // no-op unless initGamePad() lit the LEDs / GROVE
+      ctrlSessionActive = false;
+      if (miniJoyCAvailable) {
+        miniJoyCWireHat();
+        miniJoyCSetLED(0x000000);  // LED off when leaving controller screen
+        miniJoyCWireRestore();
+        miniJoyCLedColor = 0;  // force re-send on next entry
+      }
+      if (joystick2Available) {
+        joystick2WireGrove();
+        joystick2SetLED(0x000000);  // LED off when leaving controller screen
+        joystick2WireRestore();
+        joystick2LedColor = 0xFFFFFFFF;  // force re-send on next entry
+        // Drop GROVE power (JoyStick2 powered it for this screen) unless IR/RF433 hold it.
+        if (!rf433LearnMode && !irLearnMode) digitalWrite(GROVE_POWER_EN, LOW);
+      }
     }
   }
 
@@ -4405,6 +4432,10 @@ void renderFunction() {
         initGamePad();
       }
       if (navState == NAV_SETTINGS) {
+        // The settings panel doesn't poll the stick, so no frames go out while it's
+        // open — stop the robot on the way in rather than leaving it on the last
+        // command until the settings screen is dismissed.
+        transmitRemoteStop();
         renderControllerSettings();
         statusSprite.pushSprite(0, SPRITE_Y);
       } else {
@@ -5443,6 +5474,7 @@ void renderController() {
 void initGamePad() {
   controllerConnected = false;
   calibrationComplete = false;
+  ctrlSessionActive   = true;   // this screen now owns the stick LEDs / GROVE power
 
   // Unit JoyStick2 init (Grove bus) — runs whenever present, alongside any other stick.
   // It needs GROVE 5V power held on for the whole controller session (dropped on exit).
@@ -5504,6 +5536,10 @@ void initGamePad() {
 }
 
 // Read seesaw stick → powerx/powery (seesaw sign convention; lazy-calibrates center).
+// The raw span is ±512 (0..1023 ADC around the captured centre), the same scale the
+// shared deadzone works on — apply it here as the other two sticks do. Without it a
+// released stick sits a few counts off centre, those counts survive the arcade mix, and
+// the robot creeps instead of stopping: the frame carries L/R of ±1..3 forever.
 static void readSeesawAxes(int16_t& px, int16_t& py) {
   float x = 0, y = 0;
   for (int s = 0; s < 4; s++) {
@@ -5516,8 +5552,13 @@ static void readSeesawAxes(int16_t& px, int16_t& py) {
     zero_x = (int)x; zero_y = (int)y;
     calibrationComplete = true;
   }
-  px = (int16_t)(x - zero_x);
-  py = (int16_t)(y - zero_y);
+  int cx = (int)x - zero_x;
+  int cy = (int)y - zero_y;
+  int dz = CTRL_DEADZONE_VALS[ctrlDeadzoneIdx];
+  if (cx > -dz && cx < dz) cx = 0;
+  if (cy > -dz && cy < dz) cy = 0;
+  px = (int16_t)cx;
+  py = (int16_t)cy;
 }
 
 // Read Mini JoyC stick → powerx/powery (front-mount: vert used as-is, deadzoned, ±515)
@@ -5647,8 +5688,9 @@ void readGamePad() {
     driveDev = -1;
     for (int d = 0; d < CTRL_DEV_COUNT; d++) if (devOn[d]) { driveDev = d; break; }
   }
-  if (driveDev < 0) {  // no stick at all
+  if (driveDev < 0) {  // no stick at all — nothing will drive the link from here on
     remoteHasAux = false; remoteHasAux2 = false;
+    transmitRemoteStop();   // no-op unless we were mid-drive when the stick vanished
     return;
   }
   int auxDev[2] = { -1, -1 };
@@ -5706,6 +5748,7 @@ void readGamePad() {
   int16_t l = constrain(thr + turn, -255, 255);
   int16_t r = constrain(thr - turn, -255, 255);
   if (l != 0 || r != 0) resetActivity();
+  remoteTxActive = true;   // the drive loop owns the link → it owes an all-stop on exit
   transmitRemoteCommand(l, r);
 }
 
@@ -6167,13 +6210,16 @@ void WiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
 NessoBleLink  bleLink;    // adapter over the firmware's BLE UART TX characteristic
 NessoLoRaLink loraLink;   // async LoRa transport (safe no-op until a radio is wired)
 
-static void txWifiUdp(const uint8_t* buf, size_t len) {
+// Each returns true when the transport actually accepted the frame. The ~10 Hz drive
+// loop ignores that (the next frame is 100 ms away anyway), but transmitRemoteStop()
+// uses it to keep retrying until an all-stop really left the device.
+static bool txWifiUdp(const uint8_t* buf, size_t len) {
   udp.beginPacket(targetIpAddress, udpPort);
   udp.write(buf, len);
-  udp.endPacket();
+  return udp.endPacket() == 1;
 }
 
-static void txBle(const uint8_t* buf, size_t len) {
+static bool txBle(const uint8_t* buf, size_t len) {
   // NessoBleLink notifies the existing NESSO BLE UART TX characteristic. The link
   // never owns the BLE stack — we inject the notify + "ready" sinks once (lazily),
   // and they read the firmware's BLE globals at call time.
@@ -6189,7 +6235,7 @@ static void txBle(const uint8_t* buf, size_t len) {
       []() -> bool { return bleUartReady && pBLETxChar && btConnected; });
     wired = true;
   }
-  bleLink.sendRaw(buf, len);
+  return bleLink.sendRaw(buf, len);
 }
 
 // TCP TX must NEVER stall the ~10 Hz control loop. NetworkClient::connect() blocks, so
@@ -6199,17 +6245,17 @@ static void txBle(const uint8_t* buf, size_t len) {
 #define TCP_RECONNECT_MS       1000   // min gap between connect attempts while disconnected
 #define TCP_CONNECT_TIMEOUT_MS 300    // per-attempt blocking cap (ms)
 
-static void txWifiTcp(const uint8_t* buf, size_t len) {
-  if (WiFi.status() != WL_CONNECTED) return;
+static bool txWifiTcp(const uint8_t* buf, size_t len) {
+  if (WiFi.status() != WL_CONNECTED) return false;
   if (!tcpClient.connected()) {
     static uint32_t lastTcpTry = 0;
-    if (millis() - lastTcpTry < TCP_RECONNECT_MS) return;   // don't hammer connect()
+    if (millis() - lastTcpTry < TCP_RECONNECT_MS) return false;   // don't hammer connect()
     lastTcpTry = millis();
     tcpClient.stop();
-    if (!tcpClient.connect(targetIpAddress, tcpPort, TCP_CONNECT_TIMEOUT_MS)) return;
+    if (!tcpClient.connect(targetIpAddress, tcpPort, TCP_CONNECT_TIMEOUT_MS)) return false;
     tcpClient.setNoDelay(true);   // disable Nagle — control packets want low latency
   }
-  tcpClient.write(buf, len);
+  return tcpClient.write(buf, len) == len;
 }
 
 // LoRa controller TX is gated by both NessoLoRaLink's rate limiter AND the SX1262's
@@ -6255,10 +6301,10 @@ static bool loraTxArm() {
   return true;
 }
 
-static void txLora(const uint8_t* buf, size_t len) {
-  if (!loraTxArm()) return;             // bring the radio up for TX (lazy); no radio -> no-op
+static bool txLora(const uint8_t* buf, size_t len) {
+  if (!loraTxArm()) return false;       // bring the radio up for TX (lazy); no radio -> no-op
   SPI.begin(SCK, MISO, MOSI, LORA_CS);  // re-arm the shared bus (the display reconfigures it)
-  loraLink.sendRaw(buf, len);           // async startTransmit + rate/duty gate
+  return loraLink.sendRaw(buf, len);    // async startTransmit + rate/duty gate
 }
 
 // ── Remote control frame ────────────────────────────────────────
@@ -6288,7 +6334,11 @@ static uint16_t remoteButtonBits() {
 }
 
 // ── Dispatcher ──────────────────────────────────────────────────
-void transmitRemoteCommand(int leftMotorPower, int rightMotorPower) {
+// Returns true when the selected transport accepted the frame (see the tx* backends).
+// Does NOT touch remoteTxActive — that flag tracks the controller's *drive loop*, and
+// the serial `send L R` test command routes through here too. Setting it here would
+// make the next renderFunction() cancel a manual `send` with an immediate all-stop.
+bool transmitRemoteCommand(int leftMotorPower, int rightMotorPower) {
   transmitCmd.leftMotor  = constrain(leftMotorPower,  -255, 255);
   transmitCmd.rightMotor = constrain(rightMotorPower, -255, 255);
 
@@ -6305,16 +6355,66 @@ void transmitRemoteCommand(int leftMotorPower, int rightMotorPower) {
   f.seq        = ++remoteSeq;
   uint8_t frame[NESSO_FRAME_MAX_LEN];
   size_t  len = nessoEncode(f, frame);
+  bool sent;
   switch (remoteTransportIdx) {
-    case TX_BLE:      txBle(frame, len);     break;
-    case TX_WIFI_TCP: txWifiTcp(frame, len); break;
-    case TX_LORA:     txLora(frame, len);    break;
+    case TX_BLE:      sent = txBle(frame, len);     break;
+    case TX_WIFI_TCP: sent = txWifiTcp(frame, len); break;
+    case TX_LORA:     sent = txLora(frame, len);    break;
     case TX_WIFI_UDP:
-    default:          txWifiUdp(frame, len); break;
+    default:          sent = txWifiUdp(frame, len); break;
   }
 
   debug("L: "); debug(transmitCmd.leftMotor);
   debug(" | R: "); debugln(transmitCmd.rightMotor);
+  return sent;
+}
+
+// Explicit all-stop: motors 0, aux sticks centred, no buttons.
+//
+// While the controller's drive loop is running, releasing the stick already stops the
+// robot — a centred stick mixes to L=R=0 and a frame goes out every ~100 ms even when
+// centred. This covers the cases where that loop STOPS running with a non-zero command
+// as the last thing the robot heard: leaving the controller screen, opening its settings
+// panel, or losing the drive stick mid-session. Without it the robot keeps driving until
+// its own failsafe timeout fires (and a receiver without one never stops).
+//
+// Pushed until the transport has ACCEPTED the wanted number of frames, because a single
+// one can be dropped (UDP loss, BLE not connected, LoRa duty-cycle gate) — and a dropped
+// stop is a robot that keeps going. Everything is transport-aware and time-bounded: this
+// blocks the main loop, so it must stay short enough to be invisible on a screen change.
+//
+// LoRa is the exception in every way: its rate limiter refuses anything inside the TX
+// interval (retrying faster just burns attempts), a frame is ~150-200 ms of airtime, and
+// the caller may repoint the antenna switch the moment we return (controller → LoRa
+// scanner) — which would cut a still-airborne packet short. So: one frame, then wait for
+// it to drain.
+#define REMOTE_STOP_SENDS    2    // accepted frames wanted (non-LoRa)
+#define REMOTE_STOP_TRIES    4    // hard cap on attempts (bounds the blocking time)
+#define REMOTE_STOP_GAP_MS  40    // spacing between attempts (non-LoRa)
+#define LORA_TX_DRAIN_MS   220    // ~SF11/BW250 airtime for a RemoteFrame
+
+void transmitRemoteStop() {
+  if (!remoteTxActive) return;          // the drive loop wasn't running → nothing to stop
+  remoteTxActive = false;               // cleared up front: this fires exactly once
+  remoteAuxX  = remoteAuxY  = 0;
+  remoteAux2X = remoteAux2Y = 0;
+  aux2DisplayX = aux2DisplayY = aux3DisplayX = aux3DisplayY = 0;
+  joyDisplayX  = joyDisplayY  = 0;
+  gamepadButtons = 0xFFFFFFFF;          // seesaw bits are active-LOW → all released
+  miniJoyCBtn = false;
+  joystick2Btn = false;
+
+  bool     lora   = (remoteTransportIdx == TX_LORA);
+  int      wanted = lora ? 1 : REMOTE_STOP_SENDS;
+  int      tries  = lora ? 2 : REMOTE_STOP_TRIES;
+  uint32_t gap    = lora ? (LORA_TX_MIN_INTERVAL_MS + 20) : REMOTE_STOP_GAP_MS;
+
+  int sent = 0;
+  for (int i = 0; i < tries && sent < wanted; i++) {
+    if (i) delay(gap);
+    if (transmitRemoteCommand(0, 0)) sent++;
+  }
+  if (lora && sent) delay(LORA_TX_DRAIN_MS);   // let the frame finish before the radio moves
 }
 
 

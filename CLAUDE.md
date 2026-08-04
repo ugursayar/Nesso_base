@@ -40,6 +40,17 @@ Most screens push `statusSprite` at `y = SPRITE_Y` (22 px), leaving the top 22 p
 
 `renderFunction()` checks the desired `g_spriteY` value every frame (unconditionally — not gated on `lastFunction`) and resizes the sprite if it changed. This makes it immune to `updateOrientation()` setting `lastFunction = −1` mid-navigation. `initIR()` and `initRF433()` call `display.fillScreen()` before pushing the sprite at `y = 0`. All touch coordinate transforms in IR/RF433 use `sy − g_spriteY`.
 
+**Both sprites live in static buffers — never the heap.** `createStatusSprite()` calls `setBuffer()` against two file-scope arrays (`statusSpriteBuf`, `headerSpriteBuf`), so a rotation change just re-points the sprites and **cannot fail**:
+
+```cpp
+alignas(4) static uint8_t statusSpriteBuf[135 * (240 - SPRITE_Y) * 2];  // portrait-sized
+alignas(4) static uint8_t headerSpriteBuf[240 * SPRITE_Y * 2];
+```
+
+They are sized for **portrait** (135×218); landscape (240×113) is smaller and fits inside the same allocation. This replaced `createSprite()`/`deleteSprite()`, which was the root cause of the "empty screen after a long sleep" bug: the portrait status sprite needs **58,860 contiguous bytes**, and after hours of WiFi/BLE heap churn the measured largest free block sat within ~520 bytes of that — so the realloc failed silently on the rotation that followed a wake. Do **not** reintroduce heap allocation here; if a sprite needs to grow, grow the static buffer (and keep it sized for the portrait case). `alignas(4)` matters — LovyanGFX assumes aligned pixel buffers.
+
+The `heap` serial command reports free / min-ever / largest-block and confirms the sprite is `static`; it's the diagnostic for anything in this area.
+
 ### Battery percentage
 
 Use `voltageToPercent()` (piecewise linear LiPo curve, 3.0V→0% / 4.2V→100%). Do **not** use `battery.getChargeLevel()` — tested at 3.89V it returned 98% while voltage-based correctly gave ~63%. The library value is kept only as a debug label on the battery screen.
@@ -141,6 +152,24 @@ Size send/decode buffers with `NESSO_FRAME_MAX_LEN` (19) and use the length `nes
 
 Selectable from Controller settings ("TX LINK" row, item 6) or serial `ctrl link udp|ble|tcp|lora`. ESP32-C6 has one radio — BLE and WiFi coexist but contend, so BLE mode generally wants WiFi off.
 
+### Guaranteeing the robot stops
+
+Two independent mechanisms, because a released stick that doesn't stop the robot is the worst failure this firmware has:
+
+**1. A released stick must mix to exactly zero.** All three sticks apply the shared deadzone (`CTRL_DEADZONE_VALS[ctrlDeadzoneIdx]`) at read time — including the **seesaw**, whose centre is only *lazy-captured* on the first read. Without it a released seesaw sits a few ADC counts off centre, those counts survive the arcade mix, and the frame carries L/R of ±1..3 forever (a slow creep, not a stop). Because a centred stick mixes to 0 and `readGamePad()` transmits every ~100 ms **even when centred**, the release itself needs nothing else — the next frame is already a stop. `ctrlHasTunableStick()` therefore returns true for any connected stick (it gates the DEADZONE/CALIBRATE rows).
+
+**2. An explicit all-stop when the drive loop stops running.** `transmitRemoteStop()` (motors 0, aux centred, buttons cleared) fires wherever `readGamePad()` stops being called with a non-zero command as the robot's last instruction: **navigating away from the controller screen**, **opening its settings panel** (the panel doesn't poll the stick), and **losing the drive stick mid-session**. It's guarded by `remoteTxActive` — set by `transmitRemoteCommand()`, cleared here — so it's a no-op unless something was actually driving, and fires exactly once.
+
+The whole leave-the-controller-screen block is keyed on **`if (currentFunction != FUNCTION_CONTROLLER)`, deliberately NOT `lastFunction == FUNCTION_CONTROLLER`** like the other screens' cleanup blocks beside it. Three paths set `lastFunction = -1` *before* `renderFunction()` compares it, and each would silently swallow the work: `serialGoto()` (sets it alongside `currentFunction`, so `goto <screen>` would **always** miss), `resetActivity()` on wake (a single swipe that both wakes a dimmed screen and navigates away — `checkTouch()` runs before `renderFunction()`), and `updateOrientation()` on rotation. Same trap as `g_spriteY` above: **never gate exit work on `lastFunction`.**
+
+Since the block then runs on every frame of every other screen, each piece is edge-triggered by its own "I own this" flag instead: `remoteTxActive` (set by `readGamePad()`) for the all-stop, `ctrlSessionActive` (set by `initGamePad()`) for the Mini JoyC / JoyStick2 LED-off and the `GROVE_POWER_EN` drop. Both clear on the way out, so each runs exactly once however the screen was left.
+
+`remoteTxActive` is set by **`readGamePad()`, not `transmitRemoteCommand()`** — it means "the drive loop owns the link". The serial `send L R` test command also routes through `transmitRemoteCommand()`, so setting it there would make the next `renderFunction()` cancel a manual `send` with an immediate all-stop.
+
+Delivery is verified, not fire-and-forget: every `tx*()` backend and `transmitRemoteCommand()` now **return `bool`** (transport accepted the frame), and the stop retries until 2 frames are accepted. A dropped stop is a running robot — UDP loses packets, BLE may be disconnected, LoRa's rate gate refuses frames. LoRa is special-cased to **one frame plus a `LORA_TX_DRAIN_MS` wait**: retrying inside its TX interval only burns attempts, and the caller may repoint the antenna switch (controller → LoRa scanner) while the packet is still airborne. The whole thing blocks the main loop, so it is time-bounded to stay invisible on a screen change.
+
+A receiver failsafe timeout is still the last line of defence — this makes the normal paths not *need* it.
+
 ### Multi-stick (1–3 joysticks: seesaw + Mini JoyC + Unit JoyStick2)
 
 Up to **three** joysticks can be connected at once — they live on three separate I2C buses (seesaw = main GPIO10/8, Mini JoyC = HAT GPIO6/7, JoyStick2 = Grove GPIO5/4) so any combination coexists. `connectedStickCount()` (0..3) drives controller-screen visibility, the role logic, and the settings rows.
@@ -179,4 +208,4 @@ Non-obvious constraints (the reasons it's gated, not free-running):
 - **No USB HID.** ESP32-C6 has only a fixed-function USB Serial/JTAG controller (no USB-OTG), so a USB gamepad is impossible on this silicon — BLE HID is the only standard-controller path. C6 is also BLE-only (no Classic BT), so consoles won't pair; works on PC (DirectInput — Steam Input maps it) / Android.
 - **Untested on hardware** as written — report-map/axis-sign/bonding details may need iteration with a real host.
 
-The Controller **settings screen** is device-aware: `controllerSettingsItemCount()` = base 6 (CALIBRATE, DEADZONE, SWAP XY, INVERT X, INVERT Y, TX LINK) **+ MOUNT** when a seesaw is present **+ PRIMARY** when ≥2 sticks are connected. The optional rows are **dynamically indexed** (MOUNT before PRIMARY) — `renderControllerSettings()` builds the label/value arrays in order, and `onKey1Short`'s `default:` case walks the same order from index 6, so PRIMARY landing at index 6 (no seesaw) or 7 (with seesaw) both resolve correctly. Title is "TRIPLE/DUAL STICK SETTINGS" by count, else "MINIJOYC/JOYSTICK2/GAMEPAD SETTINGS". CALIBRATE/DEADZONE are active whenever a tunable stick is present (`ctrlHasTunableStick()` = Mini JoyC **or** JoyStick2; the seesaw lazy-calibrates and JoyStick2 self-centres). The count is centralized in that helper — render, tap, cursor-wrap (`onKey2Short`), and swipe-bound (`onSwipe`) all call it. Serial equivalents: `ctrl primary pad|joyc|joy2`, `ctrl ssmount 0-3`, `ctrl dz`, `ctrl calibrate`.
+The Controller **settings screen** is device-aware: `controllerSettingsItemCount()` = base 6 (CALIBRATE, DEADZONE, SWAP XY, INVERT X, INVERT Y, TX LINK) **+ MOUNT** when a seesaw is present **+ PRIMARY** when ≥2 sticks are connected. The optional rows are **dynamically indexed** (MOUNT before PRIMARY) — `renderControllerSettings()` builds the label/value arrays in order, and `onKey1Short`'s `default:` case walks the same order from index 6, so PRIMARY landing at index 6 (no seesaw) or 7 (with seesaw) both resolve correctly. Title is "TRIPLE/DUAL STICK SETTINGS" by count, else "MINIJOYC/JOYSTICK2/GAMEPAD SETTINGS". CALIBRATE/DEADZONE are active whenever any stick is connected (`ctrlHasTunableStick()`): the deadzone is shared by all three (see [Guaranteeing the robot stops](#guaranteeing-the-robot-stops)), and CALIBRATE re-centres whichever is present — Mini JoyC HW cal, else seesaw lazy recal; JoyStick2 self-centres. The count is centralized in that helper — render, tap, cursor-wrap (`onKey2Short`), and swipe-bound (`onSwipe`) all call it. Serial equivalents: `ctrl primary pad|joyc|joy2`, `ctrl ssmount 0-3`, `ctrl dz`, `ctrl calibrate`.
