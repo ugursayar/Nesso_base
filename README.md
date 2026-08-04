@@ -470,7 +470,7 @@ They sit on three separate buses, so **1, 2, or 3** can be used together:
 - **2 sticks** → one drives, the other is an **aux** stick (camera/turret → `auxX`/`auxY`).
 - **3 sticks** → one drives + **two** aux sticks (`auxX`/`auxY` and `aux2X`/`aux2Y`, the second carried in a v2 frame).
 
-`PRIMARY` selects which stick drives (default: Mini JoyC); the rest become aux1/aux2 in the order seesaw → Mini JoyC → JoyStick2. The Controller screen shows one disc per connected stick (drive first). The Mini JoyC and JoyStick2 always follow screen rotation; the seesaw follows it only in attached `MOUNT` modes (see below).
+`PRIMARY` selects which stick drives (default: Mini JoyC); the rest become aux1/aux2 in the order seesaw → Mini JoyC → JoyStick2. The Controller screen shows one disc per connected stick (drive first). The Mini JoyC and JoyStick2 always follow screen rotation; the seesaw follows it only in attached `MOUNT` modes (see below). With `SCR LOCK` on (the default) the screen doesn't rotate while you're on the Controller screen, so "screen rotation" there means the orientation you navigated in with.
 
 ### Wire protocol — RemoteFrame (v1 / v2)
 
@@ -524,6 +524,7 @@ Open controller settings with **long-press KEY1**, or use the `ctrl …` serial 
 | **DEADZONE** | Rest-position deadzone applied to **all** sticks: 8 / 16 / 30 / 50 |
 | **SWAP XY / INVERT X / INVERT Y** | drive-stick axis transforms |
 | **TX LINK** | wireless link (table above) |
+| **SCR LOCK** | **ON (default)** — the controller screen holds the orientation you entered it in, so driving tilts never rotate the display or the stick mapping · OFF — normal auto-rotation |
 | **MOUNT** (seesaw) | `SIDE` / `BACK` — attached, follows screen rotation · `DET-PORT` / `DET-LAND` — detached, fixed to the stick |
 | **PRIMARY** (2+ sticks) | which stick drives: `PAD` / `JOYC` / `JOY2` (cycles connected sticks) |
 
@@ -554,7 +555,7 @@ Connect at **115200 baud**. Commands work over both USB serial and BLE UART (`ne
 |---|---|
 | `controller` | Print joystick position + last motor values |
 | `send <L> <R>` | Send a motor command directly (−255..255) |
-| `ctrl` | Show device, axis flags, link, mount, primary |
+| `ctrl` | Show device, axis flags, link, screen lock, mount, primary |
 | `ctrl invertx on\|off` | Invert turn (X) axis |
 | `ctrl inverty on\|off` | Invert forward/back (Y) axis |
 | `ctrl swap on\|off` | Swap X/Y |
@@ -563,6 +564,7 @@ Connect at **115200 baud**. Commands work over both USB serial and BLE UART (`ne
 | `ctrl link udp\|ble\|tcp\|lora` | Select wireless link |
 | `ctrl primary pad\|joyc\|joy2` | Which stick drives (2+ sticks connected) |
 | `ctrl ssmount 0-3` | Seesaw mount: `side`/`back` (attached) · `detport`/`detland` (detached) |
+| `ctrl lock on\|off` | Screen lock — hold the screen orientation while on the controller screen (default `on`) |
 
 ### Filesystem (`fs`)
 

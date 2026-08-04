@@ -364,6 +364,11 @@ int      ctrlDeadzoneIdx     = 1;      // index into CTRL_DEADZONE_VALS (default
 bool     ctrlSwapXY          = false;  // swap X/Y after rotation remap (drive stick)
 bool     ctrlInvertX         = false;  // invert final X (turn)
 bool     ctrlInvertY         = false;  // invert final Y (forward/back)
+// Screen lock (default ON, NVS "ctrlLock"): while the controller screen is showing,
+// updateOrientation() is suppressed so the display stays in whatever orientation it
+// was navigated in. Driving tilts the device constantly and a mid-drive rotation both
+// redraws the screen and flips the stick's rotation table under the user's thumb.
+bool     ctrlScreenLock      = true;
 // Seesaw physical mount orientation — a base transform of the raw seesaw axes into the
 // device's native-portrait frame. The shared screen-rotation table (applyStickRotation)
 // is then applied on top, so the seesaw reflects screen orientation. The Mini JoyC always
@@ -1199,6 +1204,7 @@ void loadSettings() {
   ctrlSwapXY      = p.getBool ("ctrlSXY",  false);
   ctrlInvertX     = p.getBool ("ctrlIX",   false);
   ctrlInvertY     = p.getBool ("ctrlIY",   false);
+  ctrlScreenLock  = p.getBool ("ctrlLock", true);
   seesawMountIdx = constrain((int)p.getUChar("ssMount", SS_STICK_SIDE), 0, SEESAW_MOUNT_COUNT - 1);
   remoteTransportIdx = constrain((int)p.getUChar("txLink", 0), 0, REMOTE_TX_COUNT - 1);
   // Primary (drive) device. Migrate the old dual-stick bool: true → Mini JoyC, false → seesaw.
@@ -1238,6 +1244,7 @@ void saveSettings() {
   p.putBool ("ctrlSXY", ctrlSwapXY);
   p.putBool ("ctrlIX",  ctrlInvertX);
   p.putBool ("ctrlIY",  ctrlInvertY);
+  p.putBool ("ctrlLock", ctrlScreenLock);
   p.putUChar("ssMount", (uint8_t)seesawMountIdx);
   p.putUChar("txLink",  (uint8_t)remoteTransportIdx);
   p.putUChar("ctrlPrim", (uint8_t)ctrlPrimaryDev);
@@ -1624,6 +1631,11 @@ void updateOrientation() {
   // the (larger) portrait alloc fails — the "empty screen after long sleep" bug.
   // resetActivity() forces an immediate re-check on wake.
   if (displayOff || displayDimmed) return;
+  // Controller screen lock (default ON): hold whatever orientation the screen was
+  // navigated in. Driving tilts the device constantly, and a rotation mid-drive
+  // redraws the screen *and* flips applyStickRotation() under the user's thumb.
+  // Keyed on currentFunction so it covers the controller settings panel too.
+  if (ctrlScreenLock && currentFunction == FUNCTION_CONTROLLER) return;
   float ax, ay, az;
   if (!IMU.accelerationAvailable()) return;
   IMU.readAcceleration(ax, ay, az);
@@ -2710,9 +2722,10 @@ void onKey1Short() {
           if (remoteTransportIdx == TX_WIFI_TCP) tcpClient.stop();
           remoteTransportIdx = (remoteTransportIdx + 1) % REMOTE_TX_COUNT;
           break;
+        case 6: ctrlScreenLock = !ctrlScreenLock; break;  // SCR LOCK — freeze orientation on this screen
         default: {
-          // Dynamic rows ≥6, in display order: MOUNT (seesaw present) then PRIMARY (≥2 sticks).
-          int row = 6;
+          // Dynamic rows ≥7, in display order: MOUNT (seesaw present) then PRIMARY (≥2 sticks).
+          int row = 7;
           if (joystickAvailable) {
             if (settingsCursor == row) { seesawMountIdx = (seesawMountIdx + 1) % SEESAW_MOUNT_COUNT; break; }
             row++;
@@ -2754,7 +2767,7 @@ void onKey2Short() {
     else if (currentFunction == FUNCTION_RFID2)
       settingsCursor = (settingsCursor + 1) % 6;  // NEW FILE / SELECT FILE / DEL FILE / RECORD / DELETE CARD / RESET
     else if (currentFunction == FUNCTION_CONTROLLER)
-      // CALIBRATE / DEADZONE / SWAP XY / INVERT X / INVERT Y / TX LINK (+ PRIMARY in dual)
+      // CALIBRATE / DEADZONE / SWAP XY / INVERT X / INVERT Y / TX LINK / SCR LOCK (+ MOUNT, PRIMARY)
       settingsCursor = (settingsCursor + 1) % controllerSettingsItemCount();
   }
 }
@@ -2875,6 +2888,7 @@ static void printHelpNav() {
   serialWritelnAll("  ctrl dz 0-3           deadzone index (0=8 1=16 2=30 3=50) [Mini JoyC / JoyStick2]");
   serialWritelnAll("  ctrl calibrate        write joystick center to STM32 flash [Mini JoyC only]");
   serialWritelnAll("  ctrl link <type>      remote TX link: udp|ble|tcp|lora");
+  serialWritelnAll("  ctrl lock on|off      screen lock: hold orientation on the controller screen (default ON)");
   serialWritelnAll("  ctrl primary pad|joyc|joy2  which stick drives (2+ sticks connected)");
   serialWritelnAll("  ctrl ssmount 0-3      seesaw mount: 0=side 1=back (attached) 2=detport 3=detland (detached)");
   serialWritelnAll("  ctrl hid on|off       act as a standard BLE HID gamepad (PC/Android); reboot to apply");
@@ -3011,16 +3025,17 @@ void serialPrintFunctionHelp(int fn) {
       break;
     case FUNCTION_CONTROLLER: {
       snprintf(buf, sizeof(buf),
-        "[CONTROLLER] device:%s  invertx:%s  inverty:%s  swap:%s  dz:%d  link:%s  WiFi:%s",
+        "[CONTROLLER] device:%s  invertx:%s  inverty:%s  swap:%s  dz:%d  link:%s  lock:%s  WiFi:%s",
         controllerDeviceDesc(),
         ctrlInvertX ? "ON" : "off",
         ctrlInvertY ? "ON" : "off",
         ctrlSwapXY  ? "ON" : "off",
         ctrlHasTunableStick() ? CTRL_DEADZONE_VALS[ctrlDeadzoneIdx] : 0,
         REMOTE_TX_LABELS[remoteTransportIdx],
+        ctrlScreenLock ? "ON" : "off",
         WiFi.isConnected() ? "ok" : "off");
       serialWritelnAll(buf);
-      serialWritelnAll("  ctrl invertx|inverty|swap on|off | ctrl dz 0-3 | ctrl link udp|ble|tcp|lora | ctrl calibrate | send <L> <R>");
+      serialWritelnAll("  ctrl invertx|inverty|swap on|off | ctrl dz 0-3 | ctrl link udp|ble|tcp|lora | ctrl lock on|off | ctrl calibrate | send <L> <R>");
       break;
     }
     case FUNCTION_IR: {
@@ -4069,19 +4084,20 @@ void serialHandleMusic(const char* arg) {
 void serialHandleController(const char* arg) {
   bool multi = connectedStickCount() >= 2;
   if (!*arg) {
-    char buf[220];
+    char buf[240];
     char ssSeg[28] = "";
     if (joystickAvailable) snprintf(ssSeg, sizeof(ssSeg), "  ssmount:%s", SEESAW_MOUNT_LABELS[seesawMountIdx]);
     char primSeg[24] = "";
     if (multi) snprintf(primSeg, sizeof(primSeg), "  primary:%s", CTRL_DEV_LABELS[ctrlPrimaryDev]);
     snprintf(buf, sizeof(buf),
-      "[CTRL] device:%s  invertx:%s  inverty:%s  swap:%s  dz:%d  link:%s%s%s",
+      "[CTRL] device:%s  invertx:%s  inverty:%s  swap:%s  dz:%d  link:%s  lock:%s%s%s",
       controllerDeviceDesc(),
       ctrlInvertX ? "ON" : "off",
       ctrlInvertY ? "ON" : "off",
       ctrlSwapXY  ? "ON" : "off",
       ctrlHasTunableStick() ? CTRL_DEADZONE_VALS[ctrlDeadzoneIdx] : 0,
       REMOTE_TX_LABELS[remoteTransportIdx],
+      ctrlScreenLock ? "ON" : "off",
       ssSeg,
       primSeg);
     serialWritelnAll(buf);
@@ -4106,6 +4122,12 @@ void serialHandleController(const char* arg) {
     if      (strcasecmp(v,"on") ==0) ctrlSwapXY = true;
     else if (strcasecmp(v,"off")==0) ctrlSwapXY = false;
     else { serialWritelnAll("Usage: ctrl swap on|off"); return; }
+    saveSettings(); serialHandleController("");
+  } else if (cmdIs(arg,"lock")) {
+    const char* v = cmdArg(arg,"lock");
+    if      (strcasecmp(v,"on") ==0) ctrlScreenLock = true;
+    else if (strcasecmp(v,"off")==0) ctrlScreenLock = false;
+    else { serialWritelnAll("Usage: ctrl lock on|off  (hold screen orientation on the controller screen)"); return; }
     saveSettings(); serialHandleController("");
   } else if (cmdIs(arg,"dz")) {
     if (!ctrlHasTunableStick()) { serialWritelnAll("Deadzone applies to Mini JoyC / JoyStick2 only."); return; }
@@ -4163,7 +4185,7 @@ void serialHandleController(const char* arg) {
     serialWritelnAll("[CTRL] HID gamepad mode saved. Reboot with BT started to (de)activate.");
     serialHandleController("");
   } else {
-    serialWritelnAll("ctrl subcommands: invertx|inverty|swap on|off  dz 0-3  calibrate  link udp|ble|tcp|lora  primary pad|joyc|joy2  ssmount 0-3  hid on|off");
+    serialWritelnAll("ctrl subcommands: invertx|inverty|swap|lock on|off  dz 0-3  calibrate  link udp|ble|tcp|lora  primary pad|joyc|joy2  ssmount 0-3  hid on|off");
   }
 }
 
@@ -5786,12 +5808,12 @@ void readGamePadButtons() {
 // FUNCTION_CONTROLLER — Settings screen
 // ================================================================
 
-// Base 6 items, + MOUNT when a seesaw is present, + PRIMARY when ≥2 sticks are present.
-// Order: CALIBRATE, DEADZONE, SWAP XY, INVERT X, INVERT Y, TX LINK, [MOUNT], [PRIMARY].
+// Base 7 items, + MOUNT when a seesaw is present, + PRIMARY when ≥2 sticks are present.
+// Order: CALIBRATE, DEADZONE, SWAP XY, INVERT X, INVERT Y, TX LINK, SCR LOCK, [MOUNT], [PRIMARY].
 // Centralized so render / tap / cursor-wrap / swipe-bound all agree, and so the dynamic
 // rows in onKey1Short resolve to the same actions (MOUNT before PRIMARY).
 int controllerSettingsItemCount() {
-  return 6 + (joystickAvailable ? 1 : 0)
+  return 7 + (joystickAvailable ? 1 : 0)
            + ((connectedStickCount() >= 2) ? 1 : 0);
 }
 
@@ -5814,8 +5836,8 @@ void renderControllerSettings() {
   if (tunable) snprintf(dzVal, sizeof(dzVal), "%d", CTRL_DEADZONE_VALS[ctrlDeadzoneIdx]);
   else         snprintf(dzVal, sizeof(dzVal), "N/A");
 
-  const char* labels[8];
-  const char* values[8];
+  const char* labels[9];
+  const char* values[9];
   int n = 0;
   labels[n] = "CALIBRATE"; values[n] = calVal;                              n++;
   labels[n] = "DEADZONE";  values[n] = dzVal;                               n++;
@@ -5823,6 +5845,7 @@ void renderControllerSettings() {
   labels[n] = "INVERT X";  values[n] = ctrlInvertX ? "ON" : "OFF";          n++;
   labels[n] = "INVERT Y";  values[n] = ctrlInvertY ? "ON" : "OFF";          n++;
   labels[n] = "TX LINK";   values[n] = REMOTE_TX_LABELS[remoteTransportIdx]; n++;
+  labels[n] = "SCR LOCK";  values[n] = ctrlScreenLock ? "ON" : "OFF";        n++;
   if (joystickAvailable) { labels[n] = "MOUNT";   values[n] = SEESAW_MOUNT_LABELS[seesawMountIdx]; n++; }
   if (nStk >= 2)         { labels[n] = "PRIMARY"; values[n] = CTRL_DEV_LABELS[ctrlPrimaryDev];     n++; }
 
