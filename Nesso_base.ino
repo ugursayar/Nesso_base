@@ -399,6 +399,16 @@ uint32_t gamepadButtons = 0xFFFFFFFF;  // all bits 1 = all released (active LOW)
 //   joyDisplayX/Y   = drive stick (shown 1st)        — visualisation
 //   aux2DisplayX/Y  = first aux stick (shown 2nd)     — RemoteFrame auxX/auxY
 //   aux3DisplayX/Y  = second aux stick (shown 3rd)    — RemoteFrame aux2X/aux2Y
+//
+// CAUTION — the *DisplayX/Y pairs are NOT screen X/Y. Everything downstream of
+// applyStickRotation() carries (FORWARD, TURN): the X field is screen-VERTICAL
+// (up positive) and the Y field is screen-HORIZONTAL (right positive). That is
+// what the arcade mixer, drawStickViz() and the FORWARD/ROTATE label all consume,
+// so the on-screen disc is right in that frame. Anything leaving the device in a
+// standard X/Y convention has to swap them — hidSendGamepad() does, and so does
+// the aux → RemoteFrame mapping in readGamePad(). Copying a *Display* pair
+// straight into a frame's X/Y fields transposes the axes on the wire while the
+// screen still looks correct; that was a real shipped bug.
 enum CtrlStickDev {                       // canonical order (drives aux assignment too)
   CTRL_DEV_SEESAW    = 0,
   CTRL_DEV_MINIJOYC  = 1,
@@ -412,6 +422,9 @@ int16_t  aux2DisplayX = 0;             // -515..515, first aux stick — for the
 int16_t  aux2DisplayY = 0;
 int16_t  aux3DisplayX = 0;             // -515..515, second aux stick — for the 3rd indicator
 int16_t  aux3DisplayY = 0;
+// Wire-side aux values: TRUE screen X/Y at the frame's -255..255 scale — X positive =
+// stick pushed RIGHT, Y positive = stick pushed UP. Swapped and rescaled out of the
+// (forward,turn) ±515 display pairs above; see the aux block in readGamePad().
 int16_t  remoteAuxX   = 0;             // fed into RemoteFrame auxX/auxY
 int16_t  remoteAuxY   = 0;
 int16_t  remoteAux2X  = 0;             // fed into RemoteFrame aux2X/aux2Y (v2 frame)
@@ -4101,6 +4114,16 @@ void serialHandleController(const char* arg) {
       ssSeg,
       primSeg);
     serialWritelnAll(buf);
+    // Live axis snapshot — the check for "the receiver reads my aux stick transposed".
+    // drive is shown in the internal (forward,turn) form the disc renders from; aux is
+    // shown as it goes on the wire (true screen X/Y, ±255). Push the aux stick RIGHT and
+    // auxX should approach +255; push it UP and auxY should approach +255. Centred is 0.
+    snprintf(buf, sizeof(buf),
+      "  axes  drive[%s] fwd:%d turn:%d   wire aux1[%s] X:%d Y:%d   aux2[%s] X:%d Y:%d",
+      ctrlDriveLabel, joyDisplayX, joyDisplayY,
+      remoteHasAux  ? ctrlAux1Label : "-", remoteAuxX,  remoteAuxY,
+      remoteHasAux2 ? ctrlAux2Label : "-", remoteAux2X, remoteAux2Y);
+    serialWritelnAll(buf);
     if (hidGamepadEnabled)
       serialWritelnAll("  HID gamepad mode: ON (BLE standard controller; reboot with BT to activate)");
     return;
@@ -5676,6 +5699,15 @@ static bool seesawAppliesRotation() {
   return seesawMountIdx == SS_STICK_SIDE || seesawMountIdx == SS_STICK_BACK;
 }
 
+// Rescale one screen-relative stick axis (±515, post-deadzone) to the frame's ±255 wire
+// range — the same range leftMotor/rightMotor use, so a receiver needs exactly one
+// dead-zone constant for every axis in the frame. This also keeps the joystick module's
+// raw span off the wire: swapping in an aux unit with a different ADC range must not
+// silently change what the protocol means.
+static inline int16_t auxAxisToWire(int16_t v) {
+  return (int16_t)map(constrain((int)v, -515, 515), -515, 515, -255, 255);
+}
+
 void readGamePad() {
   // ── Read each connected stick → screen-relative (rx,ry), indexed by CtrlStickDev ──
   // Mini JoyC and JoyStick2 are front/independent units that always rotation-adapt.
@@ -5734,18 +5766,38 @@ void readGamePad() {
   joyDisplayY = ry;
 
   // ── Aux sticks (screen-relative, no drive flags) ──
+  // Two frames meet here and they are NOT the same, which is what made this go wrong
+  // once already: the disc render consumes (forward, turn) — devRx = screen-VERTICAL,
+  // devRy = screen-HORIZONTAL — while NessoFrame declares auxX = X and auxY = Y. Feeding
+  // the display pair straight to the frame drew a correct disc and transmitted the axes
+  // transposed. So map explicitly, exactly as hidSendGamepad() does for the drive stick:
+  //     auxX = turn    component (devRy) → + when the stick is pushed RIGHT
+  //     auxY = forward component (devRx) → + when the stick is pushed UP
+  // and rescale ±515 → ±255 so every axis in the frame shares the motor range.
+  //
+  // These are already screen-relative: each device normalises into the common frame at
+  // read time (applySeesawOrient + applyStickRotation, per mount/module), so aux tracks
+  // the current screen orientation like the drive stick does. The ctrlInvertX/InvertY/
+  // SwapXY flags are deliberately NOT applied here — they are a drive-mix escape hatch
+  // bound to whichever stick is primary, so propagating them would re-transpose the aux
+  // axes the moment someone toggled SWAP XY to tune drive feel.
+  //
+  // The *Display* vars stay in the ±515 (forward, turn) form the disc render and the HID
+  // report are built on; only the wire fields are converted.
   remoteHasAux  = (nAux >= 1);
   remoteHasAux2 = (nAux >= 2);
   if (remoteHasAux) {
     aux2DisplayX = devRx[auxDev[0]]; aux2DisplayY = devRy[auxDev[0]];
-    remoteAuxX   = aux2DisplayX;     remoteAuxY   = aux2DisplayY;
+    remoteAuxX   = auxAxisToWire(aux2DisplayY);   // X = horizontal, right positive
+    remoteAuxY   = auxAxisToWire(aux2DisplayX);   // Y = vertical,   up    positive
   } else {
     aux2DisplayX = 0; aux2DisplayY = 0;
     remoteAuxX   = 0; remoteAuxY   = 0;
   }
   if (remoteHasAux2) {
     aux3DisplayX = devRx[auxDev[1]]; aux3DisplayY = devRy[auxDev[1]];
-    remoteAux2X  = aux3DisplayX;     remoteAux2Y  = aux3DisplayY;
+    remoteAux2X  = auxAxisToWire(aux3DisplayY);   // same mapping as aux stick 1
+    remoteAux2Y  = auxAxisToWire(aux3DisplayX);
   } else {
     aux3DisplayX = 0; aux3DisplayY = 0;
     remoteAux2X  = 0; remoteAux2Y  = 0;
@@ -7304,12 +7356,14 @@ static const uint8_t HID_GAMEPAD_REPORT_MAP[] = {
 // Send one HID gamepad report from current stick/button state. Mapping:
 //   X = turn (joyDisplayY), Y = -forward (joyDisplayX; HID up = negative),
 //   Z/Rz = aux stick, buttons = same bitfield as RemoteFrame. Values scaled ±515 → ±32767.
+// The *Display* pairs are (forward, turn), not screen X/Y — hence the swap on every axis,
+// and the negation on both vertical axes (Y and Rz) so up is negative as HID expects.
 static void hidSendGamepad() {
   if (!bleHidReady || !bleHidInput || !btConnected) return;
-  int16_t x  = (int16_t)constrain((long)joyDisplayY  * 63, -32767, 32767);
-  int16_t y  = (int16_t)constrain((long)-joyDisplayX * 63, -32767, 32767);
-  int16_t z  = (int16_t)constrain((long)aux2DisplayY * 63, -32767, 32767);
-  int16_t rz = (int16_t)constrain((long)aux2DisplayX * 63, -32767, 32767);
+  int16_t x  = (int16_t)constrain((long)joyDisplayY   * 63, -32767, 32767);
+  int16_t y  = (int16_t)constrain((long)-joyDisplayX  * 63, -32767, 32767);
+  int16_t z  = (int16_t)constrain((long)aux2DisplayY  * 63, -32767, 32767);
+  int16_t rz = (int16_t)constrain((long)-aux2DisplayX * 63, -32767, 32767);
   uint16_t btns = remoteButtonBits();
   uint8_t rpt[10];
   rpt[0] = btns & 0xff;  rpt[1] = (btns >> 8) & 0xff;

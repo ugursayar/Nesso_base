@@ -135,14 +135,20 @@ All control commands flow through `transmitRemoteCommand(L, R)` → a transport 
 | 2 | seq | u8 | rolling, for dedup/loss detection |
 | 3–4 | leftMotor | i16LE | -255..255 |
 | 5–6 | rightMotor | i16LE | -255..255 |
-| 7–8 | auxX | i16LE | aux stick 1 X, -515..515 (0 unless `hasAux`) |
-| 9–10 | auxY | i16LE | aux stick 1 Y (0 unless `hasAux`) |
+| 7–8 | auxX | i16LE | aux stick 1 X, **-255..255, + = RIGHT** (0 unless `hasAux`) |
+| 9–10 | auxY | i16LE | aux stick 1 Y, **-255..255, + = UP** (0 unless `hasAux`) |
 | 11–12 | buttons | u16LE | bitfield, 1=pressed: A=0,B=1,X=2,Y=3,SEL=4,START=5,STICK=6,STICK2=7 |
 | 13 | flags | u8 | bit0=aux1 present, bit1=aux2 present; rest reserved |
 | 14 | crc8 (v1) | u8 | poly 0x07, init 0x00, over bytes 0..13 — **v1 ends here** |
-| 14–15 | aux2X (v2) | i16LE | aux stick 2 X (0 unless `hasAux2`) |
-| 16–17 | aux2Y (v2) | i16LE | aux stick 2 Y |
+| 14–15 | aux2X (v2) | i16LE | aux stick 2 X, -255..255, + = RIGHT (0 unless `hasAux2`) |
+| 16–17 | aux2Y (v2) | i16LE | aux stick 2 Y, -255..255, + = UP |
 | 18 | crc8 (v2) | u8 | poly 0x07, init 0x00, over bytes 0..17 |
+
+**Every axis in the frame is -255..255** — motors and aux alike — so a receiver needs exactly one dead-zone constant, and a joystick module's raw ADC span never reaches the wire (`auxAxisToWire()` rescales; swapping in an aux unit with a different range must not silently change what the protocol means). Specified in `NessoFrame.h` since NessoLink **1.1.2** — the header is vendored verbatim into receiver sketches, so re-vendor both ends together or they silently disagree.
+
+**The `*DisplayX/Y` pairs are NOT screen X/Y — they are `(forward, turn)`.** Everything downstream of `applyStickRotation()` carries the vertical axis in the X field (up positive) and the horizontal axis in the Y field (right positive): that is what the arcade mixer (`thr = rx`, `turn = ry`), `drawStickViz()` and the FORWARD/ROTATE label all consume. Anything leaving the device in a standard X/Y convention must **swap them** — `hidSendGamepad()` does, and so does the aux → frame mapping in `readGamePad()` (`auxX = auxAxisToWire(aux2DisplayY)`, `auxY = auxAxisToWire(aux2DisplayX)`). Copying a `*Display*` pair straight into a frame's X/Y fields draws a **correct disc on screen while transmitting the axes transposed** — a shipped bug (fixed 2026-08-06), and the failure mode is deceptive precisely because the screen looks right. `ctrl` with no argument prints a live `axes` line (drive as fwd/turn, aux as it goes on the wire) to check this without a receiver.
+
+The `ctrlInvertX/InvertY/SwapXY` flags are deliberately **not** applied to aux sticks. Each device already normalises into the shared screen-relative frame at read time (`applySeesawOrient` + `applyStickRotation`), so aux tracks screen orientation on its own; the `ctrl*` flags sit above that as a drive-mix escape hatch bound to whichever stick is *primary*. Propagating them would re-transpose the aux axes the moment someone toggled SWAP XY to tune drive feel. (Making them genuinely per-device — 3× NVS keys, 3× settings rows — is a separate change; the role-scoping is a known wart, not the cause of the transposition.)
 
 Size send/decode buffers with `NESSO_FRAME_MAX_LEN` (19) and use the length `nessoEncode()` returns. Sent at the readGamePad rate (~10 Hz) including when centered, so the receiver can implement a failsafe timeout. **The receiver firmware must parse this frame** — use the same NessoLink library (`nessoDecode()`). Backends:
 - **`TX_WIFI_UDP`** (default, fully working) — `udp` to `targetIpAddress:udpPort`. Unchanged from the original single-path implementation.
