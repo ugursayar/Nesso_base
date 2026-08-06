@@ -500,6 +500,14 @@ bool remoteTxActive = false;
 // cleanup without depending on lastFunction — see the comment at the cleanup block.
 bool ctrlSessionActive = false;
 
+// True while renderControllerSettings() owns the top 22 px (it paints its title into
+// headerSprite, over the battery/WiFi/BT header). The normal controller screen only
+// draws the status sprite below y=22, so nothing else would ever repaint that strip —
+// closing settings has to restore it explicitly, or the "…STICK SETTINGS" title stays
+// on screen. Edge-triggered by this flag rather than lastFunction, which stays
+// FUNCTION_CONTROLLER across the settings ↔ normal transition.
+bool ctrlSettingsHeaderActive = false;
+
 // ----------------------------------------------------------------
 // LoRa (SX1262)
 // ----------------------------------------------------------------
@@ -4381,6 +4389,10 @@ void renderFunction() {
   // the screen was left.
   if (currentFunction != FUNCTION_CONTROLLER) {
     transmitRemoteStop();          // no-op unless the drive loop was feeding the link
+    // Leaving the screen with settings open: the transition fillScreen() below wipes the
+    // title and the next screen paints its own header, so just drop ownership here — a
+    // stale flag would make the next controller entry redraw the header twice.
+    ctrlSettingsHeaderActive = false;
     if (ctrlSessionActive) {       // no-op unless initGamePad() lit the LEDs / GROVE
       ctrlSessionActive = false;
       if (miniJoyCAvailable) {
@@ -4484,6 +4496,13 @@ void renderFunction() {
         renderControllerSettings();
         statusSprite.pushSprite(0, SPRITE_Y);
       } else {
+        // Settings just closed (APPLY/CANCEL/tap): its title still occupies the top
+        // 22 px, and nothing below repaints that strip. lastFunction is unchanged
+        // across this transition, so the flag is what edge-triggers the restore.
+        if (ctrlSettingsHeaderActive) {
+          ctrlSettingsHeaderActive = false;
+          renderHeader();
+        }
         renderController();
         statusSprite.pushSprite(0, SPRITE_Y);
         if (millis() - previousMillis >= 100) {
@@ -5916,6 +5935,7 @@ void renderControllerSettings() {
   headerSprite.drawString(title, sw / 2, isLandscape ? 4 : 6);
   headerSprite.drawFastHLine(8, SPRITE_Y - 1, sw - 16, display.color565(0, 80, 120));
   headerSprite.pushSprite(0, 0);
+  ctrlSettingsHeaderActive = true;   // the standard header is now covered — restore on close
 
   // APPLY / CANCEL buttons
   int btnH = isLandscape ? 20 : 30;
