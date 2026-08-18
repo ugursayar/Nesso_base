@@ -326,6 +326,61 @@ uint8_t       currentRotation   = 0;  // default portrait
 unsigned long lastOrientationMs = 0;
 bool          imuDebugEnabled   = false;  // stream IMU readings to serial
 
+// ── BMI270 sampling (accelerometer + GYROSCOPE) ──────────────────
+// The gyro is live on this board even though the core's MyBoschSensor::begin() passes
+// BOSCH_ACCELEROMETER_ONLY: that flag only skips the (absent) BMM150 magnetometer, while
+// the core's configure_sensor() override enables BMI2_ACCEL *and* BMI2_GYRO at 25 Hz ODR.
+// So IMU.readGyroscope() works — the firmware simply never called it before.
+// No magnetometer means there is no absolute heading: yaw is a RATE only, and integrating
+// it drifts. Do not present an integrated yaw as a compass.
+//
+// SCREEN FRAME. Everything below works in the display's rotation-0 frame, derived from the
+// rotation mapping documented above plus the accelerometer convention that the axis reading
+// +1 g is the one pointing AWAY from earth:
+//     screen-UP     = body +X      screen-RIGHT = body -Y      out of screen = body +Z
+// ax > 0 in portrait-normal therefore means "+X points at the sky", i.e. up the screen.
+// The -Y and +Z signs are the two that hardware can still disagree with (handedness) —
+// check them with the `imu` serial command or the SENSOR screen before trusting a receiver.
+#define IMU_POLL_MS      40    // sensor ODR is 25 Hz; polling faster just re-reads a sample
+#define IMU_ACC_LPF      0.25f // attitude low-pass (raw accel is too jittery for a horizon)
+#define IMU_MOTION_DPS   25.0f // |gyro| above this = "MOVING" on the sensor screen
+// Tilt shown edge-to-edge on an attitude disc. Shared by the SENSOR screen and the
+// controller's tilt disc so both read at the same scale.
+#define SENSOR_VIZ_FS_DEG 45.0f
+
+bool  imuAvailable   = false;  // IMU.begin() succeeded at boot
+bool  imuHaveSample  = false;  // at least one accelerometer sample has landed
+float imuAx = 0, imuAy = 0, imuAz = 0;   // raw accel, G          (sensor axes)
+float imuGx = 0, imuGy = 0, imuGz = 0;   // gyro, deg/s, de-biased (sensor axes)
+float imuFax = 0, imuFay = 0, imuFaz = 1;  // low-passed accel, for attitude
+float imuGBiasX = 0, imuGBiasY = 0, imuGBiasZ = 0;  // captured by imuZeroGyro()
+// Attitude, SCREEN-RELATIVE (rotation-adapted) and measured against the calibrated zero.
+float imuPitchDeg = 0;   // + = nose UP
+float imuRollDeg  = 0;   // + = RIGHT side DOWN
+float imuYawDps   = 0;   // + = CW seen from the front (a rate, not an angle)
+float imuAccelMag = 1;   // |a| in G — 1.0 at rest, deviates under motion
+// Zero reference: the gravity direction that reads as pitch = roll = 0, in the rot-0
+// screen frame. Default (0,0,1) = held flat, screen up, which makes the angles true
+// attitude until the user calibrates to their own hold.
+float imuRefU = 0, imuRefS = 0, imuRefN = 1;
+bool  imuZeroed = false;       // a custom reference has been captured
+// True only when the operator asked for the zero (settings CALIBRATE / ZERO HERE, a tap on
+// the SENSOR screen, `imu zero`). The controller screen's automatic entry-zero does NOT set
+// it, so an explicit calibration is never quietly overwritten while an automatic one still
+// re-fires every time you walk onto the screen holding the device differently.
+bool  imuZeroExplicit = false;
+unsigned long imuLastPollMs = 0;
+
+// Calibration rejection thresholds. Both exist so a calibration taken while the device is
+// being moved fails loudly instead of baking a wrong constant in for the rest of the session.
+#define IMU_CAL_MAX_G_ERR    0.12f  // |a| may differ from 1 g by this much and still be "at rest"
+#define IMU_CAL_MAX_GYRO_PP  6.0f   // max peak-to-peak deg/s across the gyro sample window
+
+// Defined with the controller code; the IMU attitude is rotation-adapted through the very
+// same table the joystick modules use, so there is exactly one copy of it.
+static void applyStickRotation(int16_t px, int16_t py, int16_t& rx, int16_t& ry);
+static void readImuAxes(int16_t& rx, int16_t& ry);   // tilt stick, for the `imu` readout
+
 // ----------------------------------------------------------------
 // Gamepad (Adafruit seesaw mini)
 // ----------------------------------------------------------------
@@ -388,6 +443,11 @@ static const int   SEESAW_MOUNT_COUNT    = 4;
 int      seesawMountIdx      = SS_STICK_SIDE;  // persisted (NVS "ssMount")
 bool     controllerConnected = false;
 bool     calibrationComplete = false;
+// The seesaw's own lazy-centre flag. calibrationComplete is shared with the Mini JoyC
+// (miniJoyCCalibrateHW() sets it and repurposes zero_x/zero_y as its display value), so
+// keying the seesaw's centre capture on it made the capture depend on the order the
+// calibrate-all helper happens to visit devices in.
+bool     seesawCentreArmed   = false;
 int16_t  joyDisplayX = 0;       // -515..515, drive stick — for the joystick visualization
 int16_t  joyDisplayY = 0;
 uint32_t gamepadButtons = 0xFFFFFFFF;  // all bits 1 = all released (active LOW)
@@ -413,15 +473,80 @@ enum CtrlStickDev {                       // canonical order (drives aux assignm
   CTRL_DEV_SEESAW    = 0,
   CTRL_DEV_MINIJOYC  = 1,
   CTRL_DEV_JOYSTICK2 = 2,
-  CTRL_DEV_COUNT     = 3,
+  CTRL_DEV_IMU       = 3,   // the on-board BMI270 as a tilt stick — opt-in, see ctrlImuStick
+  CTRL_DEV_COUNT     = 4,
 };
-static const char* CTRL_DEV_LABELS[CTRL_DEV_COUNT] = { "PAD", "JOYC", "JOY2" };
-int      ctrlPrimaryDev = CTRL_DEV_MINIJOYC;  // which device drives; persisted (NVS "ctrlPrim")
+static const char* CTRL_DEV_LABELS[CTRL_DEV_COUNT] = { "PAD", "JOYC", "JOY2", "TILT" };
+static const char* CTRL_ROLE_LABELS[CTRL_DEV_COUNT] = { "DRIVE", "AUX 1", "AUX 2", "AUX 3" };
+
+// ── Device order ─────────────────────────────────────────────────
+// A PERMUTATION of CtrlStickDev, most-important first. Every readGamePad() cycle it is
+// compacted over the devices that are actually connected to produce the roles
+// DRIVE, AUX1, AUX2, AUX3 — so position, not connection state, is what the user configures.
+//
+// This replaces the old scalar ctrlPrimaryDev, which could only express "who drives" and,
+// worse, was REWRITTEN whenever the chosen device went missing (four separate snap-to-
+// connected sites). That silently destroyed the user's intent: unplug the stick you had
+// picked as primary and the next saveSettings() persisted the substitute. A stored
+// permutation survives unplugging, because compaction is applied at read time and never
+// written back.
+//
+// Default order keeps today's behaviour exactly: Mini JoyC drives, then seesaw, then
+// JoyStick2, then the IMU tilt stick last (so on a 2-physical + IMU rig the IMU is the
+// spare, which is also the cheapest arrangement on the wire).
+uint8_t  ctrlDevOrder[CTRL_DEV_COUNT] = { CTRL_DEV_MINIJOYC, CTRL_DEV_SEESAW,
+                                          CTRL_DEV_JOYSTICK2, CTRL_DEV_IMU };
+
+// Roles resolved from the order + the connection snapshot, refreshed every cycle.
+int      ctrlRoleDev[CTRL_DEV_COUNT] = { -1, -1, -1, -1 };   // role index → device, -1 = none
+int      ctrlRoleCount = 0;                                   // how many roles are filled
+
+// ── IMU as a control source ──────────────────────────────────────
+// Both of these default OFF so an untouched device behaves exactly as before.
+//
+// ctrlImuStick — the BMI270 joins the stick roster as a tilt input, so it shows up as
+// another disc on the controller screen and can drive or sit in an aux slot like any
+// joystick module. ON by default: the IMU is soldered to the board, so it is simply always
+// one of the sticks you have. Two consequences to keep in mind rather than be surprised by:
+//   * connectedStickCount() is never 0, so the controller screen is always reachable — you
+//     can drive by tilt alone with no joystick plugged in at all.
+//   * with two physical sticks it becomes aux2, so frames go from v1 to v2. That is
+//     decoder-compatible with any NessoLink >= 1.1.0 receiver, but a robot that already
+//     acts on aux2 will now see it move with device tilt. Turn it off if that bites.
+//
+// ctrlImuFrame — the transmitter's attitude rides along in the RemoteFrame's dedicated IMU
+// fields. Kept OFF by default, unlike the tilt stick, because this one is NOT wire-safe: it
+// promotes every frame to v3 (25 B), which any receiver built against a pre-1.2.0
+// NessoFrame.h rejects outright (unknown version byte — it fails closed, but it does stop).
+// Turn it on only once the receiver has been re-vendored. It also costs ~30% more LoRa
+// airtime on a link that is already duty-cycle bound.
+bool     ctrlImuStick = true;    // persisted (NVS "ctrlImu")
+bool     ctrlImuFrame = false;   // persisted (NVS "ctrlImuTx")
+// ctrlAux3Frame — put a THIRD aux stick on the wire. Same wire-safety reasoning as
+// ctrlImuFrame and the same default: it promotes every frame to v4 (29 B), which any
+// receiver built against a pre-1.3.0 NessoFrame.h rejects. The all-stop travels the same
+// path, so auto-promoting it the moment a 4th device appeared would mean plugging in a
+// joystick silently disabled the robot's stop frame. Off until the receiver is re-vendored;
+// until then a 4th device is read and drawn, but marked SPARE.
+bool     ctrlAux3Frame = false;  // persisted (NVS "ctrlAux3Tx")
+// Tilt full-scale: degrees of deviation from the zero reference for full stick deflection.
+static const int CTRL_TILT_RANGE_VALS[]  = { 15, 25, 35, 45 };
+static const int CTRL_TILT_RANGE_COUNT   = 4;
+// Floor under the shared deadzone for the tilt stick only — see readImuAxes().
+static const int CTRL_TILT_MIN_DEADZONE  = 30;   // ±512 counts ≈ 1.5° at the 25° range
+int      ctrlTiltRangeIdx = 1;   // persisted (NVS "ctrlTiltR"); default 25 degrees
+// Wire-side IMU values (frame scale, -255..255), refreshed each readGamePad() cycle.
+int16_t  remoteImuPitch = 0;
+int16_t  remoteImuRoll  = 0;
+int16_t  remoteImuYaw   = 0;
+bool     remoteHasImu   = false;   // sets RemoteFrame flags bit2 (promotes frame to v3)
 
 int16_t  aux2DisplayX = 0;             // -515..515, first aux stick — for the 2nd indicator
 int16_t  aux2DisplayY = 0;
 int16_t  aux3DisplayX = 0;             // -515..515, second aux stick — for the 3rd indicator
 int16_t  aux3DisplayY = 0;
+int16_t  aux4DisplayX = 0;             // -515..515, third aux stick — for the 4th indicator
+int16_t  aux4DisplayY = 0;
 // Wire-side aux values: TRUE screen X/Y at the frame's -255..255 scale — X positive =
 // stick pushed RIGHT, Y positive = stick pushed UP. Swapped and rescaled out of the
 // (forward,turn) ±515 display pairs above; see the aux block in readGamePad().
@@ -429,17 +554,37 @@ int16_t  remoteAuxX   = 0;             // fed into RemoteFrame auxX/auxY
 int16_t  remoteAuxY   = 0;
 int16_t  remoteAux2X  = 0;             // fed into RemoteFrame aux2X/aux2Y (v2 frame)
 int16_t  remoteAux2Y  = 0;
+int16_t  remoteAux3X  = 0;             // fed into RemoteFrame aux3X/aux3Y (v4 frame)
+int16_t  remoteAux3Y  = 0;
 bool     remoteHasAux  = false;        // sets RemoteFrame flags bit0
 bool     remoteHasAux2 = false;        // sets RemoteFrame flags bit1 (promotes frame to v2)
+bool     remoteHasAux3 = false;        // sets RemoteFrame flags bit3 (promotes frame to v4)
+// Drive device on the previous cycle, so a change can force a stop before the new stick
+// takes over. -1 = nothing was driving. Reset by initGamePad().
+int      ctrlLastDriveDev = -1;
+// Wall time of the last readGamePad() (stick reads + mix + transmit), for the `ctrl` and
+// `heap` diagnostics. With four devices this is the number that says whether the ~10 Hz
+// frame cadence the receiver failsafe assumes is still being met.
+uint32_t ctrlCycleMs = 0;
 // Role labels resolved each readGamePad() cycle, for the controller visualisation.
 const char* ctrlDriveLabel = "JOYC";
 const char* ctrlAux1Label  = "";
 const char* ctrlAux2Label  = "";
+const char* ctrlAux3Label  = "";
+// Which CtrlStickDev each on-screen disc belongs to ({drive, aux1, aux2}), -1 = unused.
+// Resolved alongside the labels; the render needs it to give the IMU disc its own
+// visualisation (a label string comparison would work but silently breaks if two devices
+// are ever renamed the same).
+int ctrlDiscDev[CTRL_DEV_COUNT] = { -1, -1, -1, -1 };
 
 // How many joysticks are connected (0..3) — drives role assignment, the controller
 // screen visibility, the multi-disc view, and the PRIMARY settings row.
+// True when the on-board IMU is acting as a stick (present AND opted in).
+static inline bool imuStickActive() { return imuAvailable && ctrlImuStick; }
+
 static inline int connectedStickCount() {
-  return (joystickAvailable ? 1 : 0) + (miniJoyCAvailable ? 1 : 0) + (joystick2Available ? 1 : 0);
+  return (joystickAvailable ? 1 : 0) + (miniJoyCAvailable ? 1 : 0) +
+         (joystick2Available ? 1 : 0) + (imuStickActive() ? 1 : 0);
 }
 // True when a stick with a software deadzone / settable centre is present. Gates the
 // DEADZONE/CALIBRATE rows. All three sticks qualify: the deadzone is shared by all of
@@ -447,30 +592,121 @@ static inline int connectedStickCount() {
 // released stick never mixes to a clean stop), and CALIBRATE re-centres whichever is
 // there (Mini JoyC HW cal, seesaw lazy recal; JoyStick2 self-centres).
 static inline bool ctrlHasTunableStick() {
-  return joystickAvailable || miniJoyCAvailable || joystick2Available;
+  return joystickAvailable || miniJoyCAvailable || joystick2Available || imuStickActive();
 }
 // Short text describing the connected controller setup, for serial output.
 static const char* controllerDeviceDesc() {
   int n = connectedStickCount();
   if (n == 0) return "none";
+  if (n >= 4) return "quad";
   if (n >= 3) return "triple";
   if (n == 2) return "dual";
   if (joystick2Available) return "joystick2";
   if (miniJoyCAvailable)  return "minijoyc";
+  if (imuStickActive())   return "tilt";
   return "seesaw";
 }
 static inline bool stickDevAvailable(int dev) {
   return (dev == CTRL_DEV_SEESAW    && joystickAvailable)  ||
          (dev == CTRL_DEV_MINIJOYC  && miniJoyCAvailable)  ||
-         (dev == CTRL_DEV_JOYSTICK2 && joystick2Available);
+         (dev == CTRL_DEV_JOYSTICK2 && joystick2Available) ||
+         (dev == CTRL_DEV_IMU       && imuStickActive());
 }
-// Cycle the drive (primary) device to the next CONNECTED stick (canonical order, wraps).
+// Calibrate every connected input in one action; defined with the controller code, below
+// the per-device calibration routines it calls. Returns a bit-per-CtrlStickDev mask.
+static uint8_t ctrlCalibrateAll();
+
+// Cycle to the next CONNECTED stick (canonical enum order, wraps).
 static int nextConnectedStickDev(int cur) {
   for (int i = 1; i <= CTRL_DEV_COUNT; i++) {
     int d = (cur + i) % CTRL_DEV_COUNT;
     if (stickDevAvailable(d)) return d;
   }
   return cur;
+}
+
+// ── Device-order helpers ─────────────────────────────────────────
+// The device that currently drives. A function, not a variable, so the order stays the one
+// source of truth and nothing can drift out of sync with it.
+static inline int ctrlPrimaryDev() { return ctrlRoleDev[0] >= 0 ? ctrlRoleDev[0] : (int)ctrlDevOrder[0]; }
+
+// A stored order is only usable if it is a genuine permutation. This is load-bearing, not
+// defensive dressing: the values index devOn[] and CTRL_DEV_LABELS[], so a duplicate or an
+// out-of-range byte from a corrupt/older NVS blob would read past the end of both.
+static bool ctrlOrderValid(const uint8_t* o) {
+  bool seen[CTRL_DEV_COUNT] = { false, false, false, false };
+  for (int i = 0; i < CTRL_DEV_COUNT; i++) {
+    if (o[i] >= CTRL_DEV_COUNT || seen[o[i]]) return false;
+    seen[o[i]] = true;
+  }
+  return true;
+}
+
+// Build the canonical order with `primary` moved to the front — the migration path from
+// the old scalar ctrlPrimaryDev, and the repair path for an invalid stored order.
+static void ctrlOrderDefault(uint8_t* o, int primary) {
+  if (primary < 0 || primary >= CTRL_DEV_COUNT) primary = CTRL_DEV_MINIJOYC;
+  int n = 0;
+  o[n++] = (uint8_t)primary;
+  for (int d = 0; d < CTRL_DEV_COUNT; d++) if (d != primary) o[n++] = (uint8_t)d;
+}
+
+// Put `dev` in `role`, keeping every other device's relative order — a rotate, not a swap.
+// A swap would fling whatever held the role to wherever `dev` came from, which reads as
+// random when the user is stepping a row through the device list.
+static void ctrlOrderSetRole(int role, int dev) {
+  if (role < 0 || role >= CTRL_DEV_COUNT || dev < 0 || dev >= CTRL_DEV_COUNT) return;
+  uint8_t out[CTRL_DEV_COUNT];
+  int n = 0;
+  out[n++] = (uint8_t)dev;
+  for (int i = 0; i < CTRL_DEV_COUNT; i++) if (ctrlDevOrder[i] != dev) out[n++] = ctrlDevOrder[i];
+  // out[] is now dev-first; rotate it so dev lands on `role`.
+  uint8_t fin[CTRL_DEV_COUNT];
+  for (int i = 0; i < role; i++)      fin[i] = out[i + 1];
+  fin[role] = (uint8_t)dev;
+  for (int i = role + 1; i < CTRL_DEV_COUNT; i++) fin[i] = out[i];
+  memcpy(ctrlDevOrder, fin, sizeof(ctrlDevOrder));
+}
+
+// Compact the order over the connected devices → roles. Disconnected devices keep their
+// stored position but take no role, so unplugging shifts everything below up by one and
+// re-plugging puts it back exactly where the user left it.
+static void ctrlOrderResolveRoles(const bool* devOn, int* roleDev, int& roleCount) {
+  roleCount = 0;
+  for (int i = 0; i < CTRL_DEV_COUNT; i++) roleDev[i] = -1;
+  for (int i = 0; i < CTRL_DEV_COUNT; i++) {
+    int d = ctrlDevOrder[i];
+    if (d < CTRL_DEV_COUNT && devOn[d]) roleDev[roleCount++] = d;
+  }
+}
+
+// Snapshot of what is connected right now, in CtrlStickDev order.
+static void ctrlDevOnSnapshot(bool* devOn) {
+  devOn[CTRL_DEV_SEESAW]    = joystickAvailable;
+  devOn[CTRL_DEV_MINIJOYC]  = miniJoyCAvailable;
+  devOn[CTRL_DEV_JOYSTICK2] = joystick2Available;
+  devOn[CTRL_DEV_IMU]       = imuStickActive();
+}
+
+// Step the device holding `role` to the next CONNECTED device not already above it.
+// Only connected devices are offered, because this is the on-screen row and offering an
+// absent device there would look like a no-op. Serial `ctrl order` places absent ones.
+void ctrlOrderCycleRole(int role) {
+  bool devOn[CTRL_DEV_COUNT];
+  ctrlDevOnSnapshot(devOn);
+  int roleDev[CTRL_DEV_COUNT], nRole;
+  ctrlOrderResolveRoles(devOn, roleDev, nRole);
+  if (role < 0 || role >= nRole) return;
+  int cur = roleDev[role];
+  for (int step = 1; step <= CTRL_DEV_COUNT; step++) {
+    int cand = (cur + step) % CTRL_DEV_COUNT;
+    if (!devOn[cand]) continue;
+    bool aboveUs = false;                       // already held by an earlier role
+    for (int r = 0; r < role; r++) if (roleDev[r] == cand) { aboveUs = true; break; }
+    if (aboveUs) continue;
+    ctrlOrderSetRole(role, cand);
+    return;
+  }
 }
 
 // ── BLE HID gamepad ("standard controller") ──────────────────────
@@ -481,6 +717,15 @@ static int nextConnectedStickDev(int cur) {
 // takes effect after a reboot with BT started.
 bool     hidGamepadEnabled = false;    // persisted (NVS "hidPad")
 bool     bleHidReady       = false;
+// ATT MTU we ask the central for, and the payload a notify can carry (MTU - 3 bytes of
+// ATT opcode + handle). 64 is plenty for the largest RemoteFrame (v4, 29 B) and costs
+// nothing when unused. BLEDevice::getMTU() reports the negotiated value.
+#define BLE_ATT_MTU_WANTED 64
+static inline int bleNotifyMax() {
+  int mtu = (int)BLEDevice::getMTU();
+  if (mtu < 23) mtu = 23;      // never report more than the spec floor allows
+  return mtu - 3;
+}
 class BLEHIDDevice* bleHid = nullptr;
 class BLECharacteristic* bleHidInput = nullptr;
 
@@ -507,6 +752,9 @@ bool ctrlSessionActive = false;
 // on screen. Edge-triggered by this flag rather than lastFunction, which stays
 // FUNCTION_CONTROLLER across the settings ↔ normal transition.
 bool ctrlSettingsHeaderActive = false;
+// Same deal for the SENSOR screen's settings panel — it paints its own title over the
+// header, and renderSensor() never touches that strip either.
+bool sensorSettingsHeaderActive = false;
 
 // ----------------------------------------------------------------
 // LoRa (SX1262)
@@ -1027,17 +1275,18 @@ static void joystick2SetLED(uint32_t rgb888) {
 enum MainFunctions {
   FUNCTION_MAIN       = 0,
   FUNCTION_CONTROLLER = 1,
-  FUNCTION_BT         = 2,
-  FUNCTION_WIFI       = 3,
-  FUNCTION_LORA       = 4,
-  FUNCTION_RFID2      = 5,   // M5Stack RFID2 Unit (WS1850S I2C 0x28) — hidden when not connected
-  FUNCTION_IR         = 6,   // IR remote
-  FUNCTION_RF433      = 7,   // 433 MHz RF remote (SYN115 TX + SYN531R RX)
-  FUNCTION_MEDIA      = 8,   // matrix + vader + obiwan merged; sub-screen via swipe up/down
-  FUNCTION_BATTERY    = 9,   // moved to end; long-press opens device settings
+  FUNCTION_SENSOR     = 2,   // on-board BMI270 IMU — sits next to the controller, which uses it
+  FUNCTION_BT         = 3,
+  FUNCTION_WIFI       = 4,
+  FUNCTION_LORA       = 5,
+  FUNCTION_RFID2      = 6,   // M5Stack RFID2 Unit (WS1850S I2C 0x28) — hidden when not connected
+  FUNCTION_IR         = 7,   // IR remote
+  FUNCTION_RF433      = 8,   // 433 MHz RF remote (SYN115 TX + SYN531R RX)
+  FUNCTION_MEDIA      = 9,   // matrix + vader + obiwan merged; sub-screen via swipe up/down
+  FUNCTION_BATTERY    = 10,  // kept last; long-press opens device settings
 } currentFunction;
 
-const int  mainFunctionCount = 10;
+const int  mainFunctionCount = 11;
 int        lastFunction;
 
 // ── Web file manager ─────────────────────────────────────────────
@@ -1051,6 +1300,83 @@ const long BTN_DEBOUNCE_MS = 50;    // ignore bounces shorter than this
 bool          key1Down      = false, key2Down      = false;
 bool          key1LongFired = false, key2LongFired = false;
 unsigned long key1PressedAt = 0,     key2PressedAt = 0;
+
+// ── Settings-panel row counts ────────────────────────────────────
+// Up here because the key/tap/swipe handlers below need them long before the render
+// functions that lay the rows out.
+//
+// Controller: fixed rows 0..9 (CALIBRATE, DEADZONE, SWAP XY, INVERT X, INVERT Y, TX LINK,
+// SCR LOCK, TILT STK, TILT RNG, IMU TX), then the optional ones in display order — MOUNT
+// (seesaw present) and PRIMARY (2+ sticks). The three IMU rows are always present rather
+// than gated on imuAvailable: the BMI270 is soldered on, so a missing one means a failed
+// init, and a greyed-out row says that far more usefully than a row that silently
+// disappears and renumbers everything below it.
+// Fixed rows: PROFILE, PROFILES, CALIBRATE, DEADZONE, SWAP XY, INVERT X, INVERT Y,
+// TX LINK, SCR LOCK, TILT STK, TILT RNG, IMU TX, AUX3 TX.
+#define CTRL_SET_FIXED_ROWS 13
+// Then MOUNT (seesaw present) and one role row per connected device (2+ devices).
+#define CTRL_SET_MAX_ROWS   (CTRL_SET_FIXED_ROWS + 1 + CTRL_DEV_COUNT)
+// Sensor: ZERO HERE / LEVEL REF / GYRO ZERO / TILT STK / IMU TX.
+#define SENSOR_SET_ITEMS     5
+
+// The controller settings panel has a sub-level for browsing profiles. It is a level INSIDE
+// NAV_SETTINGS rather than a new navState, deliberately: renderFunction() fires
+// transmitRemoteStop() on the way into NAV_SETTINGS, and staying inside it keeps the drive
+// loop stopped for the whole browsing session instead of resuming under the browser.
+enum CtrlSetLevel { CTRL_SET_LEVEL_ROWS = 0, CTRL_SET_LEVEL_PROFILES = 1 };
+int ctrlSetLevel   = CTRL_SET_LEVEL_ROWS;
+int ctrlProfCursor = 0;
+
+// ── Controller settings row table ────────────────────────────────
+// ONE builder, consumed by the renderer, the KEY1 action handler, the KEY2 cursor wrap,
+// the swipe bounds and the tap hit-test. Previously each of those carried its own copy of
+// the row layout — a hardcoded array size, a hand-walked "dynamic rows start at index 7"
+// switch, and a `disabled` mask written as index literals. Adding a row meant editing all
+// of them in step, and missing one gave either a stack overflow or a tap that silently
+// actioned the wrong setting. Row position is now data.
+//
+// Declared up here because the key/tap/swipe handlers run long before the render code that
+// fills it in.
+enum CtrlSetAction : uint8_t {
+  CSA_PROFILE, CSA_PROFILES, CSA_CALIBRATE, CSA_DEADZONE, CSA_SWAPXY, CSA_INVERTX,
+  CSA_INVERTY, CSA_TXLINK, CSA_SCRLOCK, CSA_TILTSTK, CSA_TILTRNG, CSA_IMUTX, CSA_AUX3TX,
+  CSA_MOUNT, CSA_ROLE,
+};
+struct CtrlSetRow {
+  const char*   label;
+  char          value[18];
+  bool          disabled;
+  CtrlSetAction action;
+  int8_t        role;     // CSA_ROLE only: which role slot this row edits
+};
+extern CtrlSetRow ctrlSetRows[CTRL_SET_MAX_ROWS];
+int  ctrlSetBuildRows();
+int  ctrlProfRowCount();
+void ctrlProfActivateRow();
+void ctrlProfScan();
+void ctrlProfCycle();
+void ctrlOrderCycleRole(int role);
+// True when the live settings differ from the active profile — drives the "*" on the
+// PROFILE row and whether APPLY writes the profile file back.
+bool ctrlProfDirty = false;
+int  ctrlProfCount = 0;
+
+// Profile table. The storage/apply functions live further down with the rest of the
+// controller code, but the table itself and these bounds are needed by the settings
+// handlers and the serial command surface, both of which come first.
+#define CTRL_PROF_MAX       8      // static table, no heap
+#define CTRL_PROF_NAME_MAX  13     // 12 chars + NUL — the settings row can show ~10
+#define CTRL_PROF_MIN_FREE  8192   // refuse to write below this, before touching anything
+struct CtrlProfEntry { char name[CTRL_PROF_NAME_MAX]; char path[48]; };
+CtrlProfEntry ctrlProfList[CTRL_PROF_MAX];
+char ctrlProfActive[48] = "";      // path of the active profile, "" = DEFAULT (NVS only)
+const char* ctrlProfActiveName();
+bool ctrlProfApply(const char* path);
+bool ctrlProfSaveActive();
+bool ctrlProfCreate(const char* name);
+bool ctrlProfDelete(const char* path);
+bool ctrlProfNameOk(const char* n);
+bool ctrlProfAutoNew();
 
 // ── Settings overlay ─────────────────────────────────────────────
 enum NavState { NAV_NORMAL, NAV_SETTINGS, NAV_RESET } navState = NAV_NORMAL;
@@ -1228,9 +1554,23 @@ void loadSettings() {
   ctrlScreenLock  = p.getBool ("ctrlLock", true);
   seesawMountIdx = constrain((int)p.getUChar("ssMount", SS_STICK_SIDE), 0, SEESAW_MOUNT_COUNT - 1);
   remoteTransportIdx = constrain((int)p.getUChar("txLink", 0), 0, REMOTE_TX_COUNT - 1);
-  // Primary (drive) device. Migrate the old dual-stick bool: true → Mini JoyC, false → seesaw.
+  // Device order. Three-step migration, newest first, so an upgrade never lands on a
+  // nonsense order and a downgrade still drives the right stick:
+  //   ctrlOrd (4-byte permutation)  →  ctrlPrim (old scalar)  →  dualPriMJC (older bool)
+  // A stored blob is only accepted if it is a genuine permutation — the bytes index
+  // devOn[] and CTRL_DEV_LABELS[], so a corrupt one would read out of bounds.
   int primDefault = p.getBool("dualPriMJC", true) ? CTRL_DEV_MINIJOYC : CTRL_DEV_SEESAW;
-  ctrlPrimaryDev = constrain((int)p.getUChar("ctrlPrim", (uint8_t)primDefault), 0, CTRL_DEV_COUNT - 1);
+  int primLegacy  = constrain((int)p.getUChar("ctrlPrim", (uint8_t)primDefault), 0, CTRL_DEV_COUNT - 1);
+  uint8_t ordBuf[CTRL_DEV_COUNT];
+  if (p.getBytes("ctrlOrd", ordBuf, sizeof(ordBuf)) == sizeof(ordBuf) && ctrlOrderValid(ordBuf))
+    memcpy(ctrlDevOrder, ordBuf, sizeof(ctrlDevOrder));
+  else
+    ctrlOrderDefault(ctrlDevOrder, primLegacy);
+  ctrlImuStick    = p.getBool ("ctrlImu",   true);
+  ctrlImuFrame    = p.getBool ("ctrlImuTx", false);
+  ctrlAux3Frame   = p.getBool ("ctrlAux3Tx", false);
+  p.getString("ctrlProf", ctrlProfActive, sizeof(ctrlProfActive));
+  ctrlTiltRangeIdx = constrain((int)p.getUChar("ctrlTiltR", 1), 0, CTRL_TILT_RANGE_COUNT - 1);
   hidGamepadEnabled   = p.getBool("hidPad", false);
   p.end();
 }
@@ -1268,7 +1608,15 @@ void saveSettings() {
   p.putBool ("ctrlLock", ctrlScreenLock);
   p.putUChar("ssMount", (uint8_t)seesawMountIdx);
   p.putUChar("txLink",  (uint8_t)remoteTransportIdx);
-  p.putUChar("ctrlPrim", (uint8_t)ctrlPrimaryDev);
+  p.putBytes("ctrlOrd", ctrlDevOrder, sizeof(ctrlDevOrder));
+  // Keep the old scalar in sync for one release, so downgrading the firmware still picks
+  // the right drive stick instead of silently reverting to the compiled default.
+  p.putUChar("ctrlPrim", (uint8_t)ctrlDevOrder[0]);
+  p.putBool ("ctrlImu",   ctrlImuStick);
+  p.putBool ("ctrlImuTx", ctrlImuFrame);
+  p.putBool ("ctrlAux3Tx", ctrlAux3Frame);
+  p.putString("ctrlProf", ctrlProfActive);
+  p.putUChar("ctrlTiltR", (uint8_t)ctrlTiltRangeIdx);
   p.putBool ("hidPad", hidGamepadEnabled);
   p.end();
 }
@@ -1421,7 +1769,9 @@ void setup() {
   lastActivityMs    = millis();
 
   Wire.begin();
-  IMU.begin();
+  imuAvailable = (IMU.begin() != 0);   // accel + gyro (the core's config enables both)
+  if (imuAvailable) splashLog("> IMU: BMI270 ready", COLOR_GREEN);
+  else              splashLog("> IMU: not found",    COLOR_RED);
   touchReady = touch.begin();
   if (touchReady) splashLog("> Touch: ready", COLOR_GREEN);
   else            splashLog("> Touch: not found", COLOR_GRAY);
@@ -1486,6 +1836,21 @@ void setup() {
     irScanFiles();
     rf433ScanFiles();
     rfid2ScanFiles();
+    // Controller profiles. loadSettings() has already run (it must — it is NVS, and NVS is
+    // available before the filesystem), so the live settings are the NVS ones; re-applying
+    // the saved profile on top is what makes "the profile I was using" survive a reboot.
+    ctrlProfScan();
+    if (ctrlProfActive[0]) {
+      char saved[48];
+      strlcpy(saved, ctrlProfActive, sizeof(saved));
+      if (!ctrlProfApply(saved)) {
+        // Deleted or unreadable. Keep the NVS settings rather than booting into an
+        // unconfigured mapping, and drop the dangling pointer so the UI says DEFAULT.
+        ctrlProfActive[0] = '\0';
+        saveSettings();
+        splashLog("> Profile: missing, using saved", COLOR_ORANGE);
+      }
+    }
     splashLog("> FS: ready", COLOR_GREEN);
   } else {
     splashLog("> FS: mount failed", COLOR_RED);
@@ -1522,7 +1887,13 @@ void setup() {
   delay(900);
 
   // Poll until the IMU has its first sample (up to 200 ms), then orient
-  for (int i = 0; i < 20 && !IMU.accelerationAvailable(); i++) delay(10);
+  for (int i = 0; i < 20 && !imuHaveSample; i++) { imuLastPollMs = 0; imuPoll(); delay(10); }
+  // Gyro bias, taken at boot because the device is usually sitting still then (~250 ms).
+  // Bias drifts with temperature, so it is measured every boot rather than persisted. If
+  // the device was being held/moved the check refuses and the bias stays 0 — say so, or a
+  // yaw that reads a few deg/s at rest looks like a bug rather than a skipped calibration.
+  if (imuAvailable && !imuZeroGyro())
+    splashLog("> IMU: gyro cal skipped (moving)", COLOR_GRAY);
   updateOrientation();
 
   currentFunction = FUNCTION_MAIN;
@@ -1586,6 +1957,11 @@ void loop() {
     debugln("%");
   }
 
+  // Sample the IMU before anything consumes it. Self-rate-limited to IMU_POLL_MS, and
+  // skipped while the screen is dark so a sleeping device isn't running I2C at 25 Hz —
+  // resetActivity() clears displayOff, so a wake gets a fresh sample within one tick.
+  if (!displayOff) imuPoll();
+
   if (msNow - lastOrientationMs > 300) {
     lastOrientationMs = msNow;
     updateOrientation();
@@ -1645,6 +2021,155 @@ void createStatusSprite() {
   headerSprite.setBuffer(headerSpriteBuf, display.width(), SPRITE_Y);
 }
 
+// ── IMU sampling ─────────────────────────────────────────────────
+// One place reads the BMI270; everything else (orientation, the SENSOR screen, the tilt
+// stick, the RemoteFrame) consumes the cached values. updateOrientation() used to do its
+// own accelerationAvailable()/readAcceleration() pair, which cannot coexist with a second
+// reader: BoschSensorClass caches the data-ready interrupt status in a shared _int_status
+// and clears the bit it just consumed, so two callers would each swallow the other's
+// samples and orientation would stall.
+
+static inline float imuWrap180(float d) {
+  while (d >  180.0f) d -= 360.0f;
+  while (d < -180.0f) d += 360.0f;
+  return d;
+}
+
+// Recompute screen-relative pitch/roll from the low-passed accelerometer.
+//
+// Pitch and roll are measured as ROTATIONS AWAY FROM THE ZERO REFERENCE, not as absolute
+// tilt angles, so the operator can calibrate in whatever posture they actually hold the
+// device. Each is the signed angle between the current and reference gravity directions
+// projected onto the plane the corresponding rotation moves them in:
+//   pitch → rotation about the screen-horizontal axis → the (up, normal) plane
+//   roll  → rotation about the screen-vertical   axis → the (right, normal) plane
+// Using atan2 per plane (rather than the usual asin-of-a-component) is what keeps this
+// monotonic through a full 180 degrees of travel — an asin form peaks at 90 degrees and
+// folds back, which would make "tilt further forward" read as "tilt back" for anyone
+// holding the device upright rather than flat.
+//
+// Roll is genuinely unobservable when gravity lies along the screen-vertical axis (device
+// held bolt upright): rotating about the gravity vector moves nothing an accelerometer can
+// see, and with no magnetometer there is nothing else to ask. It reads 0 there, correctly.
+static void imuUpdateAttitude() {
+  // Sensor axes → rot-0 screen frame (see the SCREEN FRAME note above).
+  float u = imuFax, s = -imuFay, n = imuFaz;
+  float mag = sqrtf(u * u + s * s + n * n);
+  if (mag < 0.2f) return;             // free-fall / bad sample: keep the last attitude
+  u /= mag; s /= mag; n /= mag;
+
+  float pitch0 =  imuWrap180(degrees(atan2f(u, n)) - degrees(atan2f(imuRefU, imuRefN)));
+  float roll0  = -imuWrap180(degrees(atan2f(s, n)) - degrees(atan2f(imuRefS, imuRefN)));
+
+  // Rotation-adapt through the shared stick table so the angles are screen-relative like
+  // every other axis the firmware puts on the wire. The table works on (forward, turn),
+  // which is exactly what (pitch, roll) are; tenths of a degree keep it in int16 range.
+  int16_t p10, r10;
+  applyStickRotation((int16_t)lroundf(constrain(pitch0, -1800.0f, 1800.0f) * 10.0f),
+                     (int16_t)lroundf(constrain(roll0,  -1800.0f, 1800.0f) * 10.0f),
+                     p10, r10);
+  imuPitchDeg = p10 / 10.0f;
+  imuRollDeg  = r10 / 10.0f;
+}
+
+void imuPoll() {
+  if (!imuAvailable) return;
+  unsigned long now = millis();
+  if (now - imuLastPollMs < IMU_POLL_MS) return;
+  imuLastPollMs = now;
+
+  float x, y, z;
+  if (IMU.accelerationAvailable() && IMU.readAcceleration(x, y, z)) {
+    imuAx = x; imuAy = y; imuAz = z;
+    imuAccelMag = sqrtf(x * x + y * y + z * z);
+    if (!imuHaveSample) { imuFax = x; imuFay = y; imuFaz = z; imuHaveSample = true; }
+    else {
+      imuFax += (x - imuFax) * IMU_ACC_LPF;
+      imuFay += (y - imuFay) * IMU_ACC_LPF;
+      imuFaz += (z - imuFaz) * IMU_ACC_LPF;
+    }
+    imuUpdateAttitude();
+  }
+  if (IMU.gyroscopeAvailable() && IMU.readGyroscope(x, y, z)) {
+    imuGx = x - imuGBiasX;
+    imuGy = y - imuGBiasY;
+    imuGz = z - imuGBiasZ;
+    // Yaw is rotation about the screen normal (body +Z). Clockwise as SEEN FROM THE FRONT
+    // is negative by the right-hand rule, hence the flip — and it needs no rotation
+    // adaptation, because turning the displayed image never changes which way is clockwise
+    // to the person looking at the physical screen.
+    imuYawDps = -imuGz;
+  }
+}
+
+// Capture the current attitude as the zero reference (pitch = roll = 0 from here).
+//
+// `userAsked` distinguishes a deliberate calibration from the automatic one the controller
+// screen does on entry — see the note in initGamePad(). Returns false (and changes nothing)
+// if the accelerometer isn't currently measuring gravity alone: while the device is being
+// waved about, |a| departs from 1 g and the vector points somewhere that is not down, so
+// capturing it would pin the zero to a direction the operator never intends to hold.
+bool imuZeroAttitude(bool userAsked) {
+  if (!imuHaveSample) return false;
+  float u = imuFax, s = -imuFay, n = imuFaz;
+  float mag = sqrtf(u * u + s * s + n * n);
+  if (fabsf(mag - 1.0f) > IMU_CAL_MAX_G_ERR) return false;   // not at rest → not gravity
+  imuRefU = u / mag; imuRefS = s / mag; imuRefN = n / mag;
+  imuZeroed = true;
+  if (userAsked) imuZeroExplicit = true;
+  imuUpdateAttitude();
+  return true;
+}
+
+// Back to "held flat, screen up" — the reference that makes pitch/roll true attitude.
+void imuResetAttitudeRef() {
+  imuRefU = 0; imuRefS = 0; imuRefN = 1;
+  imuZeroed = false;
+  imuZeroExplicit = false;   // hands the controller screen back its auto-zero on entry
+  imuUpdateAttitude();
+}
+
+// Average the gyro at rest and subtract that from every later reading. Blocking (~250 ms),
+// so it only runs from an explicit user action or from boot.
+//
+// Returns false and keeps the previous bias if the device was MOVING during the sample
+// window. A gyro bias captured mid-motion is worse than none: it is silently wrong for the
+// rest of the session, it makes yaw read non-zero at rest forever, and it makes the
+// STILL/MOVING indicator lie about the thing it is supposed to detect. Peak-to-peak across
+// the window is the test — an offset that stays put is bias, one that wanders is motion.
+bool imuZeroGyro() {
+  if (!imuAvailable) return false;
+  float sx = 0, sy = 0, sz = 0;
+  float lo[3] = {  9999,  9999,  9999 };
+  float hi[3] = { -9999, -9999, -9999 };
+  int   n  = 0;
+  for (int i = 0; i < 40 && n < 16; i++) {
+    float x, y, z;
+    if (IMU.gyroscopeAvailable() && IMU.readGyroscope(x, y, z)) {
+      sx += x; sy += y; sz += z; n++;
+      lo[0] = min(lo[0], x); hi[0] = max(hi[0], x);
+      lo[1] = min(lo[1], y); hi[1] = max(hi[1], y);
+      lo[2] = min(lo[2], z); hi[2] = max(hi[2], z);
+    }
+    delay(6);
+  }
+  if (n < 4) return false;
+  for (int a = 0; a < 3; a++)
+    if (hi[a] - lo[a] > IMU_CAL_MAX_GYRO_PP) return false;   // it was moving → keep old bias
+
+  imuGBiasX = sx / n; imuGBiasY = sy / n; imuGBiasZ = sz / n;
+  imuGx = imuGy = imuGz = 0;
+  imuYawDps = 0;
+  return true;
+}
+
+// Zero everything the IMU offers, as one user-facing "calibrate" action.
+bool imuCalibrate() {
+  bool okAtt = imuZeroAttitude(true);
+  bool okGyr = imuZeroGyro();
+  return okAtt && okGyr;
+}
+
 void updateOrientation() {
   if (key1Down || key2Down || touchActive) return;  // suppress during any input — avoids rotation during swipe
   // Frozen while the display is dark: every rotation flap reallocates ~65KB of
@@ -1657,9 +2182,9 @@ void updateOrientation() {
   // redraws the screen *and* flips applyStickRotation() under the user's thumb.
   // Keyed on currentFunction so it covers the controller settings panel too.
   if (ctrlScreenLock && currentFunction == FUNCTION_CONTROLLER) return;
-  float ax, ay, az;
-  if (!IMU.accelerationAvailable()) return;
-  IMU.readAcceleration(ax, ay, az);
+  // Cached from imuPoll() — see the note there for why this must not read the IMU itself.
+  if (!imuHaveSample) return;
+  float ax = imuAx, ay = imuAy, az = imuAz;
 
   float xyTotal = fabsf(ax) + fabsf(ay);
 
@@ -1991,7 +2516,12 @@ void onTap(int16_t sx, int16_t sy) {
   } else if (navState == NAV_SETTINGS && currentFunction == FUNCTION_RFID2) {
     handleRFID2SettingsTap(sx, sy);
   } else if (navState == NAV_SETTINGS && currentFunction == FUNCTION_CONTROLLER) {
-    handleControllerSettingsTap(sx, sy);
+    if (ctrlSetLevel == CTRL_SET_LEVEL_PROFILES) handleControllerProfilesTap(sx, sy);
+    else                                          handleControllerSettingsTap(sx, sy);
+  } else if (navState == NAV_SETTINGS && currentFunction == FUNCTION_SENSOR) {
+    handleSensorSettingsTap(sx, sy);
+  } else if (currentFunction == FUNCTION_SENSOR && navState == NAV_NORMAL) {
+    imuZeroAttitude(true);   // tap anywhere = zero to the current hold (the common action)
   } else if (currentFunction == FUNCTION_BT && navState == NAV_NORMAL) {
     if (btSelectedAddr[0] != '\0') {
       btSelectedAddr[0] = '\0';   // tap in detail view → back to list
@@ -2391,7 +2921,8 @@ void onSwipe(int16_t dx, int16_t dy) {
         (currentFunction == FUNCTION_LORA || currentFunction == FUNCTION_BT ||
          currentFunction == FUNCTION_WIFI  || currentFunction == FUNCTION_BATTERY ||
          currentFunction == FUNCTION_RF433 || currentFunction == FUNCTION_IR  ||
-         currentFunction == FUNCTION_RFID2 || currentFunction == FUNCTION_CONTROLLER)) {
+         currentFunction == FUNCTION_RFID2 || currentFunction == FUNCTION_CONTROLLER ||
+         currentFunction == FUNCTION_SENSOR)) {
       // Move the cursor — the render function will update settingsScrollOffset to track it
       int maxCursor;
       if      (currentFunction == FUNCTION_WIFI)       maxCursor = 2;
@@ -2400,7 +2931,15 @@ void onSwipe(int16_t dx, int16_t dy) {
       else if (currentFunction == FUNCTION_RF433)      maxCursor = 6;
       else if (currentFunction == FUNCTION_IR)         maxCursor = 6;
       else if (currentFunction == FUNCTION_RFID2)      maxCursor = 5;
-      else if (currentFunction == FUNCTION_CONTROLLER) maxCursor = controllerSettingsItemCount() - 1;
+      else if (currentFunction == FUNCTION_CONTROLLER) {
+        if (ctrlSetLevel == CTRL_SET_LEVEL_PROFILES) {
+          if (dy < 0) ctrlProfCursor = min(ctrlProfCursor + 1, ctrlProfRowCount() - 1);
+          else        ctrlProfCursor = max(ctrlProfCursor - 1, 0);
+          return;
+        }
+        maxCursor = controllerSettingsItemCount() - 1;
+      }
+      else if (currentFunction == FUNCTION_SENSOR)     maxCursor = SENSOR_SET_ITEMS - 1;
       else /* BATTERY */                               maxCursor = 7;
       if (dy < 0) settingsCursor = min(settingsCursor + 1, maxCursor);
       else        settingsCursor = max(settingsCursor - 1, 0);
@@ -2720,43 +3259,76 @@ void onKey1Short() {
           break;
         // case 5 = RESET — handled above
       }
+    } else if (currentFunction == FUNCTION_SENSOR) {
+      sensorSettingsActivate();
+    } else if (currentFunction == FUNCTION_CONTROLLER && ctrlSetLevel == CTRL_SET_LEVEL_PROFILES) {
+      ctrlProfActivateRow();
     } else if (currentFunction == FUNCTION_CONTROLLER) {
-      switch (settingsCursor) {
-        case 0:  // CALIBRATE — Mini JoyC HW cal if present, else seesaw lazy recal
-                 // (JoyStick2 self-centres via its offset register — no manual cal)
-          if (miniJoyCAvailable) {
-            miniJoyCWireHat();
-            miniJoyCCalibrateHW();  // averages 30 samples, writes x_mid/y_mid to STM32 flash
-            miniJoyCWireRestore();
-          } else {
-            calibrationComplete = false;  // seesaw: re-trigger lazy calibration
-          }
+      // Dispatch on the row's ACTION, never on its index. The row set is dynamic (profile
+      // rows, an optional MOUNT row, one row per connected device), so an index-keyed
+      // switch silently actions the wrong setting the moment the roster changes.
+      int n = ctrlSetBuildRows();
+      if (settingsCursor < 0 || settingsCursor >= n) return;
+      const CtrlSetRow& row = ctrlSetRows[settingsCursor];
+      if (row.disabled) return;
+      // Anything that changes the mapping, the transport or the endpoint marks the active
+      // profile dirty. Set up front so every branch below is covered.
+      if (row.action != CSA_PROFILE && row.action != CSA_PROFILES && row.action != CSA_CALIBRATE)
+        ctrlProfDirty = true;
+      switch (row.action) {
+        case CSA_PROFILE:                     // cycle DEFAULT → saved profiles → DEFAULT
+          ctrlProfCycle();
+          settingsCursor = 0;                 // the row set can change size under us
+          break;
+        case CSA_PROFILES:                    // open the profile browser
+          transmitRemoteStop();
+          ctrlProfScan();
+          ctrlSetLevel = CTRL_SET_LEVEL_PROFILES;
+          ctrlProfCursor = 0;
+          break;
+        case CSA_CALIBRATE:
+          ctrlCalibrateAll();
           navState = NAV_NORMAL;
           break;
-        case 1:  // DEADZONE — cycle values (Mini JoyC / JoyStick2)
-          if (ctrlHasTunableStick()) ctrlDeadzoneIdx = (ctrlDeadzoneIdx + 1) % CTRL_DEADZONE_COUNT;
+        case CSA_DEADZONE:
+          transmitRemoteStop();               // deadzone change re-shapes the live mix
+          ctrlDeadzoneIdx = (ctrlDeadzoneIdx + 1) % CTRL_DEADZONE_COUNT;
           break;
-        case 2: ctrlSwapXY  = !ctrlSwapXY;  break;
-        case 3: ctrlInvertX = !ctrlInvertX;  break;
-        case 4: ctrlInvertY = !ctrlInvertY;  break;
-        case 5:  // TX LINK — cycle WiFi-UDP / BLE / WiFi-TCP / LoRa
+        case CSA_SWAPXY:  ctrlSwapXY  = !ctrlSwapXY;  break;
+        case CSA_INVERTX: ctrlInvertX = !ctrlInvertX; break;
+        case CSA_INVERTY: ctrlInvertY = !ctrlInvertY; break;
+        case CSA_TXLINK:
+          // Stop on the OLD link first: the robot listening there would otherwise never
+          // hear a stop, and the eventual exit-stop goes out on the new transport.
+          transmitRemoteStop();
           if (remoteTransportIdx == TX_WIFI_TCP) tcpClient.stop();
           remoteTransportIdx = (remoteTransportIdx + 1) % REMOTE_TX_COUNT;
           break;
-        case 6: ctrlScreenLock = !ctrlScreenLock; break;  // SCR LOCK — freeze orientation on this screen
-        default: {
-          // Dynamic rows ≥7, in display order: MOUNT (seesaw present) then PRIMARY (≥2 sticks).
-          int row = 7;
-          if (joystickAvailable) {
-            if (settingsCursor == row) { seesawMountIdx = (seesawMountIdx + 1) % SEESAW_MOUNT_COUNT; break; }
-            row++;
-          }
-          if (connectedStickCount() >= 2) {
-            if (settingsCursor == row) { ctrlPrimaryDev = nextConnectedStickDev(ctrlPrimaryDev); break; }
-            row++;
-          }
+        case CSA_SCRLOCK:
+          ctrlScreenLock = !ctrlScreenLock;
+          ctrlProfDirty = false;              // handheld preference, not part of a profile
           break;
-        }
+        case CSA_TILTSTK:                     // the IMU joins/leaves the stick roster
+          transmitRemoteStop();
+          ctrlImuStick = !ctrlImuStick;
+          // Zero to the current hold on the way in, so enabling it doesn't hand the drive
+          // mix a large standing deflection from whatever angle the device is at.
+          if (ctrlImuStick) imuCalibrate();
+          // No re-pointing needed: the order is compacted over connected devices every
+          // cycle, so adding or removing the IMU just shifts roles by one.
+          break;
+        case CSA_TILTRNG:
+          ctrlTiltRangeIdx = (ctrlTiltRangeIdx + 1) % CTRL_TILT_RANGE_COUNT;
+          break;
+        case CSA_IMUTX:  ctrlImuFrame  = !ctrlImuFrame;  break;   // v3 — needs NessoLink 1.2.0+
+        case CSA_AUX3TX: ctrlAux3Frame = !ctrlAux3Frame; break;   // v4 — needs NessoLink 1.3.0+
+        case CSA_MOUNT:
+          seesawMountIdx = (seesawMountIdx + 1) % SEESAW_MOUNT_COUNT;
+          break;
+        case CSA_ROLE:                        // which device holds this role
+          transmitRemoteStop();
+          ctrlOrderCycleRole(row.role);
+          break;
       }
     }
   }
@@ -2787,9 +3359,14 @@ void onKey2Short() {
       settingsCursor = (settingsCursor + 1) % 7;  // NEW / SELECT / DEL REMOTE / CAPTURE / AUTO / DELETE / RESET
     else if (currentFunction == FUNCTION_RFID2)
       settingsCursor = (settingsCursor + 1) % 6;  // NEW FILE / SELECT FILE / DEL FILE / RECORD / DELETE CARD / RESET
-    else if (currentFunction == FUNCTION_CONTROLLER)
-      // CALIBRATE / DEADZONE / SWAP XY / INVERT X / INVERT Y / TX LINK / SCR LOCK (+ MOUNT, PRIMARY)
-      settingsCursor = (settingsCursor + 1) % controllerSettingsItemCount();
+    else if (currentFunction == FUNCTION_CONTROLLER) {
+      if (ctrlSetLevel == CTRL_SET_LEVEL_PROFILES)
+        ctrlProfCursor = (ctrlProfCursor + 1) % ctrlProfRowCount();
+      else
+        settingsCursor = (settingsCursor + 1) % controllerSettingsItemCount();
+    }
+    else if (currentFunction == FUNCTION_SENSOR)
+      settingsCursor = (settingsCursor + 1) % SENSOR_SET_ITEMS;
   }
 }
 
@@ -2801,14 +3378,24 @@ void onKey1Long() {
     rf433LearnStop();
     return;
   }
+  // Inside the profile browser, APPLY means "leave the browser", not "leave settings".
+  if (navState == NAV_SETTINGS && currentFunction == FUNCTION_CONTROLLER &&
+      ctrlSetLevel == CTRL_SET_LEVEL_PROFILES) {
+    ctrlSetLevel = CTRL_SET_LEVEL_ROWS;
+    return;
+  }
   if (navState == NAV_NORMAL) {
     if (currentFunction == FUNCTION_LORA       || currentFunction == FUNCTION_BT         ||
         currentFunction == FUNCTION_WIFI        || currentFunction == FUNCTION_BATTERY    ||
         currentFunction == FUNCTION_RF433       || currentFunction == FUNCTION_IR         ||
-        currentFunction == FUNCTION_RFID2       || currentFunction == FUNCTION_CONTROLLER) {
+        currentFunction == FUNCTION_RFID2       || currentFunction == FUNCTION_CONTROLLER ||
+        currentFunction == FUNCTION_SENSOR) {
       navState             = NAV_SETTINGS;
       settingsCursor       = 0;
       settingsScrollOffset = 0;
+      ctrlSetLevel         = CTRL_SET_LEVEL_ROWS;   // never open straight into a sub-level
+      ctrlProfCursor       = 0;
+      if (currentFunction == FUNCTION_CONTROLLER) ctrlProfScan();
       debugln("Entered settings");
     }
   } else if (navState == NAV_SETTINGS) {
@@ -2816,7 +3403,14 @@ void onKey1Long() {
     else if (currentFunction == FUNCTION_LORA) applyLoraSettings();
     else if (currentFunction == FUNCTION_BT) applyBTSettings();
     else if (currentFunction == FUNCTION_BATTERY) applyDeviceSettings();
-    else if (currentFunction == FUNCTION_CONTROLLER) saveSettings();
+    else if (currentFunction == FUNCTION_CONTROLLER) {
+      saveSettings();
+      // APPLY also writes the active profile, so "apply" means the same thing whether or
+      // not a profile is loaded. With DEFAULT active there is no file and NVS is the store.
+      if (ctrlProfDirty) ctrlProfSaveActive();
+      ctrlSetLevel = CTRL_SET_LEVEL_ROWS;
+    }
+    else if (currentFunction == FUNCTION_SENSOR)     saveSettings();  // TILT STK / IMU TX
     // RF433 / RFID2: no persistent settings to apply, just close
     navState = NAV_NORMAL;
     // No lastFunction = -1 here: sprite-based screens redraw every frame already.
@@ -2832,7 +3426,15 @@ void onKey2Long() {
     resetFeedbackMs = 0; resetFeedbackBtn = -1;
     debugln("Reset page closed");
   } else if (navState == NAV_SETTINGS) {
+    // From the profile browser, CANCEL steps back one level rather than closing settings —
+    // one level of "back" per press, like the RFID2/IR file browsers.
+    if (currentFunction == FUNCTION_CONTROLLER && ctrlSetLevel == CTRL_SET_LEVEL_PROFILES) {
+      ctrlSetLevel = CTRL_SET_LEVEL_ROWS;
+      debugln("Profile browser closed");
+      return;
+    }
     navState = NAV_NORMAL;
+    ctrlSetLevel = CTRL_SET_LEVEL_ROWS;
     debugln("Settings cancelled");
   }
 }
@@ -2910,9 +3512,17 @@ static void printHelpNav() {
   serialWritelnAll("  ctrl calibrate        write joystick center to STM32 flash [Mini JoyC only]");
   serialWritelnAll("  ctrl link <type>      remote TX link: udp|ble|tcp|lora");
   serialWritelnAll("  ctrl lock on|off      screen lock: hold orientation on the controller screen (default ON)");
-  serialWritelnAll("  ctrl primary pad|joyc|joy2  which stick drives (2+ sticks connected)");
+  serialWritelnAll("  ctrl order                  show device order + resolved roles");
+  serialWritelnAll("  ctrl order pad,joyc,joy2,tilt  set the order (any subset, best first)");
+  serialWritelnAll("  ctrl drive|aux1|aux2|aux3 <dev>  put a device in one role (dev: pad|joyc|joy2|tilt)");
+  serialWritelnAll("  ctrl aux3tx on|off          send the 3rd aux stick (v4 frame; needs NessoLink 1.3.0+)");
+  serialWritelnAll("  ctrl prof ...               profiles: show|use|new|save|del|default");
+  serialWritelnAll("  ctrl primary pad|joyc|joy2|tilt  alias for 'ctrl drive'");
   serialWritelnAll("  ctrl ssmount 0-3      seesaw mount: 0=side 1=back (attached) 2=detport 3=detland (detached)");
   serialWritelnAll("  ctrl hid on|off       act as a standard BLE HID gamepad (PC/Android); reboot to apply");
+  serialWritelnAll("  ctrl tilt on|off      use the on-board IMU as a tilt stick (joins the stick roster)");
+  serialWritelnAll("  ctrl tiltrange 0-3    tilt for full deflection: 0=15 1=25 2=35 3=45 degrees");
+  serialWritelnAll("  ctrl imutx on|off     send IMU attitude in the frame (v3 — needs a NessoLink 1.2.0+ receiver)");
 }
 
 static void printHelpWifi() {
@@ -3118,6 +3728,22 @@ void serialPrintFunctionHelp(int fn) {
       printHelpMusic();
       break;
     }
+    case FUNCTION_SENSOR:
+      if (!imuAvailable) {
+        serialWritelnAll("[SENSOR] BMI270 not available (IMU.begin() failed at boot)");
+      } else {
+        snprintf(buf, sizeof(buf),
+          "[SENSOR] pitch:%+.1f roll:%+.1f yaw:%+.1f d/s  |a|:%.2fg  ref:%s  tilt:%s  imutx:%s",
+          imuPitchDeg, imuRollDeg, imuYawDps, imuAccelMag,
+          imuZeroed ? "ZEROED" : "level",
+          ctrlImuStick ? "ON" : "off",
+          ctrlImuFrame ? "ON" : "off");
+        serialWritelnAll(buf);
+      }
+      serialWritelnAll("Sensor screen: tap = zero to current hold, KEY1 long = settings");
+      serialWritelnAll("  imu | imu zero | imu level | imu debug on|off");
+      serialWritelnAll("  ctrl tilt on|off | ctrl tiltrange 0-3 | ctrl imutx on|off");
+      break;
     case FUNCTION_RFID2:
       snprintf(buf, sizeof(buf), "[RFID2] unit:%s  file:%s  cards:%d  record:%s",
         rfid2Available ? "connected" : "not found",
@@ -3144,7 +3770,9 @@ void serialPrintHelp() {
   printHelpRFID2();
   printHelpMusic();
   serialWritelnAll("IMU / Orientation:");
-  serialWritelnAll("  imu                    single accelerometer snapshot");
+  serialWritelnAll("  imu                    accel + gyro + derived attitude snapshot");
+  serialWritelnAll("  imu zero               zero attitude to the current hold, re-bias the gyro");
+  serialWritelnAll("  imu level              attitude reference back to level (flat, screen up)");
   serialWritelnAll("  imu debug on|off       stream readings every 300 ms");
   serialWritelnAll("Diagnostics:");
   serialWritelnAll("  heap                   free heap, largest block, sprite alloc state");
@@ -3171,11 +3799,16 @@ static const char* cmdArg(const char* line, const char* cmd) {
 // ── Per-command handlers ──────────────────────────────────────────
 
 void serialPrintStatus() {
-  static const char* fn[] = {"main","controller","bt","lora","media","battery"};
+  // One entry per MainFunctions value, in enum order — this is indexed by currentFunction,
+  // so a short table reads past the end (it did: six names for ten screens).
+  static const char* fn[mainFunctionCount] = {
+    "main","controller","sensor","bt","wifi","lora","rfid2","ir","rf433","media","battery"
+  };
+  int fnIdx = constrain((int)currentFunction, 0, mainFunctionCount - 1);
   char buf[128];
   snprintf(buf, sizeof(buf),
     "Screen:%s  Nav:%s  WiFi:%s  BT:%s  BLE-UART:%s",
-    fn[(int)currentFunction],
+    fn[fnIdx],
     navState == NAV_NORMAL ? "normal" : navState == NAV_SETTINGS ? "settings" : "reset",
     WiFi.isConnected() ? "on" : "off",
     btConnected ? "connected" : (btInitialized ? "scanning" : "off"),
@@ -3216,9 +3849,14 @@ void serialPrintController() {
 
 void serialGoto(const char* name) {
   static const struct { const char* n; int f; } map[] = {
-    {"main",0},{"controller",1},{"bt",2},{"wifi",3},
-    {"lora",4},{"rfid2",5},{"ir",6},{"rf433",7},
-    {"media",8},{"matrix",8},{"vader",8},{"obiwan",8},{"battery",9}
+    {"main",FUNCTION_MAIN},   {"controller",FUNCTION_CONTROLLER},
+    {"bt",FUNCTION_BT},       {"wifi",FUNCTION_WIFI},
+    {"lora",FUNCTION_LORA},   {"rfid2",FUNCTION_RFID2},
+    {"ir",FUNCTION_IR},       {"rf433",FUNCTION_RF433},
+    {"media",FUNCTION_MEDIA}, {"matrix",FUNCTION_MEDIA},
+    {"vader",FUNCTION_MEDIA}, {"obiwan",FUNCTION_MEDIA},
+    {"sensor",FUNCTION_SENSOR},{"imu",FUNCTION_SENSOR},
+    {"battery",FUNCTION_BATTERY}
   };
   for (auto& e : map) {
     if (strcasecmp(name, e.n) == 0) {
@@ -3228,7 +3866,7 @@ void serialGoto(const char* name) {
       return;
     }
   }
-  serialWritelnAll("Unknown screen. Use: main|controller|bt|wifi|lora|ir|media|battery");
+  serialWritelnAll("Unknown screen. Use: main|controller|bt|wifi|lora|rfid2|ir|rf433|media|sensor|battery");
 }
 
 void serialHandleBT(const char* arg) {
@@ -3314,18 +3952,58 @@ void serialHandleImu(const char* arg) {
     if      (strcasecmp(v,"on") ==0) { imuDebugEnabled=true;  serialWritelnAll("[IMU] debug stream ON  (type 'imu debug off' to stop)"); }
     else if (strcasecmp(v,"off")==0) { imuDebugEnabled=false; serialWritelnAll("[IMU] debug stream OFF"); }
     else { serialWritelnAll("Usage: imu debug on|off"); }
-  } else {
-    // Single snapshot
-    if (!IMU.accelerationAvailable()) { serialWritelnAll("[IMU] no sample available"); return; }
-    float ax, ay, az;
-    IMU.readAcceleration(ax, ay, az);
-    char buf[120];
-    snprintf(buf, sizeof(buf),
-      "[IMU] ax=%.3f ay=%.3f az=%.3f xy=%.3f rot=%d  debug:%s",
-      ax, ay, az, fabsf(ax)+fabsf(ay), currentRotation,
-      imuDebugEnabled ? "ON" : "off");
-    serialWritelnAll(buf);
+    return;
   }
+  if (cmdIs(arg,"zero")) {
+    if (!imuAvailable) { serialWritelnAll("[IMU] not available"); return; }
+    bool okAtt = imuZeroAttitude(true);
+    bool okGyr = imuZeroGyro();
+    if (okAtt && okGyr)
+      serialWritelnAll("[IMU] zeroed to the current attitude; gyro re-biased.");
+    else
+      serialWritelnAll("[IMU] REFUSED — the device was moving. Hold it still and retry. "
+                       "(attitude and gyro are unchanged where the check failed)");
+    serialHandleImu("");
+    return;
+  }
+  if (cmdIs(arg,"level")) {
+    if (!imuAvailable) { serialWritelnAll("[IMU] not available"); return; }
+    imuResetAttitudeRef();
+    serialWritelnAll("[IMU] reference back to level (held flat, screen up).");
+    serialHandleImu("");
+    return;
+  }
+  if (*arg) {
+    serialWritelnAll("Usage: imu [debug on|off | zero | level]");
+    return;
+  }
+
+  // Snapshot. Reads the cached sample rather than the sensor: imuPoll() owns the IMU, and
+  // a second reader here would eat the data-ready flag orientation tracking depends on.
+  if (!imuAvailable)  { serialWritelnAll("[IMU] BMI270 not available (begin failed)"); return; }
+  if (!imuHaveSample) { serialWritelnAll("[IMU] no sample yet"); return; }
+  char buf[160];
+  snprintf(buf, sizeof(buf),
+    "[IMU] accel g  x=%+.3f y=%+.3f z=%+.3f  |a|=%.3f   gyro d/s  x=%+.1f y=%+.1f z=%+.1f",
+    imuAx, imuAy, imuAz, imuAccelMag, imuGx, imuGy, imuGz);
+  serialWritelnAll(buf);
+  // Screen-relative derived values — the ones the tilt stick and the frame actually use.
+  // Bench check: nose UP -> pitch +, RIGHT edge DOWN -> roll +, CW as you look at the
+  // screen -> yaw +. Any of those backwards means a sign in the SCREEN FRAME note is wrong.
+  snprintf(buf, sizeof(buf),
+    "  attitude  pitch=%+.1f (nose up +)  roll=%+.1f (right down +)  yaw=%+.1f d/s (CW +)  rot=%d  ref=%s",
+    imuPitchDeg, imuRollDeg, imuYawDps, currentRotation, imuZeroed ? "ZEROED" : "level");
+  serialWritelnAll(buf);
+  int16_t tx = 0, ty = 0;
+  if (imuStickActive()) readImuAxes(tx, ty);
+  snprintf(buf, sizeof(buf),
+    "  tilt stick:%s range:%d deg  fwd:%d turn:%d      frame(v3) tx:%s  pitch:%d roll:%d yaw:%d",
+    ctrlImuStick ? "ON" : "off", CTRL_TILT_RANGE_VALS[ctrlTiltRangeIdx], tx, ty,
+    ctrlImuFrame ? "ON" : "off", remoteImuPitch, remoteImuRoll, remoteImuYaw);
+  serialWritelnAll(buf);
+  snprintf(buf, sizeof(buf), "  gyro bias x=%+.2f y=%+.2f z=%+.2f   debug:%s",
+    imuGBiasX, imuGBiasY, imuGBiasZ, imuDebugEnabled ? "ON" : "off");
+  serialWritelnAll(buf);
 }
 
 void serialHandleIR(const char* arg) {
@@ -4102,6 +4780,112 @@ void serialHandleMusic(const char* arg) {
   }
 }
 
+// Device name → CtrlStickDev, accepting both the short screen labels and the long names.
+static int ctrlDevFromName(const char* v) {
+  if (!v || !*v) return -1;
+  if (!strcasecmp(v,"pad")  || !strcasecmp(v,"seesaw"))    return CTRL_DEV_SEESAW;
+  if (!strcasecmp(v,"joyc") || !strcasecmp(v,"minijoyc"))  return CTRL_DEV_MINIJOYC;
+  if (!strcasecmp(v,"joy2") || !strcasecmp(v,"joystick2")) return CTRL_DEV_JOYSTICK2;
+  if (!strcasecmp(v,"tilt") || !strcasecmp(v,"imu"))       return CTRL_DEV_IMU;
+  return -1;
+}
+
+// Print the stored order and the roles it currently resolves to. Devices that are stored
+// but not connected are shown in lowercase and take no role — that distinction is the whole
+// reason the order is stored as a permutation rather than snapped to what's plugged in.
+static void ctrlPrintOrder() {
+  bool devOn[CTRL_DEV_COUNT];
+  ctrlDevOnSnapshot(devOn);
+  int roleDev[CTRL_DEV_COUNT], nRole;
+  ctrlOrderResolveRoles(devOn, roleDev, nRole);
+
+  char line[160];
+  char ord[64] = "";
+  for (int i = 0; i < CTRL_DEV_COUNT; i++) {
+    char one[12];
+    const char* nm = CTRL_DEV_LABELS[ctrlDevOrder[i]];
+    if (devOn[ctrlDevOrder[i]]) snprintf(one, sizeof(one), "%s%s", i ? "," : "", nm);
+    else {                       // lowercase = stored but not connected
+      char lower[8];
+      strlcpy(lower, nm, sizeof(lower));
+      for (char* p = lower; *p; p++) *p = tolower((unsigned char)*p);
+      snprintf(one, sizeof(one), "%s%s", i ? "," : "", lower);
+    }
+    strlcat(ord, one, sizeof(ord));
+  }
+  snprintf(line, sizeof(line), "[CTRL] order: %s   (UPPER = connected, lower = absent)", ord);
+  serialWritelnAll(line);
+
+  for (int r = 0; r < nRole; r++) {
+    bool spare = (r == 3 && !ctrlAux3Frame);
+    snprintf(line, sizeof(line), "  %-6s %-5s%s",
+      CTRL_ROLE_LABELS[r], CTRL_DEV_LABELS[roleDev[r]],
+      spare ? "   SPARE - not transmitted (ctrl aux3tx on to send, needs NessoLink 1.3.0+)" : "");
+    serialWritelnAll(line);
+  }
+  if (nRole == 0) serialWritelnAll("  (no stick connected)");
+}
+
+static void serialHandleCtrlProfile(const char* arg) {
+  ctrlProfScan();
+  char buf[160];
+  if (!*arg || cmdIs(arg,"show") || cmdIs(arg,"list")) {
+    snprintf(buf, sizeof(buf), "[PROF] active:%s%s   saved:%d/%d",
+      ctrlProfActiveName(), ctrlProfDirty ? " (unsaved changes)" : "",
+      ctrlProfCount, CTRL_PROF_MAX);
+    serialWritelnAll(buf);
+    for (int i = 0; i < ctrlProfCount; i++) {
+      snprintf(buf, sizeof(buf), "  %d) %-12s %s", i + 1, ctrlProfList[i].name,
+        strcmp(ctrlProfList[i].path, ctrlProfActive) == 0 ? "<= active" : "");
+      serialWritelnAll(buf);
+    }
+    serialWritelnAll("  ctrl prof use <name> | new <name> | save | del <name> | default");
+    return;
+  }
+  if (cmdIs(arg,"use")) {
+    const char* n = cmdArg(arg,"use");
+    for (int i = 0; i < ctrlProfCount; i++)
+      if (!strcasecmp(n, ctrlProfList[i].name)) {
+        if (ctrlProfApply(ctrlProfList[i].path)) { serialWritelnAll("[PROF] applied."); ctrlPrintOrder(); }
+        else serialWritelnAll("[PROF] failed to read that profile.");
+        return;
+      }
+    serialWritelnAll("[PROF] no such profile.");
+  } else if (cmdIs(arg,"new")) {
+    const char* n = cmdArg(arg,"new");
+    if (!ctrlProfNameOk(n)) {
+      serialWritelnAll("[PROF] name must be 1-12 chars of A-Z a-z 0-9 _ -");
+      return;
+    }
+    serialWritelnAll(ctrlProfCreate(n)
+      ? "[PROF] created from the current settings and made active."
+      : "[PROF] could not create (name taken, limit reached, or filesystem full).");
+  } else if (cmdIs(arg,"save")) {
+    if (!ctrlProfActive[0]) { serialWritelnAll("[PROF] DEFAULT is active - use 'ctrl prof new <name>'."); return; }
+    serialWritelnAll(ctrlProfSaveActive() ? "[PROF] saved." : "[PROF] write failed.");
+  } else if (cmdIs(arg,"del")) {
+    const char* n = cmdArg(arg,"del");
+    for (int i = 0; i < ctrlProfCount; i++)
+      if (!strcasecmp(n, ctrlProfList[i].name)) {
+        bool wasActive = (strcmp(ctrlProfList[i].path, ctrlProfActive) == 0);
+        if (ctrlProfDelete(ctrlProfList[i].path))
+          serialWritelnAll(wasActive
+            ? "[PROF] deleted. Settings are unchanged; the active profile is now DEFAULT."
+            : "[PROF] deleted.");
+        else serialWritelnAll("[PROF] delete failed.");
+        return;
+      }
+    serialWritelnAll("[PROF] no such profile.");
+  } else if (cmdIs(arg,"default")) {
+    ctrlProfActive[0] = '\0';
+    ctrlProfDirty = false;
+    saveSettings();
+    serialWritelnAll("[PROF] active profile cleared; settings unchanged (now DEFAULT).");
+  } else {
+    serialWritelnAll("ctrl prof use|new|save|del <name> | show | default");
+  }
+}
+
 void serialHandleController(const char* arg) {
   bool multi = connectedStickCount() >= 2;
   if (!*arg) {
@@ -4109,7 +4893,7 @@ void serialHandleController(const char* arg) {
     char ssSeg[28] = "";
     if (joystickAvailable) snprintf(ssSeg, sizeof(ssSeg), "  ssmount:%s", SEESAW_MOUNT_LABELS[seesawMountIdx]);
     char primSeg[24] = "";
-    if (multi) snprintf(primSeg, sizeof(primSeg), "  primary:%s", CTRL_DEV_LABELS[ctrlPrimaryDev]);
+    if (multi) snprintf(primSeg, sizeof(primSeg), "  drive:%s", CTRL_DEV_LABELS[ctrlPrimaryDev()]);
     snprintf(buf, sizeof(buf),
       "[CTRL] device:%s  invertx:%s  inverty:%s  swap:%s  dz:%d  link:%s  lock:%s%s%s",
       controllerDeviceDesc(),
@@ -4131,6 +4915,25 @@ void serialHandleController(const char* arg) {
       ctrlDriveLabel, joyDisplayX, joyDisplayY,
       remoteHasAux  ? ctrlAux1Label : "-", remoteAuxX,  remoteAuxY,
       remoteHasAux2 ? ctrlAux2Label : "-", remoteAux2X, remoteAux2Y);
+    serialWritelnAll(buf);
+    if (ctrlRoleCount >= 4 || ctrlAux3Frame) {
+      snprintf(buf, sizeof(buf), "        aux3[%s] X:%d Y:%d%s",
+        ctrlRoleCount >= 4 ? ctrlAux3Label : "-", remoteAux3X, remoteAux3Y,
+        (ctrlRoleCount >= 4 && !ctrlAux3Frame)
+          ? "   SPARE - not transmitted ('ctrl aux3tx on')" : "");
+      serialWritelnAll(buf);
+    }
+    snprintf(buf, sizeof(buf), "  cycle:%lums (budget 100ms)  frame:v%d",
+      (unsigned long)ctrlCycleMs,
+      remoteHasAux3 ? 4 : remoteHasImu ? 3 : remoteHasAux2 ? 2 : 1);
+    serialWritelnAll(buf);
+    ctrlPrintOrder();
+    snprintf(buf, sizeof(buf),
+      "  imu   tilt-stick:%s  range:%d deg  ref:%s  frame-tx:%s  pitch:%+.1f roll:%+.1f yaw:%+.1f",
+      ctrlImuStick ? "ON" : "off", CTRL_TILT_RANGE_VALS[ctrlTiltRangeIdx],
+      imuZeroed ? "ZEROED" : "level",
+      ctrlImuFrame ? "ON (frames are v3)" : "off",
+      imuPitchDeg, imuRollDeg, imuYawDps);
     serialWritelnAll(buf);
     if (hidGamepadEnabled)
       serialWritelnAll("  HID gamepad mode: ON (BLE standard controller; reboot with BT to activate)");
@@ -4171,11 +4974,19 @@ void serialHandleController(const char* arg) {
     ctrlDeadzoneIdx = idx;
     saveSettings(); serialHandleController("");
   } else if (cmdIs(arg,"calibrate")) {
-    if (!miniJoyCAvailable) { serialWritelnAll("Calibrate applies to Mini JoyC only."); return; }
-    miniJoyCWireHat();
-    miniJoyCCalibrateHW();
-    miniJoyCWireRestore();
-    serialWritelnAll("[CTRL] Mini JoyC calibrated.");
+    if (!ctrlHasTunableStick()) { serialWritelnAll("Nothing to calibrate — no stick connected."); return; }
+    uint8_t done = ctrlCalibrateAll();
+    char buf[160];
+    snprintf(buf, sizeof(buf), "[CTRL] calibrated:%s%s%s%s",
+      (done & (1 << CTRL_DEV_MINIJOYC))  ? "  JOYC(centre->STM32 flash)" : "",
+      (done & (1 << CTRL_DEV_SEESAW))    ? "  PAD(centre re-armed)"      : "",
+      (done & (1 << CTRL_DEV_JOYSTICK2)) ? "  JOY2(self-centring)"       : "",
+      (done & (1 << CTRL_DEV_IMU))       ? "  TILT(attitude+gyro zeroed)": "");
+    serialWritelnAll(buf);
+    // The IMU is the only one that can refuse, and it refuses for a reason worth printing:
+    // a calibration taken mid-motion is silently wrong for the rest of the session.
+    if (imuStickActive() && !(done & (1 << CTRL_DEV_IMU)))
+      serialWritelnAll("  TILT: REFUSED — the device was moving. Hold it still and retry.");
   } else if (cmdIs(arg,"link")) {
     const char* v = cmdArg(arg,"link");
     int idx = -1;
@@ -4184,19 +4995,66 @@ void serialHandleController(const char* arg) {
     else if (strcasecmp(v,"tcp") ==0) idx = TX_WIFI_TCP;
     else if (strcasecmp(v,"lora")==0) idx = TX_LORA;
     if (idx < 0) { serialWritelnAll("Usage: ctrl link udp|ble|tcp|lora"); return; }
+    // Stop on the CURRENT link before switching — see the settings TX LINK row.
+    transmitRemoteStop();
     if (idx == TX_WIFI_TCP) tcpClient.stop();  // drop any stale connection on switch
     remoteTransportIdx = idx;
+    ctrlProfDirty = true;
     saveSettings(); serialHandleController("");
-  } else if (cmdIs(arg,"primary")) {
-    const char* v = cmdArg(arg,"primary");
-    int dev = -1;
-    if      (strcasecmp(v,"pad")==0  || strcasecmp(v,"seesaw")==0)   dev = CTRL_DEV_SEESAW;
-    else if (strcasecmp(v,"joyc")==0 || strcasecmp(v,"minijoyc")==0) dev = CTRL_DEV_MINIJOYC;
-    else if (strcasecmp(v,"joy2")==0 || strcasecmp(v,"joystick2")==0) dev = CTRL_DEV_JOYSTICK2;
-    if (dev < 0) { serialWritelnAll("Usage: ctrl primary pad|joyc|joy2  (which stick drives)"); return; }
-    if (!stickDevAvailable(dev)) { serialWritelnAll("That stick isn't connected."); return; }
-    ctrlPrimaryDev = dev;
+  } else if (cmdIs(arg,"primary") || cmdIs(arg,"drive") ||
+             cmdIs(arg,"aux1") || cmdIs(arg,"aux2") || cmdIs(arg,"aux3")) {
+    // `ctrl primary <dev>` is kept as an alias for `ctrl drive <dev>`.
+    int role = cmdIs(arg,"aux1") ? 1 : cmdIs(arg,"aux2") ? 2 : cmdIs(arg,"aux3") ? 3 : 0;
+    const char* key = cmdIs(arg,"primary") ? "primary" : cmdIs(arg,"drive") ? "drive"
+                    : cmdIs(arg,"aux1") ? "aux1" : cmdIs(arg,"aux2") ? "aux2" : "aux3";
+    const char* v = cmdArg(arg, key);
+    int dev = ctrlDevFromName(v);
+    if (dev < 0) {
+      serialWritelnAll("Usage: ctrl drive|aux1|aux2|aux3 pad|joyc|joy2|tilt");
+      return;
+    }
+    transmitRemoteStop();
+    ctrlOrderSetRole(role, dev);
+    ctrlProfDirty = true;
     saveSettings(); serialHandleController("");
+  } else if (cmdIs(arg,"order")) {
+    const char* v = cmdArg(arg,"order");
+    if (!*v) { ctrlPrintOrder(); return; }
+    // A comma/space separated list, most-important first. Unlisted devices keep their
+    // relative order after the listed ones. This is the only way to position a device that
+    // is NOT currently connected — the settings rows only offer connected ones.
+    uint8_t neu[CTRL_DEV_COUNT];
+    bool    used[CTRL_DEV_COUNT] = { false, false, false, false };
+    int     n = 0;
+    char    tmp[64];
+    strlcpy(tmp, v, sizeof(tmp));
+    for (char* tok = strtok(tmp, ", "); tok && n < CTRL_DEV_COUNT; tok = strtok(nullptr, ", ")) {
+      int d = ctrlDevFromName(tok);
+      if (d < 0)     { serialWritelnAll("Usage: ctrl order pad,joyc,joy2,tilt  (any subset, best first)"); return; }
+      if (used[d])   { serialWritelnAll("Each device may appear only once."); return; }
+      used[d] = true; neu[n++] = (uint8_t)d;
+    }
+    if (n == 0) { ctrlPrintOrder(); return; }
+    for (int i = 0; i < CTRL_DEV_COUNT && n < CTRL_DEV_COUNT; i++)   // keep the rest in order
+      if (!used[ctrlDevOrder[i]]) { used[ctrlDevOrder[i]] = true; neu[n++] = ctrlDevOrder[i]; }
+    if (!ctrlOrderValid(neu)) { serialWritelnAll("Internal error: bad order."); return; }
+    transmitRemoteStop();
+    memcpy(ctrlDevOrder, neu, sizeof(ctrlDevOrder));
+    ctrlProfDirty = true;
+    saveSettings(); ctrlPrintOrder();
+  } else if (cmdIs(arg,"aux3tx")) {
+    const char* v = cmdArg(arg,"aux3tx");
+    if      (strcasecmp(v,"on") ==0) ctrlAux3Frame = true;
+    else if (strcasecmp(v,"off")==0) ctrlAux3Frame = false;
+    else { serialWritelnAll("Usage: ctrl aux3tx on|off  (3rd aux stick in the frame)"); return; }
+    if (ctrlAux3Frame)
+      serialWritelnAll("[CTRL] Frames are now v4 (29 B) whenever a 4th device is connected. A "
+                       "receiver built against a pre-1.3.0 NessoFrame.h will REJECT them - "
+                       "re-vendor the header on the robot.");
+    ctrlProfDirty = true;
+    saveSettings(); serialHandleController("");
+  } else if (cmdIs(arg,"prof")) {
+    serialHandleCtrlProfile(cmdArg(arg,"prof"));
   } else if (cmdIs(arg,"ssmount")) {
     const char* v = cmdArg(arg,"ssmount");
     int idx = -1;
@@ -4207,6 +5065,32 @@ void serialHandleController(const char* arg) {
     if (idx < 0) { serialWritelnAll("Usage: ctrl ssmount 0-3  (0=side 1=back 2=detport 3=detland)"); return; }
     seesawMountIdx = idx;
     saveSettings(); serialHandleController("");
+  } else if (cmdIs(arg,"tilt")) {
+    const char* v = cmdArg(arg,"tilt");
+    if (!imuAvailable) { serialWritelnAll("IMU not available."); return; }
+    if      (strcasecmp(v,"on") ==0) ctrlImuStick = true;
+    else if (strcasecmp(v,"off")==0) ctrlImuStick = false;
+    else { serialWritelnAll("Usage: ctrl tilt on|off  (on-board IMU as a tilt stick)"); return; }
+    if (ctrlImuStick) imuCalibrate();
+    saveSettings(); serialHandleController("");
+  } else if (cmdIs(arg,"tiltrange")) {
+    int idx = atoi(cmdArg(arg,"tiltrange"));
+    if (idx < 0 || idx >= CTRL_TILT_RANGE_COUNT) {
+      serialWritelnAll("Usage: ctrl tiltrange 0-3  (degrees for full deflection: 15 25 35 45)");
+      return;
+    }
+    ctrlTiltRangeIdx = idx;
+    saveSettings(); serialHandleController("");
+  } else if (cmdIs(arg,"imutx")) {
+    const char* v = cmdArg(arg,"imutx");
+    if (!imuAvailable) { serialWritelnAll("IMU not available."); return; }
+    if      (strcasecmp(v,"on") ==0) ctrlImuFrame = true;
+    else if (strcasecmp(v,"off")==0) ctrlImuFrame = false;
+    else { serialWritelnAll("Usage: ctrl imutx on|off  (IMU attitude in the RemoteFrame)"); return; }
+    if (ctrlImuFrame)
+      serialWritelnAll("[CTRL] Frames are now v3 (25 B). A receiver built against a pre-1.2.0 "
+                       "NessoFrame.h will REJECT them — re-vendor the header on the robot.");
+    saveSettings(); serialHandleController("");
   } else if (cmdIs(arg,"hid")) {
     const char* v = cmdArg(arg,"hid");
     if      (strcasecmp(v,"on") ==0) hidGamepadEnabled = true;
@@ -4216,7 +5100,7 @@ void serialHandleController(const char* arg) {
     serialWritelnAll("[CTRL] HID gamepad mode saved. Reboot with BT started to (de)activate.");
     serialHandleController("");
   } else {
-    serialWritelnAll("ctrl subcommands: invertx|inverty|swap|lock on|off  dz 0-3  calibrate  link udp|ble|tcp|lora  primary pad|joyc|joy2  ssmount 0-3  hid on|off");
+    serialWritelnAll("ctrl subcommands: invertx|inverty|swap|lock|tilt|imutx on|off  dz 0-3  tiltrange 0-3  calibrate  link udp|ble|tcp|lora  primary pad|joyc|joy2|tilt  ssmount 0-3  hid on|off");
   }
 }
 
@@ -4412,6 +5296,11 @@ void renderFunction() {
     }
   }
 
+  // Same reasoning as the controller block above: leaving with the sensor settings open,
+  // the transition fillScreen() wipes the title and the next screen paints its own header,
+  // so just drop ownership — a stale flag would redraw the header twice on the way back in.
+  if (currentFunction != FUNCTION_SENSOR) sensorSettingsHeaderActive = false;
+
   if (lastFunction != (int)currentFunction)
     display.fillScreen(0x0000);  // blank on every function/orientation transition
 
@@ -4475,6 +5364,23 @@ void renderFunction() {
       if (lastFunction != (int)FUNCTION_MEDIA) lastMediaSubScreen = -1;  // force redraw on re-entry
       initMedia();
       renderMedia();
+      break;
+
+    case FUNCTION_SENSOR:
+      if (lastFunction != (int)FUNCTION_SENSOR) initSensor();
+      if (navState == NAV_SETTINGS) {
+        renderSensorSettings();
+      } else {
+        // Settings just closed: its title still occupies the top 22 px and renderSensor()
+        // never repaints that strip. lastFunction is unchanged across this transition, so
+        // the flag is what edge-triggers the restore (same pattern as the controller).
+        if (sensorSettingsHeaderActive) {
+          sensorSettingsHeaderActive = false;
+          renderHeader();
+        }
+        renderSensor();
+      }
+      statusSprite.pushSprite(0, SPRITE_Y);
       break;
 
     case FUNCTION_BATTERY:
@@ -5247,11 +6153,40 @@ void renderObiwan() {
 // FUNCTION_CONTROLLER — Gamepad
 // ================================================================
 
+// Calibrate every connected input in one action, and report per device.
+//
+// The independent `if`s are the point. This used to be `if (miniJoyCAvailable) {...} else
+// { seesaw }`, so on the common seesaw + Mini JoyC pair the seesaw's centre was NEVER
+// recaptured — CALIBRATE silently did half its job on the setup most likely to need it, and
+// a seesaw sitting a few counts off centre is exactly what makes a robot creep instead of
+// stop. Same trap `remoteButtonBits()` documents for merging button sources: with more than
+// one device present, `else if` drops the ones it doesn't reach.
+//
+// Returns a bitmask of what actually succeeded, so callers can say so rather than claim a
+// calibration the IMU stillness check refused. Bit per CtrlStickDev.
+static uint8_t ctrlCalibrateAll() {
+  uint8_t done = 0;
+  if (miniJoyCAvailable) {
+    miniJoyCWireHat();
+    miniJoyCCalibrateHW();   // averages 30 samples, writes x_mid/y_mid to STM32 flash
+    miniJoyCWireRestore();
+    done |= (1 << CTRL_DEV_MINIJOYC);
+  }
+  if (joystickAvailable) {
+    seesawCentreArmed = false;     // seesaw: re-arm the lazy centre capture on the next read
+    done |= (1 << CTRL_DEV_SEESAW);
+  }
+  // JoyStick2 self-centres via its offset register (0x50) — nothing to do, but say so.
+  if (joystick2Available) done |= (1 << CTRL_DEV_JOYSTICK2);
+  if (imuStickActive() && imuCalibrate()) done |= (1 << CTRL_DEV_IMU);
+  return done;
+}
+
 void initController() {
-  // Snap the configured drive device to a connected one (e.g. if the saved primary was
-  // unplugged) so the PRIMARY settings row and the actual drive stick always agree.
-  if (connectedStickCount() > 0 && !stickDevAvailable(ctrlPrimaryDev))
-    ctrlPrimaryDev = nextConnectedStickDev(ctrlPrimaryDev);
+  // Nothing to snap any more: ctrlOrderResolveRoles() compacts the stored order over the
+  // connected devices on every read, so an unplugged device simply takes no role and the
+  // user's stored preference survives untouched. (The old code rewrote ctrlPrimaryDev here,
+  // which meant unplugging your chosen stick silently overwrote the choice on next save.)
   renderHeader();
 }
 
@@ -5292,24 +6227,106 @@ static void drawStickViz(int cx, int cy, int r, int16_t valFwd, int16_t valTurn,
   }
 }
 
-// Dual-stick view: drive + aux discs side by side (both orientations), info strip below.
+// The IMU's disc. A joystick has two axes and a stick disc says everything about it; the
+// IMU has three, so this adds what a plain disc cannot show:
+//   * a horizon line that rolls and slides, echoing the SENSOR screen's attitude indicator
+//     (drawn from the raw attitude, so it keeps moving past full stick deflection)
+//   * a YAW needle on the rim — the third axis. Straight up = not turning, swinging
+//     clockwise for + (clockwise seen from the front), full scale at NESSO_IMU_YAW_FS_DPS.
+// The bubble still comes from the post-deadzone stick values, so what you see is what gets
+// mixed and transmitted, exactly like the other discs.
+static void drawTiltViz(int cx, int cy, int r, int16_t valFwd, int16_t valTurn, const char* label) {
+  statusSprite.fillCircle(cx, cy, r,     display.color565(14, 18, 22));
+  statusSprite.drawCircle(cx, cy, r,     display.color565(0, 150, 120));
+  statusSprite.drawCircle(cx, cy, r - 1, display.color565(0, 40, 34));
+
+  // Horizon: rolled, and slid vertically by pitch. Same sign convention as the SENSOR
+  // screen — drop the right edge and the drawn horizon's right end rises.
+  float rollRad = radians(constrain(imuRollDeg, -90.0f, 90.0f));
+  int   hx      = (int)(cosf(rollRad) * (r - 3));
+  int   hy      = (int)(sinf(rollRad) * (r - 3));
+  int   hcy     = cy + (int)(constrain(imuPitchDeg / SENSOR_VIZ_FS_DEG, -1.1f, 1.1f) * r);
+  statusSprite.drawLine(cx - hx, hcy + hy, cx + hx, hcy - hy, display.color565(0, 110, 85));
+
+  statusSprite.drawFastHLine(cx - r + 5, cy, (r - 5) * 2, display.color565(35, 35, 35));
+  statusSprite.drawFastVLine(cx, cy - r + 5, (r - 5) * 2, display.color565(35, 35, 35));
+
+  // Yaw needle on the rim.
+  float yawFrac = constrain(imuYawDps / (float)NESSO_IMU_YAW_FS_DPS, -1.0f, 1.0f);
+  float yawRad  = yawFrac * (float)M_PI;          // ±180° of swing from straight up
+  int   nx      = cx + (int)(sinf(yawRad) * (r - 2));
+  int   ny      = cy - (int)(cosf(yawRad) * (r - 2));
+  statusSprite.drawLine(cx, cy, nx, ny, display.color565(0, 70, 90));
+  statusSprite.fillCircle(nx, ny, 2, fabsf(imuYawDps) > 3.0f ? COLOR_WHITE
+                                                            : display.color565(0, 110, 140));
+
+  // Bubble — post-deadzone stick deflection, same as every other disc.
+  int maxR = r - 6;
+  int dotX = cx + (int)((long)valTurn * maxR / 515);
+  int dotY = cy - (int)((long)valFwd  * maxR / 515);
+  float ddx = dotX - cx, ddy = dotY - cy, dd = sqrtf(ddx * ddx + ddy * ddy);
+  if (dd > maxR) { dotX = cx + (int)(ddx * maxR / dd); dotY = cy + (int)(ddy * maxR / dd); }
+  statusSprite.fillCircle(dotX, dotY, r > 28 ? 6 : 4, COLOR_ORANGE);
+
+  if (label && *label) {
+    statusSprite.setTextDatum(TC_DATUM);
+    statusSprite.setTextSize(1);
+    statusSprite.setTextColor(display.color565(0, 190, 150));
+    statusSprite.drawString(label, cx, cy + r + 2);
+  }
+}
+
+// Multi-stick view: up to FOUR discs + info strip below.
+//
+// LAYOUT. Portrait (135x218) puts 3 or 4 discs in TWO ROWS — one row of four would force
+// r=10 and the labels would collide. Landscape (240x113) keeps ONE row for all counts,
+// which is what its 240 px of width is for; the constraint there is height, not width, so
+// the radius is uniform and the info strip is what has to give.
+//
+// The radius is derived from the HEIGHT budget, not the width. Deriving it from width (the
+// old constrain(sw/(2n)-6,...)) is what made 3 portrait discs r=16 while a 2-row layout at
+// the same formula would have overflowed the sprite by ~23 px — and LovyanGFX clips
+// silently, so the overflow shows up as the face-button diamond simply not being there.
 static void renderControllerMulti(int sw, int sh, bool isLandscape, int n) {
   if (n < 2) n = 2;
-  if (n > 3) n = 3;
-  // Disc 1 = drive, disc 2 = aux1, disc 3 = aux2, each labelled with its device name.
-  int16_t     discFwd[3]  = { joyDisplayX, aux2DisplayX, aux3DisplayX };
-  int16_t     discTurn[3] = { joyDisplayY, aux2DisplayY, aux3DisplayY };
-  const char* discLbl[3]  = { ctrlDriveLabel, ctrlAux1Label, ctrlAux2Label };
+  if (n > CTRL_DEV_COUNT) n = CTRL_DEV_COUNT;
+  // Disc i = role i (drive, aux1, aux2, aux3), each labelled with its device name.
+  int16_t     discFwd[CTRL_DEV_COUNT]  = { joyDisplayX, aux2DisplayX, aux3DisplayX, aux4DisplayX };
+  int16_t     discTurn[CTRL_DEV_COUNT] = { joyDisplayY, aux2DisplayY, aux3DisplayY, aux4DisplayY };
+  const char* discLbl[CTRL_DEV_COUNT]  = { ctrlDriveLabel, ctrlAux1Label, ctrlAux2Label, ctrlAux3Label };
 
-  // Discs spaced evenly across the width; radius shrinks with stick count so 3 fit the
-  // 135px portrait width (and the 240px landscape width) without overlapping.
-  int r  = isLandscape ? (n >= 3 ? 20 : 24)
-                       : constrain(sw / (2 * n) - 6, 12, 30);
-  int cy = r + (isLandscape ? 6 : 12);
-  for (int i = 0; i < n; i++) {
-    int cx = sw * (2 * i + 1) / (2 * n);
-    drawStickViz(cx, cy, r, discFwd[i], discTurn[i], discLbl[i]);
+  int rows = (!isLandscape && n >= 3) ? 2 : 1;
+  int cols = (rows == 2) ? 2 : n;
+  int r, cyTop;
+  if (isLandscape) {
+    r = 24; cyTop = 28;
+  } else if (rows == 2) {
+    r = 20; cyTop = 26;            // two rows of r=20 + labels ends at ~114, iy = 120
+  } else {
+    r = 27; cyTop = 39;            // n=2 single row — unchanged from before
   }
+  int pitch = 2 * r + 16;          // row-to-row: disc + label + gap
+
+  for (int i = 0; i < n; i++) {
+    int row = i / cols, col = i % cols;
+    int inRow = min(cols, n - row * cols);        // last row may be short → centre it
+    int cx = sw * (2 * col + 1) / (2 * inRow);
+    int cy = cyTop + row * pitch;
+    // A device in a slot the frame can't carry is live on screen but not transmitted —
+    // dim it so it can't be mistaken for one that is.
+    bool spare = (i == 3 && !ctrlAux3Frame);
+    if (ctrlDiscDev[i] == CTRL_DEV_IMU)
+      drawTiltViz(cx, cy, r, discFwd[i], discTurn[i], discLbl[i]);   // 3 axes, not 2
+    else
+      drawStickViz(cx, cy, r, discFwd[i], discTurn[i], discLbl[i]);
+    if (spare) {
+      statusSprite.setTextDatum(TC_DATUM);
+      statusSprite.setTextSize(1);
+      statusSprite.setTextColor(display.color565(90, 70, 0));
+      statusSprite.drawString("SPARE", cx, cy + r + 11);
+    }
+  }
+  int cy = cyTop + (rows - 1) * pitch;   // bottom row's centre — the info strip starts below
 
   const int dead = 15;
   const char* actionStr =
@@ -5321,8 +6338,8 @@ static void renderControllerMulti(int sw, int sh, bool isLandscape, int n) {
   bool bSel = !(gamepadButtons & (1UL << BUTTON_SELECT));
   bool bSta = !(gamepadButtons & (1UL << BUTTON_START));
 
-  // Info strip below the discs (both orientations)
-  int iy = cy + r + (isLandscape ? 12 : 18);
+  // Info strip below the discs.
+  int iy = cy + r + (isLandscape ? 16 : 18);
   statusSprite.drawFastHLine(8, iy - 4, sw - 16, COLOR_GRAY);
   statusSprite.setTextDatum(TC_DATUM);
   statusSprite.setTextSize(2);
@@ -5332,29 +6349,40 @@ static void renderControllerMulti(int sw, int sh, bool isLandscape, int n) {
   statusSprite.setTextSize(1);
   statusSprite.setTextColor(COLOR_TEAL);
   char m[12];
+  // Landscape puts L/R on the SAME line as the action string, flanking it. That buys back
+  // 20 px, which is what makes four discs + the flattened button row fit inside 113 px —
+  // and it also clears the overlap the old layout already had between the separator and
+  // the disc labels. The action string never spans more than ~120 px, so at 240 px wide
+  // there is ~18 px of clear space each side.
+  int lrY = isLandscape ? (iy + 4) : (iy + 20);
   statusSprite.setTextDatum(TL_DATUM);
   sprintf(m, "L %4d", transmitCmd.leftMotor);
-  statusSprite.drawString(m, 10, iy + 20);
+  statusSprite.drawString(m, isLandscape ? 6 : 10, lrY);
   statusSprite.setTextDatum(TR_DATUM);
   sprintf(m, "R %4d", transmitCmd.rightMotor);
-  statusSprite.drawString(m, sw - 10, iy + 20);
+  statusSprite.drawString(m, sw - (isLandscape ? 6 : 10), lrY);
 
   // Button row: SEL/STA (seesaw) + the two thumbstick click-buttons (JC, J2) — only
   // the ones whose device is present, centred and evenly spaced. In LANDSCAPE the
   // short height has no room for the A/B/X/Y diamond, so the seesaw face buttons are
   // flattened into this same row (portrait draws them as a diamond below instead).
-  struct { const char* lbl; bool on; } sb[8];
+  // Sized well above the worst case (2 + 4 + 2 = 8) and bounds-checked on every push:
+  // the old sb[8] sat exactly on its limit with no guard, so any future button would have
+  // corrupted the stack, and only in landscape.
+  #define CTRL_VIZ_BTN_MAX 12
+  struct { const char* lbl; bool on; } sb[CTRL_VIZ_BTN_MAX];
   int nb = 0;
-  if (joystickAvailable)  { sb[nb].lbl = "SEL"; sb[nb].on = bSel; nb++;
-                            sb[nb].lbl = "STA"; sb[nb].on = bSta; nb++; }
+  #define SB_PUSH(L, ON) do { if (nb < CTRL_VIZ_BTN_MAX) { sb[nb].lbl = (L); sb[nb].on = (ON); nb++; } } while (0)
+  if (joystickAvailable)  { SB_PUSH("SEL", bSel); SB_PUSH("STA", bSta); }
   if (isLandscape && joystickAvailable) {
-    sb[nb].lbl = "A"; sb[nb].on = !(gamepadButtons & (1UL << BUTTON_A)); nb++;
-    sb[nb].lbl = "B"; sb[nb].on = !(gamepadButtons & (1UL << BUTTON_B)); nb++;
-    sb[nb].lbl = "X"; sb[nb].on = !(gamepadButtons & (1UL << BUTTON_X)); nb++;
-    sb[nb].lbl = "Y"; sb[nb].on = !(gamepadButtons & (1UL << BUTTON_Y)); nb++;
+    SB_PUSH("A", !(gamepadButtons & (1UL << BUTTON_A)));
+    SB_PUSH("B", !(gamepadButtons & (1UL << BUTTON_B)));
+    SB_PUSH("X", !(gamepadButtons & (1UL << BUTTON_X)));
+    SB_PUSH("Y", !(gamepadButtons & (1UL << BUTTON_Y)));
   }
-  if (miniJoyCAvailable)  { sb[nb].lbl = "JC";  sb[nb].on = miniJoyCBtn;  nb++; }
-  if (joystick2Available) { sb[nb].lbl = "J2";  sb[nb].on = joystick2Btn; nb++; }
+  if (miniJoyCAvailable)  SB_PUSH("JC", miniJoyCBtn);
+  if (joystick2Available) SB_PUSH("J2", joystick2Btn);
+  #undef SB_PUSH
 
   int spacing = constrain((sw - 28) / (nb > 0 ? nb : 1), 16, 26);  // shrink to fit the width
   int rowY = isLandscape ? (sh - 11) : (iy + 40);
@@ -5384,7 +6412,10 @@ void renderController() {
   statusSprite.setFont(&fonts::Font0);
 
   // Two or three connected sticks → multi-disc view (drive + aux1 [+ aux2]).
-  int nStk = connectedStickCount();
+  // Disc count comes from the RESOLVED ROLE list, not connectedStickCount(). They are equal
+  // today, but routing the render through the same list readGamePad() assigns roles from is
+  // what keeps the screen and the wire from ever disagreeing about which stick is which.
+  int nStk = ctrlRoleCount;
   if (nStk >= 2) { renderControllerMulti(sw, sh, isLandscape, nStk); return; }
 
   // Joystick visualisation circle
@@ -5398,7 +6429,13 @@ void renderController() {
     jcy = VIZ_R + 18;
   }
 
+  // Tilt-only setup (no joystick plugged in at all): the IMU drives, so give it the same
+  // three-axis disc the multi-stick view uses rather than a plain two-axis one.
+  bool tiltOnly = (ctrlDiscDev[0] == CTRL_DEV_IMU);
+  if (tiltOnly) drawTiltViz(jcx, jcy, VIZ_R, joyDisplayX, joyDisplayY, nullptr);
+
   // Background disc + border + crosshairs
+  if (!tiltOnly) {
   statusSprite.fillCircle(jcx, jcy, VIZ_R, display.color565(18, 18, 18));
   statusSprite.drawCircle(jcx, jcy, VIZ_R,     COLOR_TEAL);
   statusSprite.drawCircle(jcx, jcy, VIZ_R - 1, display.color565(0, 30, 30));
@@ -5421,6 +6458,7 @@ void renderController() {
     dotY = jcy + (int)(dy * maxR / dist);
   }
   statusSprite.fillCircle(dotX, dotY, 6, COLOR_ORANGE);
+  }  // !tiltOnly
 
   // Action label
   const int dead = 15;
@@ -5434,11 +6472,14 @@ void renderController() {
   uint16_t connColor = controllerConnected ? COLOR_GREEN : COLOR_RED;
 
   // Single-stick path: a solo thumbstick unit (Mini JoyC or JoyStick2, no seesaw) shows
-  // its own click button; a seesaw shows the face-button cluster.
+  // its own click button; a seesaw shows the face-button cluster; the IMU has no buttons
+  // at all, so tiltOnly draws none (without this it would fall through to the seesaw
+  // cluster and paint four buttons for a device that isn't connected).
   bool isJoy2     = joystick2Available && !joystickAvailable && !miniJoyCAvailable;
   bool isSoloUnit = (miniJoyCAvailable || joystick2Available) && !joystickAvailable;
   const char* unitName = isJoy2 ? "JOYSTICK2" : "MINIJOYC";
   bool unitBtn = isJoy2 ? joystick2Btn : miniJoyCBtn;
+  if (tiltOnly) { isSoloUnit = true; unitName = "IMU TILT"; unitBtn = false; }
 
   if (isLandscape) {
     // Info panel to the right of the joystick circle
@@ -5468,7 +6509,7 @@ void renderController() {
     statusSprite.drawString(motorStr, ix, 74);
 
     if (isSoloUnit) {
-      drawGamepadBtn(ix + sw / 2 - ix / 2 - 9, sh - 14, "BTN", unitBtn);
+      if (!tiltOnly) drawGamepadBtn(ix + sw / 2 - ix / 2 - 9, sh - 14, "BTN", unitBtn);
     } else {
       bool bSel = !(gamepadButtons & (1UL << BUTTON_SELECT));
       bool bSta = !(gamepadButtons & (1UL << BUTTON_START));
@@ -5515,7 +6556,7 @@ void renderController() {
     statusSprite.drawString(motorStr, sw - 10, iy + 38);
 
     if (isSoloUnit) {
-      drawGamepadBtn(sw / 2, iy + 66, "BTN", unitBtn);
+      if (!tiltOnly) drawGamepadBtn(sw / 2, iy + 66, "BTN", unitBtn);
     } else {
       bool bSel = !(gamepadButtons & (1UL << BUTTON_SELECT));
       bool bSta = !(gamepadButtons & (1UL << BUTTON_START));
@@ -5538,7 +6579,39 @@ void renderController() {
 void initGamePad() {
   controllerConnected = false;
   calibrationComplete = false;
+  seesawCentreArmed   = false;  // re-capture the seesaw centre on this screen's first read
   ctrlSessionActive   = true;   // this screen now owns the stick LEDs / GROVE power
+  ctrlLastDriveDev    = -1;     // first readGamePad() re-establishes the drive device
+
+  // Resolve roles once now (pure arithmetic, no I2C) so renderController() has a disc count
+  // and labels for the very first frame — readGamePad() only runs on the 100 ms tick, and
+  // without this the screen shows nothing for up to a tick after entry.
+  {
+    bool devOn[CTRL_DEV_COUNT];
+    ctrlDevOnSnapshot(devOn);
+    ctrlOrderResolveRoles(devOn, ctrlRoleDev, ctrlRoleCount);
+    for (int i = 0; i < CTRL_DEV_COUNT; i++) ctrlDiscDev[i] = (i < ctrlRoleCount) ? ctrlRoleDev[i] : -1;
+    ctrlDriveLabel = ctrlRoleCount > 0 ? CTRL_DEV_LABELS[ctrlRoleDev[0]] : "-";
+    ctrlAux1Label  = ctrlRoleCount > 1 ? CTRL_DEV_LABELS[ctrlRoleDev[1]] : "";
+    ctrlAux2Label  = ctrlRoleCount > 2 ? CTRL_DEV_LABELS[ctrlRoleDev[2]] : "";
+    ctrlAux3Label  = ctrlRoleCount > 3 ? CTRL_DEV_LABELS[ctrlRoleDev[3]] : "";
+  }
+
+  // Tilt stick: capture the current hold as zero on EVERY entry, unless the operator has
+  // explicitly calibrated. Walking onto this screen holding the device at a natural 30-40
+  // degree reading angle would otherwise hand the drive mix a large standing deflection and
+  // drive the robot off the moment the screen appears. Same reasoning as the seesaw's lazy
+  // centre capture just above.
+  //
+  // Keyed on imuZeroExplicit, NOT imuZeroed: the auto-zero sets imuZeroed itself, so gating
+  // on that would make this fire exactly once per boot — leave the screen, come back holding
+  // the device differently, and you'd get the standing deflection this exists to prevent.
+  // An explicit CALIBRATE / ZERO HERE / `imu zero` pins the reference and suppresses this;
+  // `imu level` / LEVEL REF clears the pin and hands the auto-zero back.
+  //
+  // Deliberately no imuZeroGyro() here: it blocks ~250 ms on a screen change, and the gyro
+  // bias is already taken at boot and re-taken by any explicit calibrate.
+  if (imuStickActive() && !imuZeroExplicit) imuZeroAttitude(false);
 
   // Unit JoyStick2 init (Grove bus) — runs whenever present, alongside any other stick.
   // It needs GROVE 5V power held on for the whole controller session (dropped on exit).
@@ -5605,16 +6678,44 @@ void initGamePad() {
 // released stick sits a few counts off centre, those counts survive the arcade mix, and
 // the robot creeps instead of stopping: the frame carries L/R of ±1..3 forever.
 static void readSeesawAxes(int16_t& px, int16_t& py) {
-  float x = 0, y = 0;
-  for (int s = 0; s < 4; s++) {
-    x += 1023 - ss.analogRead(JOY1_X);
-    y += 1023 - ss.analogRead(JOY1_Y);
-    delay(10);
+  // ROLLING average, one sample per cycle — NOT a 4-sample block average.
+  //
+  // This used to take 4 samples with delay(10) between them: ~40 ms of the 100 ms budget
+  // burned in delay() alone, before the Mini JoyC and JoyStick2 bus-switch windows. With
+  // four devices live that pushed a cycle towards the tick period, and a readGamePad()
+  // that overruns its own interval stops being the ~10 Hz stream the receiver failsafe is
+  // sized against. One sample per cycle over a 4-deep ring gives the same smoothing with
+  // the same effective time constant (the cycle IS the sample interval) and no delay().
+  static int16_t ringX[4] = { 0, 0, 0, 0 };
+  static int16_t ringY[4] = { 0, 0, 0, 0 };
+  static uint8_t ringPos = 0;
+  static bool    ringPrimed = false;
+
+  int16_t sx = (int16_t)(1023 - ss.analogRead(JOY1_X));
+  int16_t sy = (int16_t)(1023 - ss.analogRead(JOY1_Y));
+  if (!ringPrimed) {                       // first read: fill the ring so the average is
+    for (int i = 0; i < 4; i++) { ringX[i] = sx; ringY[i] = sy; }   // not dragged up from 0
+    ringPrimed = true;
+  } else {
+    ringX[ringPos] = sx; ringY[ringPos] = sy;
+    ringPos = (ringPos + 1) & 3;
   }
-  x /= 4.0; y /= 4.0;
-  if (!calibrationComplete) {
+  float x = (ringX[0] + ringX[1] + ringX[2] + ringX[3]) / 4.0f;
+  float y = (ringY[0] + ringY[1] + ringY[2] + ringY[3]) / 4.0f;
+
+  // Lazy centre capture. seesawCentreArmed is the seesaw's OWN flag: calibrationComplete
+  // is also set by miniJoyCCalibrateHW() (which repurposes zero_x/zero_y to display its
+  // result), so sharing it made this capture depend on the order ctrlCalibrateAll()
+  // happens to call things in — and a seesaw that never re-captures its centre is a
+  // released stick that never mixes to zero.
+  if (!seesawCentreArmed) {
+    ringPrimed = false;                    // discard the old pose's samples too
+    for (int i = 0; i < 4; i++) { ringX[i] = sx; ringY[i] = sy; }
+    ringPrimed = true;
+    x = sx; y = sy;
     zero_x = (int)x; zero_y = (int)y;
-    calibrationComplete = true;
+    seesawCentreArmed = true;
+    calibrationComplete = true;            // kept in sync for the settings display
   }
   int cx = (int)x - zero_x;
   int cy = (int)y - zero_y;
@@ -5727,14 +6828,54 @@ static inline int16_t auxAxisToWire(int16_t v) {
   return (int16_t)map(constrain((int)v, -515, 515), -515, 515, -255, 255);
 }
 
+// Rescale an IMU reading to the frame's -255..255, using the full scale the PROTOCOL
+// fixes (NessoFrame.h), not a local constant — a receiver converts back with
+// nessoImuDeg()/nessoImuYawDps() and there is no side channel to renegotiate this.
+static inline int16_t imuAngleToWire(float deg) {
+  return (int16_t)constrain((int)lroundf(deg * 255.0f / NESSO_IMU_ANGLE_FS_DEG), -255, 255);
+}
+static inline int16_t imuYawToWire(float dps) {
+  return (int16_t)constrain((int)lroundf(dps * 255.0f / NESSO_IMU_YAW_FS_DPS), -255, 255);
+}
+
+// Read the IMU as a tilt stick → SCREEN-RELATIVE (rx, ry), i.e. already in the
+// (forward, turn) form the rest of the pipeline consumes.
+//
+// Unlike every joystick module, this must NOT be passed through applyStickRotation():
+// imuPitchDeg/imuRollDeg are rotation-adapted inside imuUpdateAttitude() already, and
+// rotating twice would put "forward" 90 degrees off in landscape.
+//
+// Tilt the top of the device DOWN/away to go forward, and drop the RIGHT edge to turn
+// right — the same gesture in either posture, because the angles are measured from the
+// calibrated zero rather than from level. The shared deadzone applies on the same ±512
+// scale the joystick modules use, so a level device mixes to an exact stop.
+static void readImuAxes(int16_t& rx, int16_t& ry) {
+  float range = (float)CTRL_TILT_RANGE_VALS[ctrlTiltRangeIdx];
+  int f = (int)lroundf(-imuPitchDeg * 512.0f / range);   // nose down = forward
+  int t = (int)lroundf( imuRollDeg  * 512.0f / range);   // right edge down = turn right
+  // The shared deadzone is sized for a joystick that physically springs back to a hard
+  // centre; a hand holding a device has no such stop. At the default index it is 16 counts
+  // = 0.8 degrees at the 25-degree range, which is inside normal hand tremor — the tilt
+  // axis would never read exactly 0, those counts would survive the arcade mix, and the
+  // robot would creep instead of stopping. So the tilt stick takes the LARGER of the user's
+  // deadzone and a floor of ~1.5 degrees at mid-range.
+  int dz = max(CTRL_DEADZONE_VALS[ctrlDeadzoneIdx], CTRL_TILT_MIN_DEADZONE);
+  if (f > -dz && f < dz) f = 0;
+  if (t > -dz && t < dz) t = 0;
+  rx = (int16_t)constrain(f * 515 / 512, -515, 515);
+  ry = (int16_t)constrain(t * 515 / 512, -515, 515);
+}
+
 void readGamePad() {
   // ── Read each connected stick → screen-relative (rx,ry), indexed by CtrlStickDev ──
   // Mini JoyC and JoyStick2 are front/independent units that always rotation-adapt.
   // The seesaw applies its mount base transform, then the screen-rotation table only
   // for ATTACHED mounts (side/back); DETACHED mounts keep the stick's own frame.
-  bool    devOn[CTRL_DEV_COUNT] = { joystickAvailable, miniJoyCAvailable, joystick2Available };
-  int16_t devRx[CTRL_DEV_COUNT] = { 0, 0, 0 };
-  int16_t devRy[CTRL_DEV_COUNT] = { 0, 0, 0 };
+  bool    devOn[CTRL_DEV_COUNT];
+  ctrlDevOnSnapshot(devOn);
+  int16_t devRx[CTRL_DEV_COUNT] = { 0, 0, 0, 0 };
+  int16_t devRy[CTRL_DEV_COUNT] = { 0, 0, 0, 0 };
+  uint32_t cycleStartMs = millis();
 
   if (devOn[CTRL_DEV_SEESAW]) {
     int16_t sPx, sPy, bx, by;
@@ -5753,27 +6894,43 @@ void readGamePad() {
     readJoystick2Axes(jPx, jPy);
     applyStickRotation(jPx, jPy, devRx[CTRL_DEV_JOYSTICK2], devRy[CTRL_DEV_JOYSTICK2]);
   }
+  // The tilt stick is already screen-relative — no applyStickRotation() here on purpose.
+  if (devOn[CTRL_DEV_IMU])
+    readImuAxes(devRx[CTRL_DEV_IMU], devRy[CTRL_DEV_IMU]);
 
-  // ── Assign roles: drive = primary device (if connected, else first connected);
-  //    the remaining connected devices become aux1, aux2 in canonical order. ──
-  int driveDev = ctrlPrimaryDev;
-  if (driveDev < 0 || driveDev >= CTRL_DEV_COUNT || !devOn[driveDev]) {
-    driveDev = -1;
-    for (int d = 0; d < CTRL_DEV_COUNT; d++) if (devOn[d]) { driveDev = d; break; }
-  }
+  // ── Assign roles from the configured order, compacted over what is connected ──
+  ctrlOrderResolveRoles(devOn, ctrlRoleDev, ctrlRoleCount);
+  int driveDev = ctrlRoleDev[0];
   if (driveDev < 0) {  // no stick at all — nothing will drive the link from here on
-    remoteHasAux = false; remoteHasAux2 = false;
+    remoteHasAux = false; remoteHasAux2 = false; remoteHasImu = false; remoteHasAux3 = false;
+    for (int i = 0; i < CTRL_DEV_COUNT; i++) ctrlDiscDev[i] = -1;
+    ctrlDriveLabel = "-"; ctrlAux1Label = ""; ctrlAux2Label = ""; ctrlAux3Label = "";
+    ctrlLastDriveDev = -1;
     transmitRemoteStop();   // no-op unless we were mid-drive when the stick vanished
     return;
   }
-  int auxDev[2] = { -1, -1 };
+  int auxDev[3] = { -1, -1, -1 };
   int nAux = 0;
-  for (int d = 0; d < CTRL_DEV_COUNT; d++)
-    if (devOn[d] && d != driveDev && nAux < 2) auxDev[nAux++] = d;
+  for (int r = 1; r < ctrlRoleCount && nAux < 3; r++) auxDev[nAux++] = ctrlRoleDev[r];
 
   ctrlDriveLabel = CTRL_DEV_LABELS[driveDev];
   ctrlAux1Label  = nAux >= 1 ? CTRL_DEV_LABELS[auxDev[0]] : "";
   ctrlAux2Label  = nAux >= 2 ? CTRL_DEV_LABELS[auxDev[1]] : "";
+  ctrlAux3Label  = nAux >= 3 ? CTRL_DEV_LABELS[auxDev[2]] : "";
+  ctrlDiscDev[0] = driveDev;
+  ctrlDiscDev[1] = nAux >= 1 ? auxDev[0] : -1;
+  ctrlDiscDev[2] = nAux >= 2 ? auxDev[1] : -1;
+  ctrlDiscDev[3] = nAux >= 3 ? auxDev[2] : -1;
+
+  // The drive device just changed — reordered, unplugged, or newly connected. Stop before
+  // handing control over. The incoming stick is at whatever deflection it happens to be
+  // sitting at, and without this the robot jumps straight from the old stick's last
+  // command to the new stick's resting position with no zero in between. Costs one tick.
+  if (driveDev != ctrlLastDriveDev) {
+    ctrlLastDriveDev = driveDev;
+    transmitRemoteStop();   // no-op unless something was actually driving
+    return;
+  }
 
   int16_t rx = devRx[driveDev], ry = devRy[driveDev];
 
@@ -5821,6 +6978,38 @@ void readGamePad() {
     aux3DisplayX = 0; aux3DisplayY = 0;
     remoteAux2X  = 0; remoteAux2Y  = 0;
   }
+  // Aux stick 3 — the fourth device. Gated on ctrlAux3Frame because putting it on the wire
+  // promotes every frame to v4, which any pre-1.3.0 receiver rejects (and the all-stop
+  // travels this same path). With the flag off the device is still read and still drawn;
+  // it just isn't transmitted, and the disc is marked SPARE so that is visible.
+  // Same explicit swap as aux1/aux2 above — copying a *Display* pair straight into the
+  // frame's X/Y draws a correct disc while transmitting the axes transposed.
+  remoteHasAux3 = (nAux >= 3) && ctrlAux3Frame;
+  if (nAux >= 3) {
+    aux4DisplayX = devRx[auxDev[2]]; aux4DisplayY = devRy[auxDev[2]];
+  } else {
+    aux4DisplayX = 0; aux4DisplayY = 0;
+  }
+  if (remoteHasAux3) {
+    remoteAux3X = auxAxisToWire(aux4DisplayY);   // X = horizontal, right positive
+    remoteAux3Y = auxAxisToWire(aux4DisplayX);   // Y = vertical,   up    positive
+  } else {
+    remoteAux3X = 0; remoteAux3Y = 0;
+  }
+
+  // ── IMU attitude → frame (v3) ──
+  // Independent of the tilt stick: the receiver gets the transmitter's attitude whether or
+  // not the IMU is also driving. Off by default because it promotes every frame to v3 —
+  // see the ctrlImuFrame note at the declaration. The angles are already screen-relative
+  // (imuUpdateAttitude() rotation-adapts them), which is exactly what the protocol asks for.
+  remoteHasImu = ctrlImuFrame && imuAvailable && imuHaveSample;
+  if (remoteHasImu) {
+    remoteImuPitch = imuAngleToWire(imuPitchDeg);
+    remoteImuRoll  = imuAngleToWire(imuRollDeg);
+    remoteImuYaw   = imuYawToWire(imuYawDps);
+  } else {
+    remoteImuPitch = 0; remoteImuRoll = 0; remoteImuYaw = 0;
+  }
 
   // Standard BLE HID gamepad mode — report axes/buttons to the host instead of
   // sending robot RemoteFrames. transmitCmd stays 0 (no motor mix needed).
@@ -5843,6 +7032,7 @@ void readGamePad() {
   if (l != 0 || r != 0) resetActivity();
   remoteTxActive = true;   // the drive loop owns the link → it owes an all-stop on exit
   transmitRemoteCommand(l, r);
+  ctrlCycleMs = millis() - cycleStartMs;
 }
 
 void readGamePadButtons() {
@@ -5883,42 +7073,433 @@ void readGamePadButtons() {
 // Order: CALIBRATE, DEADZONE, SWAP XY, INVERT X, INVERT Y, TX LINK, SCR LOCK, [MOUNT], [PRIMARY].
 // Centralized so render / tap / cursor-wrap / swipe-bound all agree, and so the dynamic
 // rows in onKey1Short resolve to the same actions (MOUNT before PRIMARY).
-int controllerSettingsItemCount() {
-  return 7 + (joystickAvailable ? 1 : 0)
-           + ((connectedStickCount() >= 2) ? 1 : 0);
+// ================================================================
+// Controller profiles
+// ================================================================
+//
+// A named snapshot of "which robot am I driving, and how is my rig mapped to it" —
+// device order, axis flags, deadzone, tilt tuning, transport and endpoint. Anything that
+// is a property of the HANDHELD rather than of the robot stays global and out of profiles:
+// SCR LOCK (how you like the screen to behave), HID gamepad mode (needs a reboot, so a
+// profile field that didn't apply immediately would break the contract), and the LoRa radio
+// preset (owned by the scanner screen).
+//
+// Stored on LittleFS as JSON, one file per profile, the same shape loadConfig()/saveConfig()
+// use — including the `doc["k"] | default` per-field fallback, so a hand-edited or partial
+// file loads with defaults for whatever is missing instead of failing whole. NVS was the
+// alternative and is worse here: its keys cap at 15 chars, it cannot enumerate, and none of
+// this firmware's ~35 put calls check their return, so a full partition fails silently.
+#define CTRL_PROF_DIR       "/ctrldb"
+// The table, its bounds and the active-path string are declared near the top of the sketch:
+// the settings key handlers and the serial command surface both come before this section.
+
+// Name of the active profile for display, or "DEFAULT".
+const char* ctrlProfActiveName() {
+  if (!ctrlProfActive[0]) return "DEFAULT";
+  for (int i = 0; i < ctrlProfCount; i++)
+    if (strcmp(ctrlProfList[i].path, ctrlProfActive) == 0) return ctrlProfList[i].name;
+  return "DEFAULT";
+}
+static int ctrlProfActiveIdx() {
+  if (!ctrlProfActive[0]) return -1;
+  for (int i = 0; i < ctrlProfCount; i++)
+    if (strcmp(ctrlProfList[i].path, ctrlProfActive) == 0) return i;
+  return -1;
+}
+
+// Rebuild the profile list from the filesystem.
+void ctrlProfScan() {
+  ctrlProfCount = 0;
+  File dir = LittleFS.open(CTRL_PROF_DIR);
+  if (!dir || !dir.isDirectory()) { if (dir) dir.close(); return; }
+  while (ctrlProfCount < CTRL_PROF_MAX) {
+    File e = dir.openNextFile();
+    if (!e) break;
+    if (e.isDirectory()) { e.close(); continue; }
+    char base[64];
+    strlcpy(base, e.name(), sizeof(base));
+    e.close();
+    const char* slash = strrchr(base, '/');
+    const char* leaf  = slash ? slash + 1 : base;
+    char nm[CTRL_PROF_NAME_MAX];
+    strlcpy(nm, leaf, sizeof(nm));
+    char* dot = strrchr(nm, '.');
+    if (dot) *dot = '\0';
+    if (!nm[0]) continue;
+    strlcpy(ctrlProfList[ctrlProfCount].name, nm, CTRL_PROF_NAME_MAX);
+    snprintf(ctrlProfList[ctrlProfCount].path, sizeof(ctrlProfList[0].path),
+             CTRL_PROF_DIR "/%s", leaf);
+    ctrlProfCount++;
+  }
+  dir.close();
+}
+
+// Names are rejected, not sanitised: silently rewriting what the user typed makes the file
+// they later look for not the one that exists.
+bool ctrlProfNameOk(const char* n) {
+  if (!n || !*n) return false;
+  if (strlen(n) >= CTRL_PROF_NAME_MAX) return false;
+  for (const char* p = n; *p; p++)
+    if (!isalnum((unsigned char)*p) && *p != '_' && *p != '-') return false;
+  return true;
+}
+
+// Serialise the live settings into a profile file. Temp-then-rename: saveConfig() writes in
+// place, and a truncated JSON still *parses*, which would silently yield a partial axis
+// mapping on the next boot.
+static bool ctrlProfWrite(const char* path) {
+  if (LittleFS.totalBytes() - LittleFS.usedBytes() < CTRL_PROF_MIN_FREE) return false;
+  LittleFS.mkdir(CTRL_PROF_DIR);
+
+  JsonDocument doc;
+  JsonArray ord = doc["order"].to<JsonArray>();
+  for (int i = 0; i < CTRL_DEV_COUNT; i++) ord.add(ctrlDevOrder[i]);
+  doc["swapxy"]   = ctrlSwapXY;
+  doc["invx"]     = ctrlInvertX;
+  doc["invy"]     = ctrlInvertY;
+  doc["dz"]       = ctrlDeadzoneIdx;
+  doc["ssmount"]  = seesawMountIdx;
+  doc["tiltrng"]  = ctrlTiltRangeIdx;
+  doc["imustick"] = ctrlImuStick;
+  doc["imutx"]    = ctrlImuFrame;
+  doc["aux3tx"]   = ctrlAux3Frame;
+  doc["txlink"]   = remoteTransportIdx;
+  doc["robot_ip"] = targetIpAddress;
+  doc["udp_port"] = udpPort;
+  doc["tcp_port"] = tcpPort;
+
+  const char* tmp = CTRL_PROF_DIR "/.tmp";
+  File f = LittleFS.open(tmp, "w");
+  if (!f) return false;
+  bool ok = serializeJson(doc, f) > 0;
+  f.close();
+  if (!ok) { LittleFS.remove(tmp); return false; }
+  LittleFS.remove(path);
+  if (!LittleFS.rename(tmp, path)) { LittleFS.remove(tmp); return false; }
+  return true;
+}
+
+// Load a profile and make it live. The ONLY apply path — everything (row, serial, boot)
+// funnels through here so there is one place that knows the ordering rules.
+bool ctrlProfApply(const char* path) {
+  File f = LittleFS.open(path, "r");
+  if (!f) return false;
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, f);
+  f.close();
+  if (err) return false;
+
+  // Stop BEFORE anything changes. A transport switch mid-drive would otherwise leave the
+  // robot on the OLD link never hearing a stop, while the eventual exit-stop goes out on
+  // the new one. Same reasoning for a drive-device change. No-op unless something drives.
+  transmitRemoteStop();
+
+  int newLink = constrain((int)(doc["txlink"] | remoteTransportIdx), 0, REMOTE_TX_COUNT - 1);
+  if (remoteTransportIdx == TX_WIFI_TCP && newLink != remoteTransportIdx) tcpClient.stop();
+
+  uint8_t ord[CTRL_DEV_COUNT];
+  bool haveOrder = false;
+  JsonArrayConst oa = doc["order"];
+  if (!oa.isNull() && oa.size() == CTRL_DEV_COUNT) {
+    int i = 0;
+    for (JsonVariantConst v : oa) ord[i++] = (uint8_t)(v.as<int>() & 0xFF);
+    haveOrder = ctrlOrderValid(ord);
+  }
+  if (haveOrder) memcpy(ctrlDevOrder, ord, sizeof(ctrlDevOrder));
+  // else: keep the current order rather than booting into an unconfigured mapping.
+
+  bool wasImuStick   = ctrlImuStick;
+  ctrlSwapXY         = doc["swapxy"]   | ctrlSwapXY;
+  ctrlInvertX        = doc["invx"]     | ctrlInvertX;
+  ctrlInvertY        = doc["invy"]     | ctrlInvertY;
+  ctrlDeadzoneIdx    = constrain((int)(doc["dz"]      | ctrlDeadzoneIdx),   0, CTRL_DEADZONE_COUNT - 1);
+  seesawMountIdx     = constrain((int)(doc["ssmount"] | seesawMountIdx),    0, SEESAW_MOUNT_COUNT - 1);
+  ctrlTiltRangeIdx   = constrain((int)(doc["tiltrng"] | ctrlTiltRangeIdx),  0, CTRL_TILT_RANGE_COUNT - 1);
+  ctrlImuStick       = doc["imustick"] | ctrlImuStick;
+  ctrlImuFrame       = doc["imutx"]    | ctrlImuFrame;
+  ctrlAux3Frame      = doc["aux3tx"]   | ctrlAux3Frame;
+  remoteTransportIdx = newLink;
+  strlcpy(targetIpAddress, doc["robot_ip"] | targetIpAddress, sizeof(targetIpAddress));
+  udpPort            = doc["udp_port"] | udpPort;
+  tcpPort            = doc["tcp_port"] | tcpPort;
+
+  if (ctrlImuStick && !wasImuStick) imuCalibrate();   // same as toggling TILT STK by hand
+
+  strlcpy(ctrlProfActive, path, sizeof(ctrlProfActive));
+  ctrlProfDirty = false;
+  ctrlLastDriveDev = -1;      // force the drive-change stop on the next cycle
+  saveSettings();             // NVS mirrors the live state — one source of truth
+  return true;
+}
+
+// Save the live settings back into the active profile (or nothing, if DEFAULT is active).
+bool ctrlProfSaveActive() {
+  if (!ctrlProfActive[0]) return false;
+  if (!ctrlProfWrite(ctrlProfActive)) return false;
+  ctrlProfDirty = false;
+  return true;
+}
+
+// Create a new profile from the CURRENT live settings and make it active.
+bool ctrlProfCreate(const char* name) {
+  if (!ctrlProfNameOk(name)) return false;
+  if (ctrlProfCount >= CTRL_PROF_MAX) return false;
+  char path[48];
+  snprintf(path, sizeof(path), CTRL_PROF_DIR "/%s.json", name);
+  if (LittleFS.exists(path)) return false;
+  if (!ctrlProfWrite(path)) return false;
+  strlcpy(ctrlProfActive, path, sizeof(ctrlProfActive));
+  ctrlProfDirty = false;
+  ctrlProfScan();
+  saveSettings();
+  return true;
+}
+
+// Auto-named profile, for the on-device "+ NEW" row — this firmware has no text entry.
+bool ctrlProfAutoNew() {
+  ctrlProfScan();
+  for (int i = 1; i <= CTRL_PROF_MAX; i++) {
+    char nm[CTRL_PROF_NAME_MAX];
+    snprintf(nm, sizeof(nm), "SETUP%d", i);
+    char path[48];
+    snprintf(path, sizeof(path), CTRL_PROF_DIR "/%s.json", nm);
+    if (!LittleFS.exists(path)) return ctrlProfCreate(nm);
+  }
+  return false;
+}
+
+bool ctrlProfDelete(const char* path) {
+  if (!path || !*path) return false;
+  bool wasActive = (strcmp(path, ctrlProfActive) == 0);
+  if (!LittleFS.remove(path)) return false;
+  // Deleting the active profile does NOT change the live mapping — you keep driving with
+  // exactly what you had; only the label goes back to DEFAULT.
+  if (wasActive) { ctrlProfActive[0] = '\0'; ctrlProfDirty = false; saveSettings(); }
+  ctrlProfScan();
+  return true;
+}
+
+// Switch to the profile after the active one; wraps through DEFAULT (= no profile).
+void ctrlProfCycle() {
+  ctrlProfScan();
+  if (ctrlProfCount == 0) return;
+  int cur = ctrlProfActiveIdx();          // -1 = DEFAULT
+  int next = cur + 1;
+  if (next >= ctrlProfCount) {            // past the end → back to DEFAULT
+    ctrlProfActive[0] = '\0';
+    ctrlProfDirty = false;
+    saveSettings();
+    return;
+  }
+  ctrlProfApply(ctrlProfList[next].path);
+}
+
+// Row table storage — the type and the forward declarations live near the top of the
+// sketch, with the settings-panel row counts.
+CtrlSetRow ctrlSetRows[CTRL_SET_MAX_ROWS];
+static int ctrlSetRowCount = 0;
+
+static void ctrlSetPush(const char* label, const char* value, bool disabled,
+                        CtrlSetAction action, int role = -1) {
+  if (ctrlSetRowCount >= CTRL_SET_MAX_ROWS) return;   // hard bound, never overrun
+  CtrlSetRow& r = ctrlSetRows[ctrlSetRowCount++];
+  r.label = label;
+  strlcpy(r.value, value ? value : "", sizeof(r.value));
+  r.disabled = disabled;
+  r.action = action;
+  r.role = (int8_t)role;
+}
+
+int ctrlSetBuildRows() {
+  ctrlSetRowCount = 0;
+  bool tunable = ctrlHasTunableStick();
+  char buf[18];
+
+  snprintf(buf, sizeof(buf), "%s%s", ctrlProfActiveName(), ctrlProfDirty ? "*" : "");
+  ctrlSetPush("PROFILE", buf, false, CSA_PROFILE);
+  snprintf(buf, sizeof(buf), "%d SAVED", ctrlProfCount);
+  ctrlSetPush("PROFILES", buf, false, CSA_PROFILES);
+
+  snprintf(buf, sizeof(buf), "TAP (%d DEV)", connectedStickCount());
+  ctrlSetPush("CALIBRATE", tunable ? buf : "N/A", !tunable, CSA_CALIBRATE);
+  if (tunable) snprintf(buf, sizeof(buf), "%d", CTRL_DEADZONE_VALS[ctrlDeadzoneIdx]);
+  else         strlcpy(buf, "N/A", sizeof(buf));
+  ctrlSetPush("DEADZONE", buf, !tunable, CSA_DEADZONE);
+
+  ctrlSetPush("SWAP XY",  ctrlSwapXY     ? "ON" : "OFF", false, CSA_SWAPXY);
+  ctrlSetPush("INVERT X", ctrlInvertX    ? "ON" : "OFF", false, CSA_INVERTX);
+  ctrlSetPush("INVERT Y", ctrlInvertY    ? "ON" : "OFF", false, CSA_INVERTY);
+  ctrlSetPush("TX LINK",  REMOTE_TX_LABELS[remoteTransportIdx], false, CSA_TXLINK);
+  ctrlSetPush("SCR LOCK", ctrlScreenLock ? "ON" : "OFF", false, CSA_SCRLOCK);
+
+  ctrlSetPush("TILT STK", !imuAvailable ? "NO IMU" : (ctrlImuStick ? "ON" : "OFF"),
+              !imuAvailable, CSA_TILTSTK);
+  snprintf(buf, sizeof(buf), "%d DEG", CTRL_TILT_RANGE_VALS[ctrlTiltRangeIdx]);
+  ctrlSetPush("TILT RNG", buf, !imuStickActive(), CSA_TILTRNG);
+  ctrlSetPush("IMU TX",   !imuAvailable ? "NO IMU" : (ctrlImuFrame ? "ON (v3)" : "OFF"),
+              !imuAvailable, CSA_IMUTX);
+  // AUX3 TX only bites once a 4th device is actually present, but the row is always shown
+  // so the reason a 4th disc reads SPARE is discoverable without connecting one first.
+  ctrlSetPush("AUX3 TX",  ctrlAux3Frame ? "ON (v4)" : "OFF",
+              connectedStickCount() < 4, CSA_AUX3TX);
+
+  if (joystickAvailable)
+    ctrlSetPush("MOUNT", SEESAW_MOUNT_LABELS[seesawMountIdx], false, CSA_MOUNT);
+
+  // One row per filled role — DRIVE / AUX 1 / AUX 2 / AUX 3 — replacing the old single
+  // PRIMARY row. KEY1 cycles which connected device holds that role, so "configure the
+  // order" is the same interaction as every other row on this screen rather than a
+  // drag-and-drop the two hardware buttons cannot express.
+  bool devOn[CTRL_DEV_COUNT];
+  ctrlDevOnSnapshot(devOn);
+  int roleDev[CTRL_DEV_COUNT], nRole;
+  ctrlOrderResolveRoles(devOn, roleDev, nRole);
+  if (nRole >= 2) {
+    for (int r = 0; r < nRole; r++) {
+      // A device in a slot the frame cannot carry is live on screen but not transmitted.
+      bool spare = (r == 3 && !ctrlAux3Frame);
+      snprintf(buf, sizeof(buf), "%s%s", CTRL_DEV_LABELS[roleDev[r]], spare ? " (SPARE)" : "");
+      ctrlSetPush(CTRL_ROLE_LABELS[r], buf, false, CSA_ROLE, r);
+    }
+  }
+  return ctrlSetRowCount;
+}
+
+int controllerSettingsItemCount() { return ctrlSetBuildRows(); }
+
+// ── Profile browser (a sub-level of the controller settings panel) ───────────
+// Rows: one per saved profile, then "+ NEW (CLONE)", then "< BACK". Selecting a profile
+// applies it immediately — that is the whole point of the screen, and a two-step
+// select-then-confirm would be worse for the one action people come here to do.
+// A long-press on a profile row deletes it (no text entry exists on this device, so there
+// is no rename; use serial or the web file manager).
+int ctrlProfRowCount() { return ctrlProfCount + 2; }   // + NEW, + BACK
+
+void renderControllerProfiles() {
+  int sw = statusSprite.width(), sh = statusSprite.height();
+  bool isLandscape = sw > sh;
+  statusSprite.fillSprite(COLOR_BLACK);
+  statusSprite.setFont(&fonts::Font0);
+  uint16_t cyan = display.color565(0, 160, 210);
+
+  headerSprite.setFont(&fonts::Font0);
+  headerSprite.fillSprite(display.color565(0, 10, 18));
+  headerSprite.setTextDatum(TC_DATUM);
+  headerSprite.setTextSize(2);
+  headerSprite.setTextColor(cyan);
+  headerSprite.drawString("PROFILES", sw / 2, isLandscape ? 4 : 6);
+  headerSprite.drawFastHLine(8, SPRITE_Y - 1, sw - 16, display.color565(0, 80, 120));
+  headerSprite.pushSprite(0, 0);
+  ctrlSettingsHeaderActive = true;
+
+  const int N = ctrlProfRowCount();
+  ctrlProfCursor = constrain(ctrlProfCursor, 0, N - 1);
+
+  int startY  = 4;
+  int rowH    = isLandscape ? 20 : 26;
+  int hintH   = 10;
+  int visRows = constrain((sh - startY - hintH) / rowH, 1, N);
+  int off     = constrain(ctrlProfCursor - visRows + 1, 0, max(0, N - visRows));
+  if (ctrlProfCursor < off) off = ctrlProfCursor;
+
+  for (int i = 0; i < visRows; i++) {
+    int idx = i + off;
+    if (idx >= N) break;
+    int  y     = startY + i * rowH;
+    bool sel   = (idx == ctrlProfCursor);
+    int  textY = y + (rowH - 8) / 2;
+    if (sel) statusSprite.fillRect(4, y, sw - 8, rowH - 2, display.color565(0, 10, 18));
+
+    const char* label;
+    const char* value = "";
+    if (idx < ctrlProfCount) {
+      label = ctrlProfList[idx].name;
+      value = (strcmp(ctrlProfList[idx].path, ctrlProfActive) == 0) ? "ACTIVE" : "";
+    } else if (idx == ctrlProfCount) {
+      label = (ctrlProfCount >= CTRL_PROF_MAX) ? "+ NEW (FULL)" : "+ NEW (CLONE)";
+    } else {
+      label = "< BACK";
+    }
+    statusSprite.setTextDatum(TL_DATUM);
+    statusSprite.setTextSize(1);
+    statusSprite.setTextColor(sel ? cyan : display.color565(60, 60, 60));
+    statusSprite.drawString(sel ? ">" : " ", 6, textY);
+    statusSprite.setTextColor(sel ? COLOR_WHITE : COLOR_GRAY);
+    statusSprite.drawString(label, 14, textY);
+    if (*value) {
+      statusSprite.setTextDatum(TR_DATUM);
+      statusSprite.setTextColor(COLOR_GREEN);
+      statusSprite.drawString(value, sw - 10, textY);
+    }
+    if (i < visRows - 1)
+      statusSprite.drawFastHLine(4, y + rowH - 1, sw - 8, display.color565(20, 20, 20));
+  }
+
+  statusSprite.setTextDatum(BC_DATUM);
+  statusSprite.setTextSize(1);
+  statusSprite.setTextColor(display.color565(70, 70, 70));
+  statusSprite.drawString(ctrlProfCount ? "TAP: USE THIS PROFILE" : "TAP + NEW TO SAVE THIS SETUP",
+                          sw / 2, sh - 1);
+}
+
+// Act on the selected profile row.
+//
+// No on-device delete: the only long-press available here is KEY1, which means APPLY on
+// every other settings screen, and binding "destroy this profile" to the apply button is
+// how people lose configurations. Deletion is `ctrl prof del <name>` or the web file
+// manager — both deliberate, both reversible right up to the moment you commit.
+void ctrlProfActivateRow() {
+  const int N = ctrlProfRowCount();
+  if (ctrlProfCursor < 0 || ctrlProfCursor >= N) return;
+  if (ctrlProfCursor < ctrlProfCount) {
+    ctrlProfApply(ctrlProfList[ctrlProfCursor].path);
+    ctrlSetLevel   = CTRL_SET_LEVEL_ROWS;
+    settingsCursor = 0;
+  } else if (ctrlProfCursor == ctrlProfCount) {
+    if (ctrlProfAutoNew()) { ctrlSetLevel = CTRL_SET_LEVEL_ROWS; settingsCursor = 0; }
+  } else {
+    ctrlSetLevel = CTRL_SET_LEVEL_ROWS;
+  }
+}
+
+void handleControllerProfilesTap(int16_t sx, int16_t sy) {
+  (void)sx;
+  int sw = statusSprite.width(), sh = statusSprite.height();
+  bool isLandscape = sw > sh;
+  int  sprite_y = sy - g_spriteY;
+  const int N = ctrlProfRowCount();
+  int startY  = 4;
+  int rowH    = isLandscape ? 20 : 26;
+  int hintH   = 10;
+  int visRows = constrain((sh - startY - hintH) / rowH, 1, N);
+  int off     = constrain(ctrlProfCursor - visRows + 1, 0, max(0, N - visRows));
+  if (ctrlProfCursor < off) off = ctrlProfCursor;
+  for (int i = 0; i < visRows; i++) {
+    int idx = i + off;
+    if (idx >= N) break;
+    int rowY = startY + i * rowH;
+    if (sprite_y >= rowY && sprite_y < rowY + rowH) {
+      if (ctrlProfCursor == idx) ctrlProfActivateRow();
+      else                       ctrlProfCursor = idx;
+      return;
+    }
+  }
 }
 
 void renderControllerSettings() {
+  if (ctrlSetLevel == CTRL_SET_LEVEL_PROFILES) { renderControllerProfiles(); return; }
   int sw = statusSprite.width(), sh = statusSprite.height();
   bool isLandscape = sw > sh;
-  bool tunable     = ctrlHasTunableStick();        // Mini JoyC / JoyStick2 → CAL + DEADZONE
   int  nStk        = connectedStickCount();
   statusSprite.fillSprite(COLOR_BLACK);
   statusSprite.setFont(&fonts::Font0);
 
-  const int ITEM_COUNT = controllerSettingsItemCount();
-
-  // Build the (label, value) rows dynamically so optional MOUNT/PRIMARY rows stay aligned.
-  char calVal[16], dzVal[8];
-  if (tunable)
-    snprintf(calVal, sizeof(calVal), calibrationComplete ? "%d,%d" : "TAP TO CAL", zero_x, zero_y);
-  else
-    snprintf(calVal, sizeof(calVal), "TAP TO CAL");
-  if (tunable) snprintf(dzVal, sizeof(dzVal), "%d", CTRL_DEADZONE_VALS[ctrlDeadzoneIdx]);
-  else         snprintf(dzVal, sizeof(dzVal), "N/A");
-
-  const char* labels[9];
-  const char* values[9];
-  int n = 0;
-  labels[n] = "CALIBRATE"; values[n] = calVal;                              n++;
-  labels[n] = "DEADZONE";  values[n] = dzVal;                               n++;
-  labels[n] = "SWAP XY";   values[n] = ctrlSwapXY  ? "ON" : "OFF";          n++;
-  labels[n] = "INVERT X";  values[n] = ctrlInvertX ? "ON" : "OFF";          n++;
-  labels[n] = "INVERT Y";  values[n] = ctrlInvertY ? "ON" : "OFF";          n++;
-  labels[n] = "TX LINK";   values[n] = REMOTE_TX_LABELS[remoteTransportIdx]; n++;
-  labels[n] = "SCR LOCK";  values[n] = ctrlScreenLock ? "ON" : "OFF";        n++;
-  if (joystickAvailable) { labels[n] = "MOUNT";   values[n] = SEESAW_MOUNT_LABELS[seesawMountIdx]; n++; }
-  if (nStk >= 2)         { labels[n] = "PRIMARY"; values[n] = CTRL_DEV_LABELS[ctrlPrimaryDev];     n++; }
+  const int ITEM_COUNT = ctrlSetBuildRows();
+  // Clamp the cursor before anything derives a scroll offset from it. Nothing clamped it
+  // before, which was survivable only while the row count never shrank under a parked
+  // cursor — the PROFILE and role rows make it shrink (switch a profile, drop a device),
+  // and an out-of-range cursor renders a blank, untappable panel.
+  settingsCursor = constrain(settingsCursor, 0, ITEM_COUNT - 1);
 
   uint16_t cyan = display.color565(0, 160, 210);
 
@@ -5928,10 +7509,12 @@ void renderControllerSettings() {
   headerSprite.setTextDatum(TC_DATUM);
   headerSprite.setTextSize(2);
   headerSprite.setTextColor(cyan);
-  const char* title = (nStk >= 3) ? "TRIPLE STICK SETTINGS"
+  const char* title = (nStk >= 4) ? "QUAD STICK SETTINGS"
+                    : (nStk == 3) ? "TRIPLE STICK SETTINGS"
                     : (nStk == 2) ? "DUAL STICK SETTINGS"
                     : (miniJoyCAvailable  ? "MINIJOYC SETTINGS"
-                    : (joystick2Available ? "JOYSTICK2 SETTINGS" : "GAMEPAD SETTINGS"));
+                    : (joystick2Available ? "JOYSTICK2 SETTINGS"
+                    : (joystickAvailable  ? "GAMEPAD SETTINGS" : "TILT SETTINGS")));
   headerSprite.drawString(title, sw / 2, isLandscape ? 4 : 6);
   headerSprite.drawFastHLine(8, SPRITE_Y - 1, sw - 16, display.color565(0, 80, 120));
   headerSprite.pushSprite(0, 0);
@@ -5971,7 +7554,7 @@ void renderControllerSettings() {
     bool sel = (idx == settingsCursor);
     int textY = y + (rowH - 8) / 2;
 
-    bool disabled = (idx == 1 && !tunable);  // DEADZONE is N/A without a Mini JoyC / JoyStick2
+    bool disabled = ctrlSetRows[idx].disabled;   // decided by the row builder, not by index
 
     if (sel) statusSprite.fillRect(4, y, sw - 8, rowH - 2, display.color565(0, 10, 18));
 
@@ -5981,11 +7564,11 @@ void renderControllerSettings() {
     statusSprite.drawString(sel ? ">" : " ", 6, textY);
     statusSprite.setTextColor(disabled ? display.color565(50, 50, 50)
                                        : (sel ? COLOR_WHITE : COLOR_GRAY));
-    statusSprite.drawString(labels[idx], 14, textY);
+    statusSprite.drawString(ctrlSetRows[idx].label, 14, textY);
     statusSprite.setTextDatum(TR_DATUM);
     statusSprite.setTextColor(disabled ? display.color565(40, 40, 40)
                                        : (sel ? cyan : display.color565(40, 60, 80)));
-    statusSprite.drawString(values[idx], sw - 10, textY);
+    statusSprite.drawString(ctrlSetRows[idx].value, sw - 10, textY);
 
     if (i < visRows - 1)
       statusSprite.drawFastHLine(4, y + rowH - 1, sw - 8, display.color565(20, 20, 20));
@@ -6019,6 +7602,315 @@ void handleControllerSettingsTap(int16_t sx, int16_t sy) {
     else             onKey2Long();
   }
 }
+
+// ================================================================
+// FUNCTION_SENSOR — on-board BMI270 IMU
+// ================================================================
+//
+// Shows the same numbers the controller and the RemoteFrame use, which makes this the
+// bench check for the axis conventions that hardware can still disagree with (see the
+// SCREEN FRAME note at the top): tip the top of the device UP and PITCH must go positive;
+// drop the RIGHT edge and ROLL must go positive; turn it clockwise as you look at the
+// screen and YAW must go positive.
+//
+// Attitude is drawn as an attitude indicator: the horizon line rolls with ROLL and slides
+// with PITCH, and the bubble is the same (forward, turn) dot the stick discs draw, so a
+// tilt stick reads exactly like a joystick disc.
+
+void initSensor() {
+  renderHeader();
+}
+
+// One signed axis on a single 12 px row: name, a centre-zero bar, and the value.
+// Single-line on purpose — a label-above-bar layout needs 18 px, and six of those plus the
+// attitude block overflows the 218 px portrait sprite (and badly overflows landscape's 113).
+#define SENSOR_ROW_H 12
+static void drawSensorRow(int x, int y, int w, const char* label,
+                          float value, float fullScale, int decimals, uint16_t colour) {
+  const int nameW = 14;
+  const int valW  = 40;
+  const int barX  = x + nameW;
+  const int barW  = w - nameW - valW - 4;
+  const int barH  = 5;
+  const int barY  = y + 3;
+  int cx = barX + barW / 2;
+
+  statusSprite.setTextSize(1);
+  statusSprite.setTextDatum(TL_DATUM);
+  statusSprite.setTextColor(COLOR_GRAY);
+  statusSprite.drawString(label, x, y + 1);
+
+  statusSprite.drawFastHLine(barX, barY + barH / 2, barW, display.color565(28, 28, 28));
+  statusSprite.drawFastVLine(cx, barY, barH, display.color565(70, 70, 70));
+  int len = (int)(constrain(value / fullScale, -1.0f, 1.0f) * (barW / 2));
+  if      (len > 0) statusSprite.fillRect(cx, barY, len, barH, colour);
+  else if (len < 0) statusSprite.fillRect(cx + len, barY, -len, barH, colour);
+
+  char v[16];
+  snprintf(v, sizeof(v), "%+.*f", decimals, value);
+  statusSprite.setTextDatum(TR_DATUM);
+  statusSprite.setTextColor(display.color565(0, 150, 195));
+  statusSprite.drawString(v, x + w, y + 1);
+}
+
+// Attitude indicator: rolled + pitched horizon inside a disc, plus the tilt bubble.
+static void drawAttitudeDisc(int cx, int cy, int r) {
+  statusSprite.fillCircle(cx, cy, r, display.color565(10, 14, 20));
+  statusSprite.drawCircle(cx, cy, r, COLOR_TEAL);
+  statusSprite.drawCircle(cx, cy, r - 1, display.color565(0, 30, 30));
+
+  // Horizon: rotated by roll, offset by pitch. Roll is "right side down" positive, and
+  // dropping the right edge must tip the drawn horizon's right end UP (the world stays
+  // level, the instrument doesn't) — hence the sign on dy.
+  float rollRad = radians(constrain(imuRollDeg, -90.0f, 90.0f));
+  float pitchPx = constrain(imuPitchDeg / SENSOR_VIZ_FS_DEG, -1.2f, 1.2f) * r;
+  int   hx      = (int)(cosf(rollRad) * (r - 3));
+  int   hy      = (int)(sinf(rollRad) * (r - 3));
+  int   hcy     = cy + (int)pitchPx;
+  statusSprite.drawLine(cx - hx, hcy + hy, cx + hx, hcy - hy, display.color565(0, 120, 90));
+  statusSprite.drawLine(cx - hx, hcy + hy + 1, cx + hx, hcy - hy + 1, display.color565(0, 60, 45));
+
+  // Centre reticle (the aircraft), fixed.
+  statusSprite.drawFastHLine(cx - 8, cy, 5, COLOR_GRAY);
+  statusSprite.drawFastHLine(cx + 4, cy, 5, COLOR_GRAY);
+  statusSprite.drawPixel(cx, cy, COLOR_WHITE);
+
+  // Tilt bubble — same convention as the stick discs (up = nose up, right = right down).
+  int maxR = r - 6;
+  int dotX = cx + (int)(constrain(imuRollDeg  / SENSOR_VIZ_FS_DEG, -1.0f, 1.0f) * maxR);
+  int dotY = cy - (int)(constrain(imuPitchDeg / SENSOR_VIZ_FS_DEG, -1.0f, 1.0f) * maxR);
+  statusSprite.fillCircle(dotX, dotY, r > 28 ? 5 : 4, COLOR_ORANGE);
+}
+
+void renderSensor() {
+  int  sw = statusSprite.width(), sh = statusSprite.height();
+  bool isLandscape = sw > sh;
+
+  statusSprite.fillSprite(COLOR_BLACK);
+  statusSprite.setFont(&fonts::Font0);
+
+  if (!imuAvailable) {
+    statusSprite.setTextDatum(MC_DATUM);
+    statusSprite.setTextSize(1);
+    statusSprite.setTextColor(COLOR_RED);
+    statusSprite.drawString("BMI270 NOT FOUND", sw / 2, sh / 2 - 6);
+    statusSprite.setTextColor(COLOR_GRAY);
+    statusSprite.drawString("IMU.begin() failed at boot", sw / 2, sh / 2 + 8);
+    return;
+  }
+
+  bool  moving  = (fabsf(imuGx) + fabsf(imuGy) + fabsf(imuGz)) > IMU_MOTION_DPS;
+  int   r       = isLandscape ? 38 : 34;
+  int   discX   = isLandscape ? (r + 8) : (sw / 2);
+  int   discY   = isLandscape ? (r + 4)  : (r + 4);
+  drawAttitudeDisc(discX, discY, r);
+
+  // Portrait stacks the readout under the disc; landscape puts it to the right.
+  int   tx = isLandscape ? (discX + r + 10) : 5;
+  int   tw = isLandscape ? (sw - tx - 5)    : (sw - 10);
+  int   ty = isLandscape ? 1                : (discY + r + 5);
+  char  buf[28];
+
+  statusSprite.setTextDatum(TL_DATUM);
+  statusSprite.setTextSize(1);
+  statusSprite.setTextColor(imuZeroed ? COLOR_ORANGE : COLOR_GRAY);
+  statusSprite.drawString(imuZeroed ? "ZEROED" : "LEVEL", tx, ty);
+  statusSprite.setTextDatum(TR_DATUM);
+  statusSprite.setTextColor(moving ? COLOR_ORANGE : display.color565(0, 120, 60));
+  statusSprite.drawString(moving ? "MOVING" : "STILL", tx + tw, ty);
+  ty += 10;
+  statusSprite.drawFastHLine(tx, ty, tw, display.color565(40, 40, 40));
+  ty += 3;
+
+  statusSprite.setTextDatum(TL_DATUM);
+  statusSprite.setTextSize(2);
+  statusSprite.setTextColor(COLOR_WHITE);
+  snprintf(buf, sizeof(buf), "P%+.0f", imuPitchDeg);
+  statusSprite.drawString(buf, tx, ty);
+  statusSprite.setTextDatum(TR_DATUM);
+  snprintf(buf, sizeof(buf), "R%+.0f", imuRollDeg);
+  statusSprite.drawString(buf, tx + tw, ty);
+  ty += 17;
+
+  statusSprite.setTextSize(1);
+  statusSprite.setTextDatum(TL_DATUM);
+  statusSprite.setTextColor(COLOR_TEAL);
+  snprintf(buf, sizeof(buf), "YAW%+.0f/s", imuYawDps);
+  statusSprite.drawString(buf, tx, ty);
+  statusSprite.setTextDatum(TR_DATUM);
+  snprintf(buf, sizeof(buf), "|a|%.2fg", imuAccelMag);
+  statusSprite.drawString(buf, tx + tw, ty);
+  ty += 12;
+
+  // ── Raw sensor axes ──
+  // Deliberately the SENSOR's own X/Y/Z, not the screen frame: this is the ground truth a
+  // datasheet or a bug report is written against, while everything above it is the derived
+  // screen-relative interpretation. Rows are drawn only while they fit, so the short
+  // landscape sprite truncates the list instead of scribbling over the footer.
+  uint16_t accCol = COLOR_TEAL, gyrCol = display.color565(150, 90, 0);
+  struct { const char* lbl; float val; float fs; int dp; uint16_t col; } rows[] = {
+    { "AX", imuAx, 2.0f,   2, accCol }, { "AY", imuAy, 2.0f,   2, accCol },
+    { "AZ", imuAz, 2.0f,   2, accCol },
+    { "GX", imuGx, 250.0f, 0, gyrCol }, { "GY", imuGy, 250.0f, 0, gyrCol },
+    { "GZ", imuGz, 250.0f, 0, gyrCol },
+  };
+  // Landscape reclaims the footer strip for a sixth row (GZ — the yaw axis, the one worth
+  // seeing) and puts the status text in the dead space under the disc instead.
+  const int footerH = isLandscape ? 0 : 10;
+  for (auto& row : rows) {
+    if (ty + SENSOR_ROW_H > sh - footerH) break;
+    drawSensorRow(tx, ty, tw, row.lbl, row.val, row.fs, row.dp, row.col);
+    ty += SENSOR_ROW_H;
+  }
+
+  // What this IMU is currently feeding, so the screen explains its own settings.
+  const char* role = (imuStickActive() && ctrlImuFrame) ? "TILT STICK + FRAME v3"
+                   : imuStickActive()                   ? "TILT STICK"
+                   : ctrlImuFrame                       ? "FRAME v3"
+                                                        : nullptr;
+  statusSprite.setTextSize(1);
+  statusSprite.setTextColor(display.color565(70, 70, 70));
+  if (isLandscape) {
+    statusSprite.setTextDatum(BC_DATUM);
+    statusSprite.drawString(role ? role : "TAP: ZERO", discX, sh - 2);
+    if (role) statusSprite.drawString("TAP: ZERO", discX, sh - 12);
+  } else {
+    statusSprite.setTextDatum(BC_DATUM);
+    statusSprite.drawString(role ? role : "TAP: ZERO  KEY1 HOLD: SETUP", sw / 2, sh - 1);
+  }
+}
+
+// ── Sensor settings ──────────────────────────────────────────────
+// ZERO / LEVEL REF / GYRO ZERO / TILT STK / IMU TX (SENSOR_SET_ITEMS). The last two are
+// the very same flags the controller settings expose: the IMU is one sensor with two
+// consumers, and a second copy of the state would be a bug waiting to happen.
+
+void renderSensorSettings() {
+  int  sw = statusSprite.width(), sh = statusSprite.height();
+  bool isLandscape = sw > sh;
+  statusSprite.fillSprite(COLOR_BLACK);
+  statusSprite.setFont(&fonts::Font0);
+
+  char zeroVal[20];
+  snprintf(zeroVal, sizeof(zeroVal), "%+.0f,%+.0f", imuPitchDeg, imuRollDeg);
+  char biasVal[20];
+  snprintf(biasVal, sizeof(biasVal), "%+.1f %+.1f", imuGBiasX, imuGBiasY);
+
+  const char* labels[SENSOR_SET_ITEMS] = { "ZERO HERE", "LEVEL REF", "GYRO ZERO", "TILT STK", "IMU TX" };
+  const char* values[SENSOR_SET_ITEMS] = {
+    zeroVal,
+    imuZeroed ? "CUSTOM" : "FLAT",
+    biasVal,
+    ctrlImuStick ? "ON" : "OFF",
+    ctrlImuFrame ? "ON (v3)" : "OFF",
+  };
+
+  uint16_t cyan = display.color565(0, 160, 210);
+
+  headerSprite.setFont(&fonts::Font0);
+  headerSprite.fillSprite(display.color565(0, 10, 18));
+  headerSprite.setTextDatum(TC_DATUM);
+  headerSprite.setTextSize(2);
+  headerSprite.setTextColor(cyan);
+  headerSprite.drawString("SENSOR SETTINGS", sw / 2, isLandscape ? 4 : 6);
+  headerSprite.drawFastHLine(8, SPRITE_Y - 1, sw - 16, display.color565(0, 80, 120));
+  headerSprite.pushSprite(0, 0);
+  sensorSettingsHeaderActive = true;   // covered the standard header — restore on close
+
+  int btnH = isLandscape ? 20 : 30;
+  int btnY = sh - 6 - btnH;
+  int sepY = btnY - 6;
+  statusSprite.drawFastHLine(8, sepY, sw - 16, display.color565(40, 40, 40));
+  int bw = (sw - 24) / 2;
+  statusSprite.fillRect(8,       btnY, bw, btnH, display.color565(0, 60, 0));
+  statusSprite.fillRect(16 + bw, btnY, bw, btnH, display.color565(60, 0, 0));
+  statusSprite.drawRect(8,       btnY, bw, btnH, COLOR_GREEN);
+  statusSprite.drawRect(16 + bw, btnY, bw, btnH, COLOR_RED);
+  statusSprite.setTextSize(1);
+  statusSprite.setTextDatum(MC_DATUM);
+  statusSprite.setTextColor(COLOR_GREEN);
+  statusSprite.drawString("APPLY",  8  + bw / 2,      btnY + btnH / 2);
+  statusSprite.setTextColor(COLOR_RED);
+  statusSprite.drawString("CANCEL", 16 + bw + bw / 2, btnY + btnH / 2);
+
+  int startY   = 4;
+  int rowH     = isLandscape ? 20 : 26;
+  int rowsArea = sepY - startY;
+  int visRows  = constrain(rowsArea / rowH, 1, SENSOR_SET_ITEMS);
+
+  settingsScrollOffset = constrain(settingsScrollOffset, 0, SENSOR_SET_ITEMS - visRows);
+  if (settingsCursor < settingsScrollOffset) settingsScrollOffset = settingsCursor;
+  if (settingsCursor >= settingsScrollOffset + visRows) settingsScrollOffset = settingsCursor - visRows + 1;
+
+  for (int i = 0; i < visRows; i++) {
+    int idx = i + settingsScrollOffset;
+    if (idx >= SENSOR_SET_ITEMS) break;
+    int  y     = startY + i * rowH;
+    bool sel   = (idx == settingsCursor);
+    int  textY = y + (rowH - 8) / 2;
+    bool disabled = !imuAvailable;
+
+    if (sel) statusSprite.fillRect(4, y, sw - 8, rowH - 2, display.color565(0, 10, 18));
+
+    statusSprite.setTextDatum(TL_DATUM);
+    statusSprite.setTextSize(1);
+    statusSprite.setTextColor(sel ? cyan : display.color565(60, 60, 60));
+    statusSprite.drawString(sel ? ">" : " ", 6, textY);
+    statusSprite.setTextColor(disabled ? display.color565(50, 50, 50)
+                                       : (sel ? COLOR_WHITE : COLOR_GRAY));
+    statusSprite.drawString(labels[idx], 14, textY);
+    statusSprite.setTextDatum(TR_DATUM);
+    statusSprite.setTextColor(disabled ? display.color565(40, 40, 40)
+                                       : (sel ? cyan : display.color565(40, 60, 80)));
+    statusSprite.drawString(values[idx], sw - 10, textY);
+
+    if (i < visRows - 1)
+      statusSprite.drawFastHLine(4, y + rowH - 1, sw - 8, display.color565(20, 20, 20));
+  }
+}
+
+// Act on the selected sensor settings row (KEY1 short / tap on the highlighted row).
+void sensorSettingsActivate() {
+  if (!imuAvailable) return;
+  switch (settingsCursor) {
+    case 0: imuZeroAttitude(true); break;                   // ZERO HERE
+    case 1: imuResetAttitudeRef(); break;                   // LEVEL REF — back to flat
+    case 2: imuZeroGyro(); break;                           // GYRO ZERO — re-bias at rest
+    case 3:                                                 // TILT STK
+      ctrlImuStick = !ctrlImuStick;
+      if (ctrlImuStick) imuCalibrate();
+      break;
+    case 4: ctrlImuFrame = !ctrlImuFrame; break;            // IMU TX
+  }
+}
+
+void handleSensorSettingsTap(int16_t sx, int16_t sy) {
+  int sw = statusSprite.width(), sh = statusSprite.height();
+  bool isLandscape = sw > sh;
+  int  sprite_y    = sy - g_spriteY;
+  int startY   = 4;
+  int btnH     = isLandscape ? 20 : 30;
+  int btnY     = sh - 6 - btnH;
+  int sepY     = btnY - 6;
+  int rowH     = isLandscape ? 20 : 26;
+  int rowsArea = sepY - startY;
+  int visRows  = constrain(rowsArea / rowH, 1, SENSOR_SET_ITEMS);
+  for (int i = 0; i < visRows; i++) {
+    int idx = i + settingsScrollOffset;
+    if (idx >= SENSOR_SET_ITEMS) break;
+    int rowY = startY + i * rowH;
+    if (sprite_y >= rowY && sprite_y < rowY + rowH) {
+      if (settingsCursor == idx) onKey1Short();
+      else                       settingsCursor = idx;
+      return;
+    }
+  }
+  if (sprite_y >= btnY && sprite_y < btnY + btnH) {
+    if (sx < sw / 2) onKey1Long();
+    else             onKey2Long();
+  }
+}
+
 
 // ================================================================
 // Web File Manager
@@ -6323,6 +8215,12 @@ static bool txBle(const uint8_t* buf, size_t len) {
     bleLink.begin(
       [](const uint8_t* b, size_t n) -> bool {
         if (!pBLETxChar) return false;
+        // A notify payload is capped at ATT_MTU - 3. The stack's default ATT MTU is 23,
+        // so 20 bytes — which silently truncates anything past v2, and a truncated frame
+        // fails CRC at the receiver and is dropped. That kills the all-stop too, since it
+        // travels this same path. btInitStack() raises the MTU; refuse rather than emit a
+        // frame we know is short, so the failure is visible instead of intermittent.
+        if (n > (size_t)bleNotifyMax()) return false;
         pBLETxChar->setValue((uint8_t*)b, n);
         pBLETxChar->notify();
         return true;
@@ -6446,6 +8344,13 @@ bool transmitRemoteCommand(int leftMotorPower, int rightMotorPower) {
   f.aux2X      = remoteAux2X;
   f.aux2Y      = remoteAux2Y;
   f.hasAux2    = remoteHasAux2;   // promotes the frame to v2 (19 bytes) when a 3rd stick is present
+  f.imuPitch   = remoteImuPitch;
+  f.imuRoll    = remoteImuRoll;
+  f.imuYaw     = remoteImuYaw;
+  f.hasImu     = remoteHasImu;    // promotes the frame to v3 (25 bytes) — pre-1.2.0 receivers reject it
+  f.aux3X      = remoteAux3X;
+  f.aux3Y      = remoteAux3Y;
+  f.hasAux3    = remoteHasAux3;   // promotes the frame to v4 (29 bytes) — pre-1.3.0 receivers reject it
   f.buttons    = remoteButtonBits();
   f.seq        = ++remoteSeq;
   uint8_t frame[NESSO_FRAME_MAX_LEN];
@@ -6493,6 +8398,13 @@ void transmitRemoteStop() {
   remoteTxActive = false;               // cleared up front: this fires exactly once
   remoteAuxX  = remoteAuxY  = 0;
   remoteAux2X = remoteAux2Y = 0;
+  // Attitude neutralised alongside the aux sticks (a receiver aiming a gimbal from it must
+  // recentre too). remoteHasImu is deliberately left alone, exactly like remoteHasAux —
+  // clearing it would drop the frame back to v1/v2 mid-stream on the one frame that
+  // matters most, and a receiver that only accepts v3 would ignore the stop.
+  remoteImuPitch = remoteImuRoll = remoteImuYaw = 0;
+  remoteAux3X = remoteAux3Y = 0;        // aux3 centred too; remoteHasAux3 left alone, as above
+  aux4DisplayX = aux4DisplayY = 0;
   aux2DisplayX = aux2DisplayY = aux3DisplayX = aux3DisplayY = 0;
   joyDisplayX  = joyDisplayY  = 0;
   gamepadButtons = 0xFFFFFFFF;          // seesaw bits are active-LOW → all released
@@ -7400,6 +9312,12 @@ void btInitStack() {
   if (btInitialized || btInitFailed) return;
 
   BLEDevice::init("NESSO");
+  // Ask for a bigger ATT MTU before anything connects. The default is 23, which caps a
+  // notify payload at 20 bytes — smaller than a v3 RemoteFrame (25) or v4 (29), so BLE
+  // would silently truncate every frame once IMU attitude or a third aux stick is enabled.
+  // This is a request: the central decides, and BLE_NOTIFY_FALLBACK_MAX covers a peer that
+  // refuses to grow. txBle() checks the resulting limit per frame rather than trusting it.
+  BLEDevice::setMTU(BLE_ATT_MTU_WANTED);
   delay(50);   // let FreeRTOS BLE task settle before we touch the scan object
 
   // Server must exist so incoming connections have a GATT handler.

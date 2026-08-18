@@ -35,7 +35,7 @@ Arduino firmware for the **Arduino Nesso N1** handheld controller — a WiFi-ena
 - Optional controller:
   - Adafruit seesaw mini gamepad (I2C `0x50`, main Wire) — stick + 6 buttons
 
-The three joysticks live on separate I2C buses, so up to **three** can be connected at once for multi-stick control.
+The three joysticks live on separate I2C buses, so up to **three** can be connected at once for multi-stick control — plus the board's built-in BMI270 IMU, which can act as a fourth "tilt stick".
 
 **Required libraries:** `Adafruit seesaw`, `Arduino_Nesso_N1`, `MFRC522_I2C` (for RFID2), `NessoLink` (control-frame codec — install from the Arduino IDE Library Manager / `arduino-cli lib install NessoLink`, or clone [github.com/ugursayar/NessoLink](https://github.com/ugursayar/NessoLink) into your Arduino `libraries/` folder)
 
@@ -148,7 +148,8 @@ Navigate with **KEY1** (forward) and **KEY2** (backward), 500 ms debounce. **Lon
 | Mode | Description |
 |------|-------------|
 | `FUNCTION_MAIN` | Clock + WiFi status via NTP (UTC+3) |
-| `FUNCTION_CONTROLLER` | Gamepad / Mini JoyC → robot commands over selectable link (UDP/BLE/TCP/LoRa) |
+| `FUNCTION_CONTROLLER` | Gamepad / Mini JoyC / tilt → robot commands over selectable link (UDP/BLE/TCP/LoRa) |
+| `FUNCTION_SENSOR` | On-board BMI270 IMU — attitude indicator, pitch/roll/yaw, raw accel + gyro |
 | `FUNCTION_BT` | Bluetooth scanner |
 | `FUNCTION_WIFI` | WiFi network scanner |
 | `FUNCTION_LORA` | LoRa / Meshtastic |
@@ -159,6 +160,25 @@ Navigate with **KEY1** (forward) and **KEY2** (backward), 500 ms debounce. **Lon
 | `FUNCTION_BATTERY` | Battery status + device settings |
 
 **Device settings** (long-press KEY1 on battery screen): DIM TIMEOUT, SLEEP TIMEOUT, LOW BAT SLEEP, UI CLICKS, RF433, SPEAKER, VOLUME, RESET.
+
+---
+
+## Sensor screen (BMI270 IMU)
+
+The board's 6-axis Bosch BMI270 drives screen auto-rotation, and the **Sensor** screen exposes the rest of it: an attitude indicator (horizon line that rolls and pitches, plus a tilt bubble), pitch / roll / yaw-rate / |a| readouts, and signed bars for the raw accelerometer and gyroscope X/Y/Z.
+
+- **Tap** anywhere → zero the attitude to however you're holding it right now.
+- **Long-press KEY1** → settings: `ZERO HERE`, `LEVEL REF` (back to flat/screen-up), `GYRO ZERO` (re-bias the gyro — keep the device still), `TILT STK`, `IMU TX`.
+
+Pitch and roll are measured as rotation away from the zero reference rather than as absolute tilt, so you can calibrate in whatever posture you actually hold the device. The reference is not saved across reboots — it starts at "flat, screen up", which makes the readings true attitude until you zero it.
+
+**Calibration refuses if the device is moving.** Both the attitude zero and the gyro bias check that the device is at rest first and change nothing if it isn't, rather than baking a wrong constant in for the rest of the session. Hold it still and retry; the serial commands say so explicitly. Gyro bias is re-measured on every boot (it drifts with temperature) and is never saved.
+
+`CALIBRATE` on the Controller screen calibrates **everything connected** in one action — Mini JoyC centre to STM32 flash, seesaw centre re-armed, IMU attitude + gyro zeroed. `ctrl calibrate` does the same and prints what it did.
+
+There is **no magnetometer** on this board, so there is no compass heading: yaw is a *rate* (deg/s), and integrating it drifts.
+
+Serial: `imu` (full snapshot), `imu zero`, `imu level`, `imu debug on|off`.
 
 ---
 
@@ -463,36 +483,112 @@ Controller mode reads a joystick and transmits motor + button commands to a remo
 | Adafruit seesaw mini gamepad | I2C `0x50` (main Wire) | Stick + A/B/X/Y/SELECT/START |
 | M5Stack Mini JoyC HAT (STM32F030) | I2C `0x54` (HAT bus, GPIO 6/7) | Stick + button; self-powered |
 | M5Stack Unit JoyStick2 (STM32G030) | I2C `0x63` (GROVE bus, GPIO 5/4) | Stick + button; GROVE 5V powered |
+| Built-in BMI270 IMU ("tilt stick") | on-board | Tilt the device itself; no button. **On by default** — disable with `TILT STK` |
 
-They sit on three separate buses, so **1, 2, or 3** can be used together:
+The three joysticks use three separate connectors (main / HAT / Grove), so **all three can be
+plugged in at once** — plus the IMU, giving **four live devices**. A *fourth physical* stick is
+not possible: there is one seesaw header, one HAT slot and one Grove port. Two conflicts worth
+knowing: the Mini JoyC HAT and the Speaker Hat 2 use the same pins (GPIO 6/7), and the
+JoyStick2 occupies the Grove port, so it can't share with RFID2 / IR / RF433.
 
-- **1 stick** → it drives the motors directly.
-- **2 sticks** → one drives, the other is an **aux** stick (camera/turret → `auxX`/`auxY`).
-- **3 sticks** → one drives + **two** aux sticks (`auxX`/`auxY` and `aux2X`/`aux2Y`, the second carried in a v2 frame).
+- **1 device** → it drives the motors directly.
+- **2 devices** → one drives, the other is an **aux** stick (camera/turret → `auxX`/`auxY`).
+- **3 devices** → one drives + **two** aux sticks (`aux2X`/`aux2Y` rides in a v2 frame).
+- **4 devices** → one drives + **three** aux. The third aux needs `AUX3 TX` on (v4 frame);
+  until then it is live on screen but marked **SPARE** and not transmitted.
 
-`PRIMARY` selects which stick drives (default: Mini JoyC); the rest become aux1/aux2 in the order seesaw → Mini JoyC → JoyStick2. The Controller screen shows one disc per connected stick (drive first). The Mini JoyC and JoyStick2 always follow screen rotation; the seesaw follows it only in attached `MOUNT` modes (see below). With `SCR LOCK` on (the default) the screen doesn't rotate while you're on the Controller screen, so "screen rotation" there means the orientation you navigated in with.
+### Device order
 
-### Wire protocol — RemoteFrame (v1 / v2)
+The order is fully configurable — not just "who drives". It's a stored ranking of all four
+devices, and the roles **DRIVE / AUX 1 / AUX 2 / AUX 3** are handed out top-down over
+whichever devices are actually connected.
 
-Every link sends the same little-endian frame, encoded by the shared **[NessoLink](https://github.com/ugursayar/NessoLink)** library (`nessoEncode()`); the robot receiver decodes it with the same library (`nessoDecode()`). Magic + version + CRC let it validate. There are two versions — the firmware sends the **minimal** one and `nessoDecode()` accepts either, so existing v1 receivers keep working for 1–2 stick setups:
+- On screen: one settings row per role. KEY1 cycles which connected device holds it.
+- Serial: `ctrl order` to see it, `ctrl order tilt,pad` to set it (any subset — the rest keep
+  their relative order), or `ctrl drive|aux1|aux2|aux3 <dev>` for a single role.
 
-- **v1 (15 bytes)** — drive + up to one aux stick. Sent unless a third stick is connected.
-- **v2 (19 bytes)** — adds a second aux stick (`aux2X`/`aux2Y`). Sent only in three-joystick mode.
+Unplugging a device doesn't rewrite your order — it just takes no role until it's back, and
+then returns to exactly the slot you gave it. `ctrl order` prints absent devices in lowercase.
+Changing the drive device (by reordering, unplugging or hot-plugging) sends an explicit stop
+before the new stick takes over, so the robot never jumps from the old stick's last command
+straight to the new stick's resting position.
+
+The Controller screen shows one disc per role — **two rows in portrait, four across in
+landscape**. The Mini JoyC, JoyStick2 and tilt stick always follow screen rotation; the seesaw
+follows it only in attached `MOUNT` modes (see below). With `SCR LOCK` on (the default) the
+screen doesn't rotate while you're on the Controller screen, so "screen rotation" there means
+the orientation you navigated in with.
+
+### Profiles
+
+Save the whole controller setup under a name and switch between rigs or robots in one tap.
+A profile stores the device order, axis flags, deadzone, seesaw mount, tilt range/enable,
+IMU TX, AUX3 TX, the transport **and** the robot's IP/ports — so "switch to my other robot"
+is a single action. Things that belong to the handheld rather than the robot (screen lock,
+HID mode, the LoRa scanner's radio preset) stay global.
+
+- **PROFILE** row — cycles `DEFAULT` → your profiles → `DEFAULT`, applying immediately.
+  A `*` means the live settings differ from the saved profile; APPLY writes them back.
+- **PROFILES** row — browser with each saved profile plus **`+ NEW (CLONE)`**, which saves
+  the settings you're using right now as a new profile.
+- Serial: `ctrl prof`, `ctrl prof new <name>`, `ctrl prof use <name>`, `ctrl prof save`,
+  `ctrl prof del <name>`, `ctrl prof default`.
+
+Up to 8 profiles, stored as JSON under `/ctrldb/` (visible in the web file manager). Names are
+1–12 characters of `A–Z a–z 0–9 _ -`. There's no on-device rename or delete — this device has
+no text entry, and the only long-press available means APPLY, which is a bad thing to bind a
+destructive action to; use serial or the web file manager. The active profile is restored on
+boot; if its file has gone, your settings are left exactly as they were and the profile
+reverts to `DEFAULT`.
+
+### Tilt stick (IMU)
+
+The board's own IMU counts as a stick and is **on by default** (`TILT STK`, or `ctrl tilt on|off`) — it's soldered to the board, so it's simply always one of the sticks you have. With two joysticks plugged in you get three discs: drive, aux1, and `TILT`. Gesture: **tilt the top of the device down/away to go forward, drop the right edge to turn right.** `TILT RNG` sets how far you have to tilt for full deflection (15 / 25 / 35 / 45°, default 25).
+
+The tilt disc shows **three** axes where a joystick disc shows two — a horizon line that rolls and slides with attitude, and a yaw needle on the rim (straight up = not turning, swinging clockwise for clockwise rotation). The orange bubble is the actual post-deadzone stick deflection, same as every other disc.
+
+Because the IMU takes a slot, on a two-joystick setup it lands in **aux2** and frames go from v1 to v2. Any NessoLink ≥ 1.1.0 receiver decodes that fine, but if your robot already acts on `aux2X`/`aux2Y` it will now see them move with device tilt — turn `TILT STK` off if that's not what you want.
+
+Because tilt is measured from a *zero reference* rather than from level, you can hold the device however you like — `CALIBRATE` (or a tap on the Sensor screen, or `imu zero`) captures the current hold as centre. Until you calibrate explicitly, the controller screen re-zeros to your current hold every time you enter it, so walking in holding the device at a reading angle never lurches the robot. The tilt axis enforces a deadzone floor of ~1.5° regardless of the `DEADZONE` setting, because a hand has no mechanical centre to spring back to and the residual counts would otherwise make the robot creep instead of stop.
+
+Best results holding the device roughly flat-to-moderately-tilted. Held bolt upright, roll becomes unobservable (rotating about the gravity vector is invisible to an accelerometer, and there's no magnetometer to fall back on).
+
+### Wire protocol — RemoteFrame (v1 / v2 / v3)
+
+Every link sends the same little-endian frame, encoded by the shared **[NessoLink](https://github.com/ugursayar/NessoLink)** library (`nessoEncode()`); the robot receiver decodes it with the same library (`nessoDecode()`). Magic + version + CRC let it validate. There are three versions — the firmware sends the **minimal** one and `nessoDecode()` accepts all of them, so existing receivers keep working for setups that don't use the newer fields:
+
+- **v1 (15 bytes)** — drive + up to one aux stick. Sent unless a third stick or IMU data is present.
+- **v2 (19 bytes)** — adds a second aux stick (`aux2X`/`aux2Y`). Sent in three-joystick mode.
+- **v3 (25 bytes)** — adds the transmitter's IMU attitude. Sent only when `IMU TX` is on.
+- **v4 (29 bytes)** — adds a third aux stick. Sent only when `AUX3 TX` is on.
 
 | off | field | type | notes |
 |---|---|---|---|
 | 0 | magic | u8 | `0xA5` |
-| 1 | version | u8 | `1` (v1) or `2` (v2) |
+| 1 | version | u8 | `1`, `2` or `3` |
 | 2 | seq | u8 | rolling sequence (dedup / loss detection) |
 | 3–4 | leftMotor | i16 | −255..255 |
 | 5–6 | rightMotor | i16 | −255..255 |
 | 7–8 | auxX | i16 | aux stick 1 X (0 unless aux present) |
 | 9–10 | auxY | i16 | aux stick 1 Y |
 | 11–12 | buttons | u16 | bitfield, 1 = pressed: A=0, B=1, X=2, Y=3, SELECT=4, START=5, STICK=6, STICK2=7 |
-| 13 | flags | u8 | bit0 = aux1 present, bit1 = aux2 present |
+| 13 | flags | u8 | bit0 = aux1, bit1 = aux2, bit2 = IMU present |
 | 14 | crc8 (v1) | u8 | poly `0x07`, init `0x00`, over bytes 0..13 — **v1 ends here** |
-| 14–17 | aux2X / aux2Y (v2) | i16×2 | aux stick 2 X/Y |
-| 18 | crc8 (v2) | u8 | poly `0x07`, init `0x00`, over bytes 0..17 |
+| 14–17 | aux2X / aux2Y (v2+) | i16×2 | aux stick 2 X/Y (zero-filled if no second aux stick) |
+| 18 | crc8 (v2) | u8 | poly `0x07`, init `0x00`, over bytes 0..17 — **v2 ends here** |
+| 18–19 | imuPitch (v3) | i16 | −255..255, + = nose up |
+| 20–21 | imuRoll (v3) | i16 | −255..255, + = right side down |
+| 22–23 | imuYaw (v3) | i16 | −255..255, **rate** not angle, + = clockwise from the front |
+| 24 | crc8 (v3) | u8 | poly `0x07`, init `0x00`, over bytes 0..23 |
+| 24–25 | aux3X (v4) | i16 | aux stick 3 X (0 unless `hasAux3`) |
+| 26–27 | aux3Y (v4) | i16 | aux stick 3 Y |
+| 28 | crc8 (v4) | u8 | poly `0x07`, init `0x00`, over bytes 0..27 |
+
+Every axis — motors, aux and IMU — is −255..255, so a receiver needs exactly one dead-zone constant. IMU counts convert back to physical units with `nessoImuDeg()` (±255 = ±90°) and `nessoImuYawDps()` (±255 = ±250 °/s).
+
+Aux slots are **role-typed, not device-typed** — which stick sits in a slot is your configuration, so write receivers against "aux slot 2", never "the Mini JoyC". Button bits *are* device-bound and don't move when you reorder. A tilt input in an aux slot rides as stick deflection; attitude only ever appears in the `imu*` fields.
+
+> **`IMU TX` and `AUX3 TX` are off by default on purpose.** Each promotes *every* frame to a newer version (v3 / v4), and a receiver built against an older NessoLink rejects unknown version bytes. It fails closed rather than misparsing — but the **all-stop travels the same path**, so a rejected version means the robot never hears the stop. Nothing auto-promotes the wire version when you plug a stick in. Re-vendor `NessoFrame.h` on the robot (NessoLink ≥ 1.2.0 for v3, ≥ 1.3.0 for v4) before turning either on. They also cost airtime on LoRa, which is already duty-cycle limited.
 
 Sent continuously at ~10 Hz (even when centered) so the receiver can implement a failsafe (stop motors if no valid frame for N ms).
 
@@ -542,7 +638,7 @@ Connect at **115200 baud**. Commands work over both USB serial and BLE UART (`ne
 | `status` | Current state summary (screen, WiFi, BT, BLE-UART) |
 | `next` | Advance to next screen (same as KEY1) |
 | `prev` | Go to previous screen (same as KEY2) |
-| `goto <screen>` | Jump to screen: `main`, `controller`, `bt`, `wifi`, `lora`, `rfid2`, `ir`, `rf433`, `media`, `matrix`, `vader`, `obiwan`, `battery` |
+| `goto <screen>` | Jump to screen: `main`, `controller`, `sensor`, `bt`, `wifi`, `lora`, `rfid2`, `ir`, `rf433`, `media`, `matrix`, `vader`, `obiwan`, `battery` |
 | `clock` | Print current date/time (NTP) |
 | `battery` | Print voltage, percentage, charge state, uptime |
 | `webfm` | Print web file manager URL |
@@ -560,11 +656,31 @@ Connect at **115200 baud**. Commands work over both USB serial and BLE UART (`ne
 | `ctrl inverty on\|off` | Invert forward/back (Y) axis |
 | `ctrl swap on\|off` | Swap X/Y |
 | `ctrl dz 0-3` | Stick deadzone, all sticks (8 / 16 / 30 / 50) |
-| `ctrl calibrate` | Calibrate Mini JoyC center → STM32 flash |
+| `ctrl calibrate` | Calibrate **every** connected input at once, and report per device |
 | `ctrl link udp\|ble\|tcp\|lora` | Select wireless link |
-| `ctrl primary pad\|joyc\|joy2` | Which stick drives (2+ sticks connected) |
+| `ctrl order` | Show the device order and the roles it resolves to |
+| `ctrl order <list>` | Set the order, e.g. `ctrl order tilt,pad` (any subset, best first) |
+| `ctrl drive\|aux1\|aux2\|aux3 <dev>` | Put one device in one role (`pad\|joyc\|joy2\|tilt`) |
+| `ctrl aux3tx on\|off` | Send the 3rd aux stick — v4 frame, needs a NessoLink 1.3.0+ receiver (default `off`) |
+| `ctrl prof` | List profiles and show the active one |
+| `ctrl prof new\|use\|del <name>` | Create from current settings / switch to / delete |
+| `ctrl prof save` | Write the current settings back to the active profile |
+| `ctrl prof default` | Clear the active profile (settings unchanged) |
+| `ctrl primary pad\|joyc\|joy2\|tilt` | Alias for `ctrl drive` |
 | `ctrl ssmount 0-3` | Seesaw mount: `side`/`back` (attached) · `detport`/`detland` (detached) |
 | `ctrl lock on\|off` | Screen lock — hold the screen orientation while on the controller screen (default `on`) |
+| `ctrl tilt on\|off` | Use the built-in IMU as a tilt stick (default `on`) |
+| `ctrl tiltrange 0-3` | Tilt for full deflection: 15 / 25 / 35 / 45 degrees |
+| `ctrl imutx on\|off` | Send IMU attitude in the frame — promotes it to v3, needs a NessoLink 1.2.0+ receiver (default `off`) |
+
+### IMU (`imu`)
+
+| Command | Description |
+|---|---|
+| `imu` | Accel + gyro + derived attitude snapshot, and what the tilt stick / frame are sending |
+| `imu zero` | Zero the attitude to the current hold and re-bias the gyro |
+| `imu level` | Reset the attitude reference to level (flat, screen up) |
+| `imu debug on\|off` | Stream readings every 300 ms |
 
 ### Filesystem (`fs`)
 
