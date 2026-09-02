@@ -9,25 +9,60 @@ update this file first, then copy from here into the portal.
 | field | value |
 |---|---|
 | category / device | Nesso-N1 / Arduino Nesso N1 |
-| firmware file | `firmware/Nesso_base_v1.1.0.bin` (compact merge — leaves LittleFS intact) |
+| firmware file | `firmware/Nesso_base_v1.2.0.bin` (compact merge — leaves LittleFS intact) |
 | flash address | `0x0` |
 | baud | `921600` |
 | cover image | `assets/cover.png` (regenerate with `python gen_cover.py`, 420×300) |
-| version | `1.1.0` (keep in sync with `m5burner.json`) |
-| NessoLink (robot side) | **`1.1.2` or newer** — see below; keep in sync with the description text |
+| version | `1.2.0` (keep in sync with `m5burner.json`) |
+| NessoLink (robot side) | **`1.4.0` or newer** — see below; keep in sync with the description text |
 
-## Description (v1.1.0)
+## Rebuilding the image
+
+The published file is a **compact merge** — bootloader + partitions + boot_app0 + app, ending
+after the app so flashing it at `0x0` leaves the LittleFS IR/RF433 database at `0x610000`
+untouched. Do NOT publish arduino-cli's own `Nesso_base.ino.merged.bin`: that one is padded
+to the full 16 MB flash and would erase the database.
+
+```powershell
+arduino-cli compile --clean --fqbn "esp32:esp32:arduino_nesso_n1" --build-path "D:/Nesso_base/build" Nesso_base.ino
+copy build\Nesso_base.ino.bootloader.bin firmware\Nesso_base_0x0.bin
+copy build\Nesso_base.ino.partitions.bin firmware\Nesso_base_0x8000.bin
+copy build\boot_app0.bin                 firmware\Nesso_base_0xe000.bin
+copy build\Nesso_base.ino.bin            firmware\Nesso_base_0x10000.bin
+& "D:\packages\arduino\data\packages\esp32\tools\esptool_py\5.3.1\esptool.exe" --chip esp32c6 merge-bin `
+    -o firmware\Nesso_base_v1.2.0.bin `
+    0x0 firmware\Nesso_base_0x0.bin 0x8000 firmware\Nesso_base_0x8000.bin `
+    0xe000 firmware\Nesso_base_0xe000.bin 0x10000 firmware\Nesso_base_0x10000.bin
+```
+
+(`merge_bin` with an underscore still works but is deprecated in esptool 5.x.)
+
+## Publishing checklist
+
+1. Rebuild the image (above) and commit the refreshed `firmware/*.bin`.
+2. Bump `version` in **both** `m5burner.json` and the table above.
+3. **Copy the description and "What's new" text below into the M5Burner portal** — this file
+   is only the source of truth; editing it changes nothing users see until it is pasted into
+   the desktop app.
+4. Re-check the NessoLink floor: it tracks what the firmware *can emit*, not what it emits by
+   default. IMU TX promotes frames to v3 and AUX3 TX to v4, so a build that merely exposes
+   those rows raises the floor even though both default OFF.
+
+## Description (v1.2.0)
 
 Arduino firmware for the **Arduino Nesso N1** handheld controller — a
 WiFi/BLE/LoRa-enabled base station that controls a remote robot platform over a
 selectable wireless link: WiFi-UDP, TCP, BLE, or LoRa (CRC-checked NessoLink
 RemoteFrame protocol with receiver failsafe). Features a 240×135px TFT display
-with a multi-mode menu, battery monitoring, 1–3 joystick input (Adafruit seesaw
-gamepad, M5Stack Mini JoyC HAT, and/or M5Stack Unit JoyStick2 — one drive stick
-plus up to two aux sticks, with per-stick orientation adaptation, calibration,
-and deadzone settings), IR and 433 MHz RF remote control, RFID card scanning,
-Speaker Hat 2 (MAX98357A) audio, an experimental BLE HID gamepad mode, and a
-web-based file manager.
+with a multi-mode menu, battery monitoring, and up to **four simultaneous
+control inputs** — Adafruit seesaw gamepad, M5Stack Mini JoyC HAT, M5Stack Unit
+JoyStick2, M5Stack Unit Joystick v1.1, and the board's own BMI270 IMU as a tilt
+stick — with one drive stick plus up to three aux sticks, a configurable device
+order, per-stick orientation adaptation, calibration and deadzone settings, and
+named controller profiles. Also: a BMI270 sensor screen (attitude, gyro rates,
+raw axes), IR and 433 MHz RF remote control, RFID card scanning, Speaker Hat 2
+(MAX98357A) audio, an experimental BLE HID gamepad mode, and a web-based file
+manager.
 
 Robot side: control frames are encoded by the **NessoLink** Arduino library —
 install it from the IDE Library Manager (or `arduino-cli lib install NessoLink`,
@@ -37,23 +72,36 @@ Arduino Uno R4 WiFi (`UnoR4ReceiverUDP/TCP/BLE`), and M5 Cardputer ADV + Cap
 LoRa 1262 (`CardputerAdvLoRaReceiver`), so a robot can be up and driving with a
 few lines around `applyMotors()`.
 
-**Requires NessoLink 1.1.2 or newer on the robot.** This build emits RemoteFrame
-**v1/v2** only, so 1.1.2 is a floor rather than an exact pin — it is the first
-release whose `NessoFrame.h` states the aux stick axis contract, and without that
-a receiver can disagree with the transmitter about what `auxX`/`auxY` mean while
-both sides still pass CRC. Newer releases decode v1/v2 unchanged, so installing
-the current Library Manager version is always right; the floor only rules out
-1.1.0 and 1.1.1, never an upgrade.
+**Requires NessoLink 1.4.0 or newer on the robot.** A floor rather than an exact
+pin — newer releases decode older frames unchanged, so installing the current
+Library Manager version is always right. The floor is 1.4.0 because it tracks
+what this build *can* emit, not what it emits by default: frames are v1/v2 out
+of the box, but turning on **IMU TX** promotes every frame to v3 and **AUX3 TX**
+to v4, and `nessoDecode()` rejects a version byte it does not know — it fails
+closed, but it does stop, and the all-stop frame travels the same path. Both
+rows default OFF precisely so this cannot happen by accident, and the on-device
+toggles say which NessoLink version they need.
 
-## What's new in v1.1.0
+## What's new in v1.2.0
 
-- Selectable robot TX link: WiFi-UDP / TCP / BLE / LoRa (NessoLink RemoteFrame v1/v2,
-  robot needs NessoLink >= 1.1.2)
-- Up to three joysticks at once — seesaw gamepad, Mini JoyC HAT, Unit JoyStick2:
-  one drive + two aux sticks, per-stick rotation adaptation, selectable primary
-- Controller settings screen: calibration, deadzone, axis swap/invert, TX link,
-  stick mount, primary stick
-- Speaker Hat 2 (MAX98357A) audio support
-- Experimental BLE HID gamepad mode (off by default)
-- Smoother drive mixer and non-blocking TCP reconnects; button-read and boot
-  robustness fixes
+- **M5Stack Unit Joystick v1.1** (I2C `0x52`) joins the roster, alongside JoyStick2
+  on the same Grove port
+- **The built-in BMI270 IMU is a control input** — tilt the device to drive, with a
+  selectable tilt range; on by default since the sensor is soldered to the board
+- **New SENSOR screen**: attitude indicator, pitch / roll / yaw-rate, and raw
+  accelerometer + gyroscope axes; tap to zero to your current hold
+- **Configurable device order** — DRIVE / AUX 1 / AUX 2 / AUX 3 are handed out over
+  whatever is connected, and unplugging a device no longer overwrites your choice
+- **Controller profiles**: named snapshots of the whole mapping plus the robot's
+  IP/ports, so switching rigs or robots is one tap
+- **Screen lock** (on by default) — the Controller and Sensor screens hold the
+  orientation you entered them in, so tilting never rotates the display or remaps
+  the axes mid-drive or mid-reading
+- RemoteFrame **v3** (transmitter IMU attitude) and **v4** (a third aux stick),
+  both opt-in and both requiring a matching NessoLink on the robot
+- **Guaranteed stop**: an explicit all-stop whenever the drive loop stops running —
+  leaving the screen, opening settings, or losing the drive stick — retried until
+  the transport accepts it
+- Fixes: aux stick axes were transmitted transposed and at the wrong scale; the
+  screen could come back empty after a long sleep (sprites moved to static buffers);
+  the status header did not return when the controller settings panel closed
