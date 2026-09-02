@@ -73,7 +73,7 @@ The zero reference is **RAM-only by design** (a hold captured days ago is not th
 
 ### Calibration
 
-**One action, every device.** `ctrlCalibrateAll()` is what the CALIBRATE row and `ctrl calibrate` both run, and it uses **independent `if`s, never `else if`**. It used to be `if (miniJoyCAvailable) {…} else { seesaw }`, so on the common seesaw + Mini JoyC pair the seesaw's centre was *never* recaptured — CALIBRATE silently did half its job on the setup most likely to need it, and a seesaw a few counts off centre is exactly what makes a robot creep instead of stop. Same trap `remoteButtonBits()` documents for merging button sources. It returns a bit-per-`CtrlStickDev` mask so callers report what actually happened. Per device: Mini JoyC → HW centre into STM32 flash; seesaw → re-arm the lazy centre capture; JoyStick2 → nothing (self-centring); IMU → `imuCalibrate()` (attitude zero + gyro bias).
+**One action, every device.** `ctrlCalibrateAll()` is what the CALIBRATE row and `ctrl calibrate` both run, and it uses **independent `if`s, never `else if`**. It used to be `if (miniJoyCAvailable) {…} else { seesaw }`, so on the common seesaw + Mini JoyC pair the seesaw's centre was *never* recaptured — CALIBRATE silently did half its job on the setup most likely to need it, and a seesaw a few counts off centre is exactly what makes a robot creep instead of stop. Same trap `remoteButtonBits()` documents for merging button sources. It returns a bit-per-`CtrlStickDev` mask so callers report what actually happened. Per device: Mini JoyC → HW centre into STM32 flash; seesaw → re-arm the lazy centre capture; **Joystick v1.1 → re-arm its lazy centre capture** (it hands out raw ADC and does *not* self-centre); JoyStick2 → nothing (self-centring); IMU → `imuCalibrate()` (attitude zero + gyro bias).
 
 **Calibration can refuse, and that is the point.** Both IMU routines return `bool` and change nothing on failure:
 
@@ -122,6 +122,8 @@ Use `voltageToPercent()` (piecewise linear LiPo curve, 3.0V→0% / 4.2V→100%).
 
 ESP32-C6 has only one HP I2C controller (`Wire`). The LP I2C SDA is hardware-locked to GPIO 6, unusable for GPIO 5. RFID2 operations briefly switch `Wire` to GPIO 5/4 via `rfid2WireGrove()` / `rfid2WireRestore()`, which call `Wire.end()` + `Wire.begin()`. `Wire.end()` is mandatory before `Wire.begin()` with different pins — omitting it leaves the bus silently stuck on the old pins.
 
+**`GROVE_POWER_EN` is an I2C *expander* pin, and the expander is on the MAIN bus.** `digitalWrite(GROVE_POWER_EN, …)` is a register write sent over the global `Wire` (see `expander.cpp`; it calls `Wire.begin(SDA, SCL)` exactly once, then writes to whatever pins `Wire` currently holds). So **`Wire` must be back on the main bus before any GROVE power write** — do it while re-pinned to the HAT or Grove bus and the write goes nowhere, silently, and the rail never changes state. This bit `serialHandleI2c()`, which turned GROVE power on straight after the HAT-bus scan: the rail stayed off and the Grove scan reported `(none)` for a Unit Joystick v1.1 that was plugged in, detected at boot and driving the controller screen. The bug hid for as long as it did because the scan *does* work whenever something else already holds the rail on — the controller screen holds it for the whole session. Every other `digitalWrite(GROVE_POWER_EN, …)` site is preceded by a `*WireRestore()`; keep it that way.
+
 ### Speaker (MAX98357A I2S)
 
 Main-loop polling only — no FreeRTOS task. `spkUpdate()` is called every `loop()` iteration and writes up to 512 synthesised samples via `i2s_channel_write()` with `timeout_ms = 0` (non-blocking; samples drop rather than stall). A FreeRTOS task approach caused resets on the single-core ESP32-C6 and was replaced with this design.
@@ -154,6 +156,7 @@ Both use GPIO 4 via different ISR handlers. `irLearnStart()` refuses if `rf433Le
 
 #define MINIJOYC_ADDR   0x54   // Mini JoyC HAT, HAT bus G6/G7
 #define JOYSTICK2_ADDR  0x63   // Unit JoyStick2, Grove bus G5/G4 (+ GROVE_POWER_EN)
+#define JOYSTICK1_ADDR  0x52   // Unit Joystick v1.1, Grove bus G5/G4 (+ GROVE_POWER_EN)
 ```
 
 ### Mini JoyC HAT (M5Stack, STM32F030, I2C 0x54)
@@ -187,6 +190,59 @@ Register map (M5Unit-JoyStick2 library):
 
 `readJoystick2Axes()` normalises the ±2048 reading to the ±512 scale the **shared deadzone** (`CTRL_DEADZONE_VALS`) expects, then to ±515 like the other sticks, in the **same (px=horizontal-right-positive, py=vertical-up-negative) convention as the Mini JoyC** so it feeds the shared `applyStickRotation()` table identically (always rotation-adapts, like the front-mounted Mini JoyC). **Axis mapping (verified on hardware):** the unit's **Y register drives screen-horizontal and its X register screen-vertical (interchanged), and both are inverted** — i.e. `horiz = jy/4`, `vert = -jx/4`. If a future unit reads differently, that one function is where to adjust.
 
+### Unit Joystick v1.1 (M5Stack, MEGA8A, I2C 0x52)
+
+The **original** M5 joystick unit — not JoyStick2. A Grove I2C unit like JoyStick2 and RFID2,
+so it shares the Grove bus (SDA=GPIO5, SCL=GPIO4) and `GROVE_POWER_EN` (5V) and reuses
+`rfid2WireGrove()`/`rfid2WireRestore()` (aliased `joystick1WireGrove()`/`joystick1WireRestore()`).
+Different address from JoyStick2, so the two *can* coexist behind an I2C hub; one Grove port
+means one unit in practice. Probed at boot inside the same GROVE-power window as the others.
+
+**There is no register file.** A 3-byte read of the device address is the whole protocol:
+`[0] X 0..255`, `[1] Y 0..255`, `[2] button 0/1`. Two things follow, and both differ from
+JoyStick2:
+
+- **The axes are raw 8-bit ADC — the unit does not centre them** (JoyStick2's `0x50` does). So
+  `readJoystick1Axes()` **lazy-captures the resting centre**, exactly like the seesaw and for
+  exactly the same reason: without it a released stick never mixes to a clean zero and the
+  robot creeps instead of stopping (see [Guaranteeing the robot stops](#guaranteeing-the-robot-stops)).
+  Re-armed on every controller-screen entry and by CALIBRATE. Only a reading inside
+  `JOYSTICK1_CENTRE_MIN..MAX` (80..176) is accepted as a centre — a capture taken while the
+  stick is held would bake that deflection in and make the robot creep the *other* way.
+- **No LED and no calibration register**, so nothing is ever written. Axes and button arrive in
+  one transaction — one bus window per cycle, like the other units.
+
+**Axis mapping and button polarity, both measured on hardware 2026-09-02:**
+
+- *Axes.* The **Y byte rises as the stick is pushed away** (forward) and the **X byte rises to
+  the right** (rotate CW). The two lines at the end of `readJoystick1Axes()` are the only place
+  this lives — `px` is FORWARD and `py` is TURN going into `applyStickRotation()`, see the
+  `*DisplayX/Y` note under
+  [Remote control transport layer](#remote-control-transport-layer). The first guess had
+  forward inverted; both axes reach the full 0..255 span, so a stick that reads dead on one
+  axis is a wiring or unit fault, not a mapping one.
+- *Button.* `JOYSTICK1_BTN_PRESSED` is **1** — this unit is **not** active-low like the Mini
+  JoyC and JoyStick2. Measured over 200+ samples at rest and through a full two-axis sweep, the
+  byte never left 0, so 0 is the released level.
+
+  The read also **arms itself**: `joystick1BtnArmed` is set only once the unit has been seen
+  reporting the released level, and until then the button never registers. That is not
+  belt-and-braces — it is what turned the original *wrong* polarity guess into a no-op instead
+  of a permanently "pressed" button latched into every frame the robot receives. Keep it: it
+  makes this constant safe to flip from the bench.
+
+`ctrl` prints `joy1 raw x/y/btn` and the captured centre while the controller screen is live —
+that line is the bench check for both. Note the raw values only refresh while `readGamePad()`
+is running, so read them **on the controller screen**; elsewhere they are the boot defaults.
+
+**Both Grove sticks are probed in ONE interleaved retry loop at boot** (~600 ms budget, 12 ×
+50 ms, exits as soon as both answer), not two loops in series. They share a bus and a power
+window, so the pair costs one settle rather than two — but the real reason is an ordering trap:
+probed second in series, Joystick v1.1 was only ever detected because an *absent* JoyStick2
+burned 360 ms of its own retries first. Plug a JoyStick2 in and that accidental padding
+disappears. The probe is boot-only, so giving up early marks the unit absent for the whole
+session.
+
 ### Remote control transport layer
 
 All control commands flow through `transmitRemoteCommand(L, R)` → a transport dispatcher selected by `remoteTransportIdx` (`enum RemoteTransport`, persisted to NVS key `txLink`). The payload is the **versioned RemoteFrame**, encoded by the **NessoLink library** (`#include <NessoFrame.h>` → `NessoFrame` + `nessoEncode()`) — the same codec the robot receiver uses (repo: `github.com/ugursayar/NessoLink`, public and in the Arduino Library Registry since 1.1.0; local dev clone at `D:\packages\arduino\user\libraries\NessoLink`). The firmware only fills a `NessoFrame` (motors from `transmitCmd`, `remoteAux*`/`remoteAux2*`, `remoteButtonBits()`, `++remoteSeq`); the byte layout, CRC-8, and `NESSO_*` constants live in the library. `nessoEncode()` emits the **minimal** version that fits the data: **v1 (15 bytes)** for drive + ≤1 aux stick, **v2 (19 bytes)** with a second aux stick, **v3 (25 bytes)** with IMU attitude, **v4 (29 bytes)** with a third aux stick. `nessoDecode()` accepts all four, so a setup that doesn't use the newer fields stays byte-compatible with existing receivers. Each newer version is a pure append — v3 keeps v2's aux2 slots and v4 keeps both, zero-filled when unused. Wire layout (little-endian, CRC-8 checked):
@@ -216,7 +272,7 @@ All control commands flow through `transmitRemoteCommand(L, R)` → a transport 
 
 **The transmitter never promotes the wire version implicitly.** v3 needs `ctrlImuFrame` ("IMU TX"), v4 needs `ctrlAux3Frame` ("AUX3 TX"), both **default OFF**. This is not caution for its own sake: `nessoDecode()` rejects an unknown version byte, and `transmitRemoteStop()` deliberately does *not* clear `remoteHasAux*`/`remoteHasImu` — so a version the receiver rejects makes the **all-stop frame unreceivable**. Auto-promoting on hotplug would mean plugging in a joystick silently disabled the robot's stop. A 4th device with AUX3 TX off is read, drawn, and labelled **SPARE**.
 
-Aux slots are **role-typed, not device-typed** — which device sits in a slot is now user configuration. Receivers must be written against "aux slot 2", never "the Mini JoyC". Button bits *are* device-bound and are **not** renumbered by reordering (`NESSO_BTN_STICK` is always the Mini JoyC click). A tilt/IMU input in an aux slot rides as post-deadzone **deflection**, never as attitude counts — attitude only ever appears in the `imu*` fields, and both can be present in one frame from the same sensor.
+Aux slots are **role-typed, not device-typed** — which device sits in a slot is now user configuration. Receivers must be written against "aux slot 2", never "the Mini JoyC". Button bits *are* device-bound and are **not** renumbered by reordering (`NESSO_BTN_STICK` is always the Mini JoyC click, `NESSO_BTN_STICK2` the JoyStick2 click, `NESSO_BTN_STICK3` — bit 8, added in NessoLink after 1.3.0 — the Joystick v1.1 click). STICK3 names a bit that was already on the wire as a reserved zero inside the existing 16-bit field: no frame version, length or CRC coverage changes, and an older receiver simply never sees it set. A tilt/IMU input in an aux slot rides as post-deadzone **deflection**, never as attitude counts — attitude only ever appears in the `imu*` fields, and both can be present in one frame from the same sensor.
 
 **Every axis in the frame is -255..255** — motors, aux and IMU alike — so a receiver needs exactly one dead-zone constant, and no sensor's raw span ever reaches the wire (`auxAxisToWire()` / `imuAngleToWire()` / `imuYawToWire()` rescale; swapping in a unit with a different range must not silently change what the protocol means). IMU counts convert back with a full scale **baked into the protocol**, not a local constant: `NESSO_IMU_ANGLE_FS_DEG` (90°) and `NESSO_IMU_YAW_FS_DPS` (250 °/s), via `nessoImuDeg()` / `nessoImuYawDps()`. Specified in `NessoFrame.h` since NessoLink **1.1.2** (IMU since **1.2.0**) — the header is vendored verbatim into receiver sketches, so re-vendor both ends together or they silently disagree.
 
@@ -238,7 +294,7 @@ Selectable from Controller settings ("TX LINK" row, item 6) or serial `ctrl link
 
 Two independent mechanisms, because a released stick that doesn't stop the robot is the worst failure this firmware has:
 
-**1. A released stick must mix to exactly zero.** Every stick applies the shared deadzone (`CTRL_DEADZONE_VALS[ctrlDeadzoneIdx]`) at read time — including the **seesaw**, whose centre is only *lazy-captured* on the first read, and the **IMU tilt stick**, which additionally takes a `max()` with `CTRL_TILT_MIN_DEADZONE` because a hand has no mechanical centre to spring back to (see [Controller: IMU as a tilt stick](#controller-imu-as-a-tilt-stick--frame-axes)). Without it a released seesaw sits a few ADC counts off centre, those counts survive the arcade mix, and the frame carries L/R of ±1..3 forever (a slow creep, not a stop). Because a centred stick mixes to 0 and `readGamePad()` transmits every ~100 ms **even when centred**, the release itself needs nothing else — the next frame is already a stop. `ctrlHasTunableStick()` therefore returns true for any connected stick (it gates the DEADZONE/CALIBRATE rows).
+**1. A released stick must mix to exactly zero.** Every stick applies the shared deadzone (`CTRL_DEADZONE_VALS[ctrlDeadzoneIdx]`) at read time — including the **seesaw** and the **Unit Joystick v1.1**, whose centres are only *lazy-captured* on the first read, and the **IMU tilt stick**, which additionally takes a `max()` with `CTRL_TILT_MIN_DEADZONE` because a hand has no mechanical centre to spring back to (see [Controller: IMU as a tilt stick](#controller-imu-as-a-tilt-stick--frame-axes)). Without it a released seesaw sits a few ADC counts off centre, those counts survive the arcade mix, and the frame carries L/R of ±1..3 forever (a slow creep, not a stop). Because a centred stick mixes to 0 and `readGamePad()` transmits every ~100 ms **even when centred**, the release itself needs nothing else — the next frame is already a stop. `ctrlHasTunableStick()` therefore returns true for any connected stick (it gates the DEADZONE/CALIBRATE rows).
 
 **2. An explicit all-stop when the drive loop stops running.** `transmitRemoteStop()` (motors 0, aux centred, buttons cleared) fires wherever `readGamePad()` stops being called with a non-zero command as the robot's last instruction: **navigating away from the controller screen**, **opening its settings panel** (the panel doesn't poll the stick), and **losing the drive stick mid-session**. It's guarded by `remoteTxActive` — set by `transmitRemoteCommand()`, cleared here — so it's a no-op unless something was actually driving, and fires exactly once.
 
@@ -254,7 +310,13 @@ A receiver failsafe timeout is still the last line of defence — this makes the
 
 ### Device order (`ctrlDevOrder`) — the role model
 
-`uint8_t ctrlDevOrder[CTRL_DEV_COUNT]` is a **permutation** of `CtrlStickDev`, most-important first, persisted as a 4-byte NVS blob (`ctrlOrd`). Every `readGamePad()` cycle `ctrlOrderResolveRoles()` compacts it over the *connected* devices to produce roles **DRIVE, AUX 1, AUX 2, AUX 3** (`ctrlRoleDev[]` / `ctrlRoleCount`).
+`uint8_t ctrlDevOrder[CTRL_DEV_COUNT]` is a **permutation** of `CtrlStickDev`, most-important first, persisted as a `CTRL_DEV_COUNT`-byte NVS blob (`ctrlOrd`). Every `readGamePad()` cycle `ctrlOrderResolveRoles()` compacts it over the *connected* devices to produce roles **DRIVE, AUX 1, AUX 2, AUX 3** (`ctrlRoleDev[]` / `ctrlRoleCount`).
+
+**`CTRL_ROLE_COUNT` (4) is not `CTRL_DEV_COUNT` (5).** The roster is allowed to grow past the number of slots the frame has, so resolution stops at four roles and a connected device that compacts past AUX 3 holds **none** — still read (the read loop runs before roles are assigned), but not drawn and not transmitted. `ctrl order` says so out loud, because a stick that is plugged in, powered and simply ignored looks exactly like a dead unit. Everything role-shaped (`ctrlRoleDev[]`, `ctrlDiscDev[]`, `CTRL_ROLE_LABELS[]`, the disc arrays in `renderControllerMulti()`, `CTRL_SET_MAX_ROWS`) is sized by `CTRL_ROLE_COUNT`; only the order blob and the device tables are sized by `CTRL_DEV_COUNT`.
+
+**Enum order ≠ default priority, and that is the point.** `CtrlStickDev` values are *persisted* — they are the NVS blob's bytes and the integers in a profile's `order` array — so a new device is **appended** to the enum or every stored order silently remaps to different hardware. The compiled default ranking lives separately in `CTRL_DEV_DEFAULT_ORDER` (`JOYC, PAD, JOY2, JOY1, TILT`), which is what `ctrlOrderDefault()` walks. It puts every physical stick **ahead of the IMU** deliberately: the IMU is soldered on and therefore always "connected", so a device ranked below it would take the last role or none the moment it was plugged in — plug in a joystick, find the tilt stick still driving.
+
+**A stored order shorter than the roster is extended, not discarded.** `ctrlOrderExtend()` keeps the stored devices where they are and puts the missing ones at the end in default-priority order — **except that a trailing IMU stays last**. That exception is the whole reason it is not a plain append: the IMU is always connected, so a new stick appended behind it comes last, and someone whose only stick is that new unit would plug it in and find the tilt stick driving. It is *only* the trailing case, because a user who moved the IMU up the list has expressed a preference about who drives, and a device they have never seen must not displace it. Both the NVS blob and a profile's `order` array go through it, so a firmware update never silently resets the mapping.
 
 This replaced the scalar `ctrlPrimaryDev`, which could only express "who drives" **and was rewritten by four separate snap-to-connected sites**. That silently destroyed user intent: unplug the stick you had chosen as primary and the next `saveSettings()` persisted the substitute. A stored permutation needs no snapping — compaction happens at read time and is never written back, so an unplugged device keeps its position and returns to it when re-plugged. All four snap sites are gone; `ctrlPrimaryDev()` is now a *function* returning `ctrlRoleDev[0]`, deliberately so the compiler catches any reintroduced assignment.
 
@@ -278,14 +340,14 @@ Boot order matters: `loadSettings()` (NVS) runs *before* `LittleFS.begin()`, so 
 
 The browser is a **sub-level inside `NAV_SETTINGS`** (`ctrlSetLevel`), not a new `navState`, so the `transmitRemoteStop()` that fires on entering settings keeps the drive loop stopped for the whole browsing session. No on-device rename or delete: this firmware has no text entry, and the only long-press available is KEY1 = APPLY — binding "destroy this profile" to the apply button is how people lose configurations. Use `ctrl prof del` or the web file manager.
 
-### Multi-stick (1–4 devices: seesaw + Mini JoyC + Unit JoyStick2 + the IMU tilt stick)
+### Multi-stick (seesaw + Mini JoyC + a Grove unit + the IMU tilt stick)
 
-**Four is the ceiling, and three of them are the physical limit.** The three joysticks sit on three distinct connectors (main `GPIO10/8`, HAT `GPIO6/7`, Grove `GPIO5/4`) driven by the one HP I2C peripheral, time-multiplexed by re-pinning — so all three *can* be connected at once. A fourth physical stick is impossible (one seesaw header, one HAT slot, one Grove port), which is why `CTRL_DEV_COUNT` is 4 and stops there. Two conflicts to know: the **Mini JoyC HAT and Speaker Hat 2 share GPIO6/7** (only one fits the slot, but nothing in software stops both being enabled), and **JoyStick2 excludes RFID2 / IR / RF433** (one Grove port).
+**Five in the roster, four roles, three connectors.** The joysticks sit on three distinct connectors (main `GPIO10/8`, HAT `GPIO6/7`, Grove `GPIO5/4`) driven by the one HP I2C peripheral, time-multiplexed by re-pinning — so three physical sticks *can* be connected at once, and the IMU makes four live devices. `CTRL_DEV_COUNT` is **5** because the Grove port has two supported units (JoyStick2 `0x63` and Joystick v1.1 `0x52`); they are different addresses, so both can be present behind an I2C hub, but one port normally means one unit. The frame carries **four** roles (`CTRL_ROLE_COUNT`), so a fifth connected device holds none — see [Device order](#device-order-ctrldevorder--the-role-model). Two conflicts to know: the **Mini JoyC HAT and Speaker Hat 2 share GPIO6/7** (only one fits the slot, but nothing in software stops both being enabled), and **a Grove stick excludes RFID2 / IR / RF433** (one Grove port). Note also that two Grove sticks on a hub cost **two** bus-switch windows per cycle, not one.
 
 **Cycle budget.** `readSeesawAxes()` used to take 4 samples with `delay(10)` between them — ~40 ms of the 100 ms tick spent in `delay()` alone, before the two bus-switch windows. It now keeps a **4-deep rolling ring, one sample per cycle**: same smoothing, same effective time constant (the cycle *is* the sample interval), no delay. Measured cycle went from tens of ms to **~7 ms** with three devices live. `ctrlCycleMs` is reported by the `ctrl` command — it is the number that says whether the ~10 Hz cadence the receiver failsafe is sized against is still being met.
 
 
-Up to **three** joysticks can be connected at once — they live on three separate I2C buses (seesaw = main GPIO10/8, Mini JoyC = HAT GPIO6/7, JoyStick2 = Grove GPIO5/4) so any combination coexists. `connectedStickCount()` (0..3) drives controller-screen visibility, the role logic, and the settings rows.
+Up to **three** joysticks can be connected at once — they live on three separate I2C buses (seesaw = main GPIO10/8, Mini JoyC = HAT GPIO6/7, JoyStick2 *or* Joystick v1.1 = Grove GPIO5/4) so any combination coexists. `connectedStickCount()` (0..`CTRL_DEV_COUNT`) drives controller-screen visibility, the role logic, and the settings rows.
 
 **Roles** (resolved every `readGamePad()` cycle): one stick **drives** (full pipeline → `leftMotor`/`rightMotor`), the rest become **aux** sticks. The `CtrlStickDev` enum (`SEESAW=0, MINIJOYC=1, JOYSTICK2=2, IMU=3`) is the **canonical order** used for aux assignment. The drive device is `ctrlPrimaryDev` (NVS `ctrlPrim`, default `MINIJOYC`; migrated from the old `dualPriMJC` bool) **if it's connected**, else the first connected device; the remaining connected devices become **aux1, aux2** in canonical order. Aux1 → `auxX`/`auxY` + `flags` bit0; aux2 → `aux2X`/`aux2Y` + `flags` bit1 (which promotes the frame to v2). `readGamePad()` reads each connected stick into a per-device screen-relative `(rx,ry)` (`devRx[]`/`devRy[]`), then assigns roles. `ctrlDriveLabel`/`ctrlAux1Label`/`ctrlAux2Label` (device names) are resolved for the render. Set the primary via the "PRIMARY" settings row (cycles connected devices, shown when ≥2 sticks) or serial `ctrl primary pad|joyc|joy2|tilt`. All stick click-buttons merge into the frame (Mini JoyC → `STICK`, JoyStick2 → `STICK2`; the tilt stick has no button). With four sticks connected only three get roles — the frame has two aux slots — so the fourth is read but unused. `renderController()` branches to `renderControllerMulti(n)` showing **n stick discs** (drive + aux1 [+ aux2]) when ≥2 are connected.
 
@@ -329,4 +391,4 @@ The Controller **settings screen** is device-aware: `controllerSettingsItemCount
 
 **Row position is data, not index arithmetic.** `ctrlSetBuildRows()` fills `ctrlSetRows[]` with `{label, value, disabled, action, role}`, and the renderer, the KEY1 action handler, the KEY2 cursor wrap, the swipe bounds and the tap hit-test all consume that one table. Before this, each of those carried its own copy of the layout — a hardcoded array size, a hand-walked "dynamic rows start at index 7" `default:` case, and a `disabled` mask written as index literals — so adding a row meant editing all of them in step, and missing one gave either a stack overflow or a tap that silently actioned the wrong setting. **Dispatch on `row.action`, never on `settingsCursor`.** The three IMU rows are always present rather than gated on `imuAvailable`: the BMI270 is soldered on, so a missing one means a failed init, and a greyed-out row says that far more usefully than a row that silently disappears. `CTRL_SET_FIXED_ROWS`, `CTRL_SET_MAX_ROWS`, `SENSOR_SET_ITEMS` and the row struct are declared near the top of the sketch because the key/tap/swipe handlers run long before the render code.
 
-`settingsCursor` is **clamped** at the top of `renderControllerSettings()` and the tap handler. Nothing clamped it before, which was survivable only while the row count never shrank under a parked cursor — the PROFILE row and the per-role rows make it shrink (switch a profile, unplug a device), and an out-of-range cursor renders a blank, untappable panel. Title is "QUAD/TRIPLE/DUAL STICK SETTINGS" by count, else "MINIJOYC/JOYSTICK2/GAMEPAD/TILT SETTINGS". CALIBRATE/DEADZONE are active whenever any stick is connected (`ctrlHasTunableStick()`): the deadzone is shared by all three (see [Guaranteeing the robot stops](#guaranteeing-the-robot-stops)), and CALIBRATE runs `ctrlCalibrateAll()`, which re-centres **every** connected device in one action (see [Calibration](#calibration)) — not just the first one that matches. The count is centralized in that helper — render, tap, cursor-wrap (`onKey2Short`), and swipe-bound (`onSwipe`) all call it. Serial equivalents: `ctrl order`, `ctrl drive|aux1|aux2|aux3 <dev>`, `ctrl ssmount 0-3`, `ctrl dz`, `ctrl calibrate`, `ctrl lock on|off`, `ctrl tilt on|off`, `ctrl tiltrange 0-3`, `ctrl imutx on|off`, `ctrl aux3tx on|off`, `ctrl prof ...`, plus `imu` / `imu zero` / `imu level`.
+`settingsCursor` is **clamped** at the top of `renderControllerSettings()` and the tap handler. Nothing clamped it before, which was survivable only while the row count never shrank under a parked cursor — the PROFILE row and the per-role rows make it shrink (switch a profile, unplug a device), and an out-of-range cursor renders a blank, untappable panel. Title is "5-STICK/QUAD/TRIPLE/DUAL STICK SETTINGS" by count, else "MINIJOYC/JOYSTICK2/JOYSTICK/GAMEPAD/TILT SETTINGS". The single-stick render path resolves *which* solo unit from `ctrlDiscDev[0]` (the resolved drive device) rather than a chain of availability flags — only one device is connected on that path, and the flag chain had to be extended for every new module. CALIBRATE/DEADZONE are active whenever any stick is connected (`ctrlHasTunableStick()`): the deadzone is shared by all three (see [Guaranteeing the robot stops](#guaranteeing-the-robot-stops)), and CALIBRATE runs `ctrlCalibrateAll()`, which re-centres **every** connected device in one action (see [Calibration](#calibration)) — not just the first one that matches. The count is centralized in that helper — render, tap, cursor-wrap (`onKey2Short`), and swipe-bound (`onSwipe`) all call it. Serial equivalents: `ctrl order` (devices: `pad|joyc|joy2|joy1|tilt`), `ctrl drive|aux1|aux2|aux3 <dev>`, `ctrl ssmount 0-3`, `ctrl dz`, `ctrl calibrate`, `ctrl lock on|off`, `ctrl tilt on|off`, `ctrl tiltrange 0-3`, `ctrl imutx on|off`, `ctrl aux3tx on|off`, `ctrl prof ...`, plus `imu` / `imu zero` / `imu level`.

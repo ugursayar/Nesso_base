@@ -2,7 +2,7 @@
 
 ![Arduino Nesso N1 running the multi-stick controller screen, with three joystick inputs connected](assets/20260722_140133.jpg)
 
-Arduino firmware for the **Arduino Nesso N1** handheld controller — a WiFi-enabled base station that drives a remote robot platform over a selectable wireless link (WiFi-UDP/TCP, BLE, LoRa). Features a 240×135px TFT display with a multi-mode menu, battery monitoring, 1–3 stick gamepad input (Adafruit seesaw, M5Stack Mini JoyC HAT, and/or M5Stack Unit JoyStick2), IR and 433 MHz RF remote control, RFID card scanning, and a web-based file manager.
+Arduino firmware for the **Arduino Nesso N1** handheld controller — a WiFi-enabled base station that drives a remote robot platform over a selectable wireless link (WiFi-UDP/TCP, BLE, LoRa). Features a 240×135px TFT display with a multi-mode menu, battery monitoring, 1–3 stick gamepad input (Adafruit seesaw, M5Stack Mini JoyC HAT, and/or an M5Stack Grove joystick unit), IR and 433 MHz RF remote control, RFID card scanning, and a web-based file manager.
 
 ## Table of Contents
 
@@ -29,13 +29,14 @@ Arduino firmware for the **Arduino Nesso N1** handheld controller — a WiFi-ena
   - M5Stack RF433T + RF433R units (Y-cable) — 433 MHz remote learn/transmit
   - M5Stack RFID2 Unit (WS1850S) — ISO/IEC 14443-A card scanning
   - M5Stack Unit JoyStick2 (STM32G030, I2C `0x63`) — joystick for robot control (shares the GROVE port with the units above, so one at a time)
+  - M5Stack Unit Joystick v1.1 (MEGA8A, I2C `0x52`) — the original joystick unit; same GROVE port, different address
 - Optional HATs (HAT bus, SDA=GPIO 6 / SCL=GPIO 7):
   - M5Stack Speaker Hat 2 (MAX98357A) — high-quality I2S audio output
   - M5StickC Mini JoyC HAT (STM32F030, I2C `0x54`) — front-mounted joystick for robot control
 - Optional controller:
   - Adafruit seesaw mini gamepad (I2C `0x50`, main Wire) — stick + 6 buttons
 
-The three joysticks live on separate I2C buses, so up to **three** can be connected at once for multi-stick control — plus the board's built-in BMI270 IMU, which can act as a fourth "tilt stick".
+The joysticks live on separate I2C buses (main / HAT / Grove), so up to **three** can be connected at once for multi-stick control — plus the board's built-in BMI270 IMU, which can act as a fourth "tilt stick". The two Grove units share one port, so normally you pick one of them.
 
 **Required libraries:** `Adafruit seesaw`, `Arduino_Nesso_N1`, `MFRC522_I2C` (for RFID2), `NessoLink` (control-frame codec — install from the Arduino IDE Library Manager / `arduino-cli lib install NessoLink`, or clone [github.com/ugursayar/NessoLink](https://github.com/ugursayar/NessoLink) into your Arduino `libraries/` folder)
 
@@ -483,13 +484,16 @@ Controller mode reads a joystick and transmits motor + button commands to a remo
 | Adafruit seesaw mini gamepad | I2C `0x50` (main Wire) | Stick + A/B/X/Y/SELECT/START |
 | M5Stack Mini JoyC HAT (STM32F030) | I2C `0x54` (HAT bus, GPIO 6/7) | Stick + button; self-powered |
 | M5Stack Unit JoyStick2 (STM32G030) | I2C `0x63` (GROVE bus, GPIO 5/4) | Stick + button; GROVE 5V powered |
+| M5Stack Unit Joystick v1.1 (MEGA8A) | I2C `0x52` (GROVE bus, GPIO 5/4) | Stick + button; GROVE 5V powered. Raw ADC — the centre is captured on entry / by CALIBRATE. Slow to wake on a cold rail, so the first few frames after entering the Controller screen read centred |
 | Built-in BMI270 IMU ("tilt stick") | on-board | Tilt the device itself; no button. **On by default** — disable with `TILT STK` |
 
-The three joysticks use three separate connectors (main / HAT / Grove), so **all three can be
-plugged in at once** — plus the IMU, giving **four live devices**. A *fourth physical* stick is
-not possible: there is one seesaw header, one HAT slot and one Grove port. Two conflicts worth
-knowing: the Mini JoyC HAT and the Speaker Hat 2 use the same pins (GPIO 6/7), and the
-JoyStick2 occupies the Grove port, so it can't share with RFID2 / IR / RF433.
+The joysticks use three separate connectors (main / HAT / Grove), so **three can be plugged in
+at once** — plus the IMU, giving **four live devices**, which is exactly what the frame carries
+(drive + three aux). A *fourth physical* stick needs a Grove I2C hub: JoyStick2 and Joystick
+v1.1 have different addresses and both work, but with five devices connected the lowest-ranked
+one holds no role — `ctrl order` tells you which. Two conflicts worth knowing: the Mini JoyC
+HAT and the Speaker Hat 2 use the same pins (GPIO 6/7), and a Grove joystick occupies the Grove
+port, so it can't share with RFID2 / IR / RF433.
 
 - **1 device** → it drives the motors directly.
 - **2 devices** → one drives, the other is an **aux** stick (camera/turret → `auxX`/`auxY`).
@@ -499,13 +503,16 @@ JoyStick2 occupies the Grove port, so it can't share with RFID2 / IR / RF433.
 
 ### Device order
 
-The order is fully configurable — not just "who drives". It's a stored ranking of all four
-devices, and the roles **DRIVE / AUX 1 / AUX 2 / AUX 3** are handed out top-down over
-whichever devices are actually connected.
+The order is fully configurable — not just "who drives". It's a stored ranking of every
+supported device, and the roles **DRIVE / AUX 1 / AUX 2 / AUX 3** are handed out top-down over
+whichever devices are actually connected. There are four roles, so a fifth connected device
+takes none.
 
 - On screen: one settings row per role. KEY1 cycles which connected device holds it.
 - Serial: `ctrl order` to see it, `ctrl order tilt,pad` to set it (any subset — the rest keep
   their relative order), or `ctrl drive|aux1|aux2|aux3 <dev>` for a single role.
+  Device names: `pad` (seesaw), `joyc` (Mini JoyC), `joy2` (JoyStick2), `joy1` (Joystick v1.1),
+  `tilt` (IMU).
 
 Unplugging a device doesn't rewrite your order — it just takes no role until it's back, and
 then returns to exactly the slot you gave it. `ctrl order` prints absent devices in lowercase.
@@ -514,7 +521,7 @@ before the new stick takes over, so the robot never jumps from the old stick's l
 straight to the new stick's resting position.
 
 The Controller screen shows one disc per role — **two rows in portrait, four across in
-landscape**. The Mini JoyC, JoyStick2 and tilt stick always follow screen rotation; the seesaw
+landscape**. The Mini JoyC, both Grove units and the tilt stick always follow screen rotation; the seesaw
 follows it only in attached `MOUNT` modes (see below). With `SCR LOCK` on (the default) the
 screen doesn't rotate while you're on the Controller screen, so "screen rotation" there means
 the orientation you navigated in with.
@@ -616,7 +623,7 @@ Open controller settings with **long-press KEY1**, or use the `ctrl …` serial 
 
 | Setting | Options |
 |---|---|
-| **CALIBRATE** | Mini JoyC: write center to its STM32 flash · seesaw: re-zero on next read · JoyStick2: self-centres (no manual cal) |
+| **CALIBRATE** | One tap, every connected device. Mini JoyC: write center to its STM32 flash · seesaw and Joystick v1.1: re-capture centre on next read · JoyStick2: self-centres (no manual cal) · tilt stick: re-zero attitude + gyro bias |
 | **DEADZONE** | Rest-position deadzone applied to **all** sticks: 8 / 16 / 30 / 50 |
 | **SWAP XY / INVERT X / INVERT Y** | drive-stick axis transforms |
 | **TX LINK** | wireless link (table above) |
@@ -660,13 +667,13 @@ Connect at **115200 baud**. Commands work over both USB serial and BLE UART (`ne
 | `ctrl link udp\|ble\|tcp\|lora` | Select wireless link |
 | `ctrl order` | Show the device order and the roles it resolves to |
 | `ctrl order <list>` | Set the order, e.g. `ctrl order tilt,pad` (any subset, best first) |
-| `ctrl drive\|aux1\|aux2\|aux3 <dev>` | Put one device in one role (`pad\|joyc\|joy2\|tilt`) |
+| `ctrl drive\|aux1\|aux2\|aux3 <dev>` | Put one device in one role (`pad\|joyc\|joy2\|joy1\|tilt`) |
 | `ctrl aux3tx on\|off` | Send the 3rd aux stick — v4 frame, needs a NessoLink 1.3.0+ receiver (default `off`) |
 | `ctrl prof` | List profiles and show the active one |
 | `ctrl prof new\|use\|del <name>` | Create from current settings / switch to / delete |
 | `ctrl prof save` | Write the current settings back to the active profile |
 | `ctrl prof default` | Clear the active profile (settings unchanged) |
-| `ctrl primary pad\|joyc\|joy2\|tilt` | Alias for `ctrl drive` |
+| `ctrl primary pad\|joyc\|joy2\|joy1\|tilt` | Alias for `ctrl drive` |
 | `ctrl ssmount 0-3` | Seesaw mount: `side`/`back` (attached) · `detport`/`detland` (detached) |
 | `ctrl lock on\|off` | Screen lock — hold the screen orientation while on the controller screen (default `on`) |
 | `ctrl tilt on\|off` | Use the built-in IMU as a tilt stick (default `on`) |

@@ -407,6 +407,21 @@ uint32_t miniJoyCLedColor    = 0;      // last LED color written to Mini JoyC
 bool     joystick2Available  = false;  // set at boot by probing Unit JoyStick2 (0x63) on Grove bus
 bool     joystick2Btn        = false;  // current JoyStick2 button state (true = pressed)
 uint32_t joystick2LedColor   = 0xFFFFFFFF;  // last LED color written (force first write)
+bool     joystick1Available  = false;  // set at boot by probing Unit Joystick v1.1 (0x52) on Grove bus
+bool     joystick1Btn        = false;  // current Joystick v1.1 button state (true = pressed)
+// The v1.1 unit hands out RAW 8-bit ADC — unlike JoyStick2 it does not centre itself — so
+// the resting position is lazy-captured, exactly like the seesaw. Re-armed on every
+// controller-screen entry and by CALIBRATE; see readJoystick1Axes().
+bool     joystick1CentreArmed = true;
+uint8_t  joystick1CentreX     = 128, joystick1CentreY = 128;
+// Previous raw sample, so the centre is only captured once two reads agree — see
+// readJoystick1Axes(). Reset with the arm.
+uint8_t  joystick1PrevX = 128, joystick1PrevY = 128;
+bool     joystick1HavePrev    = false;
+// Set once the unit has been seen reporting the RELEASED level; until then the button
+// never registers. See the polarity note at JOYSTICK1_BTN_PRESSED.
+bool     joystick1BtnArmed    = false;
+uint8_t  joystick1RawX = 128, joystick1RawY = 128, joystick1RawBtn = 1;  // last read, for `ctrl`
 // Deadzone in calibrated ±512 units from STM32 registers 0x10/0x12
 static const int CTRL_DEADZONE_VALS[]  = {8, 16, 30, 50};
 static const int CTRL_DEADZONE_COUNT   = 4;
@@ -453,7 +468,7 @@ int16_t  joyDisplayY = 0;
 uint32_t gamepadButtons = 0xFFFFFFFF;  // all bits 1 = all released (active LOW)
 
 // Multi-stick: up to three joysticks can be connected at once — the seesaw gamepad
-// (main bus), the Mini JoyC HAT (HAT bus) and the Unit JoyStick2 (Grove bus). One
+// (main bus), the Mini JoyC HAT (HAT bus) and a Grove unit (JoyStick2 or Joystick v1.1). One
 // drives (full pipeline → L/R motor mix); the rest become aux sticks (camera/turret/
 // arm → auxX/auxY [+ aux2X/aux2Y when a third stick is present] in the frame).
 //   joyDisplayX/Y   = drive stick (shown 1st)        — visualisation
@@ -469,15 +484,34 @@ uint32_t gamepadButtons = 0xFFFFFFFF;  // all bits 1 = all released (active LOW)
 // the aux → RemoteFrame mapping in readGamePad(). Copying a *Display* pair
 // straight into a frame's X/Y fields transposes the axes on the wire while the
 // screen still looks correct; that was a real shipped bug.
-enum CtrlStickDev {                       // canonical order (drives aux assignment too)
+// These values are PERSISTED — they are the bytes of the NVS `ctrlOrd` blob and the
+// integers in a profile's "order" array. A new device is therefore APPENDED here, never
+// inserted, or every stored order silently remaps to different hardware. The sensible
+// default *priority* is a separate table (CTRL_DEV_DEFAULT_ORDER, below).
+enum CtrlStickDev {
   CTRL_DEV_SEESAW    = 0,
   CTRL_DEV_MINIJOYC  = 1,
   CTRL_DEV_JOYSTICK2 = 2,
   CTRL_DEV_IMU       = 3,   // the on-board BMI270 as a tilt stick — opt-in, see ctrlImuStick
-  CTRL_DEV_COUNT     = 4,
+  CTRL_DEV_JOYSTICK1 = 4,   // M5 Unit Joystick v1.1 (MEGA8A, 0x52) — the original Grove unit
+  CTRL_DEV_COUNT     = 5,
 };
-static const char* CTRL_DEV_LABELS[CTRL_DEV_COUNT] = { "PAD", "JOYC", "JOY2", "TILT" };
-static const char* CTRL_ROLE_LABELS[CTRL_DEV_COUNT] = { "DRIVE", "AUX 1", "AUX 2", "AUX 3" };
+// Roles the frame can actually carry: DRIVE + aux1..aux3. Deliberately NOT CTRL_DEV_COUNT —
+// the roster is allowed to grow past the number of slots on the wire, and a device that
+// compacts past the last role simply holds none (it is not read, drawn or transmitted).
+#define CTRL_ROLE_COUNT 4
+static const char* CTRL_DEV_LABELS[CTRL_DEV_COUNT]   = { "PAD", "JOYC", "JOY2", "TILT", "JOY1" };
+static const char* CTRL_ROLE_LABELS[CTRL_ROLE_COUNT] = { "DRIVE", "AUX 1", "AUX 2", "AUX 3" };
+
+// Compiled default priority, best first. NOT the enum order, and that difference is the
+// point: enum values are persisted, so a new device has to be appended there, while the
+// default priority must put every PHYSICAL stick ahead of the IMU. The IMU is soldered on
+// and therefore always "connected", so anything ranked below it would take the last role
+// or none at all the moment it was plugged in — plug in a joystick and find the tilt stick
+// still driving.
+static const uint8_t CTRL_DEV_DEFAULT_ORDER[CTRL_DEV_COUNT] = {
+  CTRL_DEV_MINIJOYC, CTRL_DEV_SEESAW, CTRL_DEV_JOYSTICK2, CTRL_DEV_JOYSTICK1, CTRL_DEV_IMU
+};
 
 // ── Device order ─────────────────────────────────────────────────
 // A PERMUTATION of CtrlStickDev, most-important first. Every readGamePad() cycle it is
@@ -492,13 +526,15 @@ static const char* CTRL_ROLE_LABELS[CTRL_DEV_COUNT] = { "DRIVE", "AUX 1", "AUX 2
 // written back.
 //
 // Default order keeps today's behaviour exactly: Mini JoyC drives, then seesaw, then
-// JoyStick2, then the IMU tilt stick last (so on a 2-physical + IMU rig the IMU is the
-// spare, which is also the cheapest arrangement on the wire).
+// JoyStick2, then Joystick v1.1, then the IMU tilt stick last (so on a 2-physical + IMU
+// rig the IMU is the spare, which is also the cheapest arrangement on the wire). The
+// ordering lives in CTRL_DEV_DEFAULT_ORDER — see the note there on why it is not the enum.
 uint8_t  ctrlDevOrder[CTRL_DEV_COUNT] = { CTRL_DEV_MINIJOYC, CTRL_DEV_SEESAW,
-                                          CTRL_DEV_JOYSTICK2, CTRL_DEV_IMU };
+                                          CTRL_DEV_JOYSTICK2, CTRL_DEV_JOYSTICK1,
+                                          CTRL_DEV_IMU };
 
 // Roles resolved from the order + the connection snapshot, refreshed every cycle.
-int      ctrlRoleDev[CTRL_DEV_COUNT] = { -1, -1, -1, -1 };   // role index → device, -1 = none
+int      ctrlRoleDev[CTRL_ROLE_COUNT] = { -1, -1, -1, -1 };   // role index → device, -1 = none
 int      ctrlRoleCount = 0;                                   // how many roles are filled
 
 // ── IMU as a control source ──────────────────────────────────────
@@ -575,33 +611,38 @@ const char* ctrlAux3Label  = "";
 // Resolved alongside the labels; the render needs it to give the IMU disc its own
 // visualisation (a label string comparison would work but silently breaks if two devices
 // are ever renamed the same).
-int ctrlDiscDev[CTRL_DEV_COUNT] = { -1, -1, -1, -1 };
+int ctrlDiscDev[CTRL_ROLE_COUNT] = { -1, -1, -1, -1 };
 
-// How many joysticks are connected (0..3) — drives role assignment, the controller
-// screen visibility, the multi-disc view, and the PRIMARY settings row.
+// How many inputs are connected (0..CTRL_DEV_COUNT) — drives role assignment, the
+// controller screen visibility, the multi-disc view, and the role settings rows. Note it
+// can exceed CTRL_ROLE_COUNT: the roster is bigger than the frame has slots for.
 // True when the on-board IMU is acting as a stick (present AND opted in).
 static inline bool imuStickActive() { return imuAvailable && ctrlImuStick; }
 
 static inline int connectedStickCount() {
   return (joystickAvailable ? 1 : 0) + (miniJoyCAvailable ? 1 : 0) +
-         (joystick2Available ? 1 : 0) + (imuStickActive() ? 1 : 0);
+         (joystick2Available ? 1 : 0) + (joystick1Available ? 1 : 0) +
+         (imuStickActive() ? 1 : 0);
 }
 // True when a stick with a software deadzone / settable centre is present. Gates the
-// DEADZONE/CALIBRATE rows. All three sticks qualify: the deadzone is shared by all of
-// them (the seesaw needs it most — its centre is only lazy-captured, so without one a
-// released stick never mixes to a clean stop), and CALIBRATE re-centres whichever is
-// there (Mini JoyC HW cal, seesaw lazy recal; JoyStick2 self-centres).
+// DEADZONE/CALIBRATE rows. Every stick qualifies: the deadzone is shared by all of
+// them (the seesaw and Joystick v1.1 need it most — their centres are only lazy-captured,
+// so without one a released stick never mixes to a clean stop), and CALIBRATE re-centres
+// there (Mini JoyC HW cal, seesaw and Joystick v1.1 lazy recal; JoyStick2 self-centres).
 static inline bool ctrlHasTunableStick() {
-  return joystickAvailable || miniJoyCAvailable || joystick2Available || imuStickActive();
+  return joystickAvailable || miniJoyCAvailable || joystick2Available ||
+         joystick1Available || imuStickActive();
 }
 // Short text describing the connected controller setup, for serial output.
 static const char* controllerDeviceDesc() {
   int n = connectedStickCount();
   if (n == 0) return "none";
-  if (n >= 4) return "quad";
-  if (n >= 3) return "triple";
+  if (n >= 5) return "quint";
+  if (n == 4) return "quad";
+  if (n == 3) return "triple";
   if (n == 2) return "dual";
   if (joystick2Available) return "joystick2";
+  if (joystick1Available) return "joystick1";
   if (miniJoyCAvailable)  return "minijoyc";
   if (imuStickActive())   return "tilt";
   return "seesaw";
@@ -610,6 +651,7 @@ static inline bool stickDevAvailable(int dev) {
   return (dev == CTRL_DEV_SEESAW    && joystickAvailable)  ||
          (dev == CTRL_DEV_MINIJOYC  && miniJoyCAvailable)  ||
          (dev == CTRL_DEV_JOYSTICK2 && joystick2Available) ||
+         (dev == CTRL_DEV_JOYSTICK1 && joystick1Available) ||
          (dev == CTRL_DEV_IMU       && imuStickActive());
 }
 // Calibrate every connected input in one action; defined with the controller code, below
@@ -634,7 +676,7 @@ static inline int ctrlPrimaryDev() { return ctrlRoleDev[0] >= 0 ? ctrlRoleDev[0]
 // defensive dressing: the values index devOn[] and CTRL_DEV_LABELS[], so a duplicate or an
 // out-of-range byte from a corrupt/older NVS blob would read past the end of both.
 static bool ctrlOrderValid(const uint8_t* o) {
-  bool seen[CTRL_DEV_COUNT] = { false, false, false, false };
+  bool seen[CTRL_DEV_COUNT] = {};
   for (int i = 0; i < CTRL_DEV_COUNT; i++) {
     if (o[i] >= CTRL_DEV_COUNT || seen[o[i]]) return false;
     seen[o[i]] = true;
@@ -648,14 +690,53 @@ static void ctrlOrderDefault(uint8_t* o, int primary) {
   if (primary < 0 || primary >= CTRL_DEV_COUNT) primary = CTRL_DEV_MINIJOYC;
   int n = 0;
   o[n++] = (uint8_t)primary;
-  for (int d = 0; d < CTRL_DEV_COUNT; d++) if (d != primary) o[n++] = (uint8_t)d;
+  for (int i = 0; i < CTRL_DEV_COUNT; i++) {         // default PRIORITY, not enum order
+    uint8_t d = CTRL_DEV_DEFAULT_ORDER[i];
+    if (d != (uint8_t)primary) o[n++] = d;
+  }
+}
+
+// Fill a PARTIAL order out to the full roster — an NVS blob or profile array written by a
+// firmware that knew fewer devices. The stored devices keep their positions (that is the
+// user's configuration); the missing ones go at the END in default-priority order, with
+// ONE exception: if the stored order ENDS WITH THE IMU they go in front of it.
+//
+// That exception is the whole reason this is not a plain append. The IMU is soldered on, so
+// it is always "connected" and always takes a role; a new physical stick appended behind it
+// would come last, and someone whose only stick is that new unit would plug it in and find
+// the tilt stick still driving. A trailing IMU means "the spare goes last" — the default,
+// and exactly the slot a new stick belongs in front of.
+//
+// It is only the TRAILING case, deliberately. A user who moved the IMU up the list has
+// expressed a preference about who drives, and a device they have never seen must not
+// displace it — so there, append.
+//
+// Returns false if what was stored is not a valid partial permutation.
+static bool ctrlOrderExtend(uint8_t* o, int have) {
+  if (have < 1 || have > CTRL_DEV_COUNT) return false;
+  bool seen[CTRL_DEV_COUNT] = {};
+  for (int i = 0; i < have; i++) {
+    if (o[i] >= CTRL_DEV_COUNT || seen[o[i]]) return false;
+    seen[o[i]] = true;
+  }
+  int n  = have;
+  int at = (o[have - 1] == CTRL_DEV_IMU) ? have - 1 : have;   // in front of a trailing IMU
+  for (int k = 0; k < CTRL_DEV_COUNT; k++) {
+    uint8_t d = CTRL_DEV_DEFAULT_ORDER[k];
+    if (seen[d]) continue;
+    for (int i = n; i > at; i--) o[i] = o[i - 1];
+    o[at++] = d;                                   // keep default priority among the new ones
+    seen[d] = true;
+    n++;
+  }
+  return n == CTRL_DEV_COUNT;
 }
 
 // Put `dev` in `role`, keeping every other device's relative order — a rotate, not a swap.
 // A swap would fling whatever held the role to wherever `dev` came from, which reads as
 // random when the user is stepping a row through the device list.
 static void ctrlOrderSetRole(int role, int dev) {
-  if (role < 0 || role >= CTRL_DEV_COUNT || dev < 0 || dev >= CTRL_DEV_COUNT) return;
+  if (role < 0 || role >= CTRL_ROLE_COUNT || dev < 0 || dev >= CTRL_DEV_COUNT) return;
   uint8_t out[CTRL_DEV_COUNT];
   int n = 0;
   out[n++] = (uint8_t)dev;
@@ -671,10 +752,15 @@ static void ctrlOrderSetRole(int role, int dev) {
 // Compact the order over the connected devices → roles. Disconnected devices keep their
 // stored position but take no role, so unplugging shifts everything below up by one and
 // re-plugging puts it back exactly where the user left it.
+// Stops at CTRL_ROLE_COUNT: the roster is larger than the number of slots the frame has,
+// so a connected device that compacts past AUX 3 holds no role at all: it is still read
+// (the read loop runs before roles are assigned) but it is not drawn and not transmitted.
+// `ctrl order` says so explicitly, because a silently ignored stick otherwise looks like a
+// dead unit.
 static void ctrlOrderResolveRoles(const bool* devOn, int* roleDev, int& roleCount) {
   roleCount = 0;
-  for (int i = 0; i < CTRL_DEV_COUNT; i++) roleDev[i] = -1;
-  for (int i = 0; i < CTRL_DEV_COUNT; i++) {
+  for (int i = 0; i < CTRL_ROLE_COUNT; i++) roleDev[i] = -1;
+  for (int i = 0; i < CTRL_DEV_COUNT && roleCount < CTRL_ROLE_COUNT; i++) {
     int d = ctrlDevOrder[i];
     if (d < CTRL_DEV_COUNT && devOn[d]) roleDev[roleCount++] = d;
   }
@@ -685,6 +771,7 @@ static void ctrlDevOnSnapshot(bool* devOn) {
   devOn[CTRL_DEV_SEESAW]    = joystickAvailable;
   devOn[CTRL_DEV_MINIJOYC]  = miniJoyCAvailable;
   devOn[CTRL_DEV_JOYSTICK2] = joystick2Available;
+  devOn[CTRL_DEV_JOYSTICK1] = joystick1Available;
   devOn[CTRL_DEV_IMU]       = imuStickActive();
 }
 
@@ -694,7 +781,7 @@ static void ctrlDevOnSnapshot(bool* devOn) {
 void ctrlOrderCycleRole(int role) {
   bool devOn[CTRL_DEV_COUNT];
   ctrlDevOnSnapshot(devOn);
-  int roleDev[CTRL_DEV_COUNT], nRole;
+  int roleDev[CTRL_ROLE_COUNT], nRole;
   ctrlOrderResolveRoles(devOn, roleDev, nRole);
   if (role < 0 || role >= nRole) return;
   int cur = roleDev[role];
@@ -1268,6 +1355,60 @@ static void joystick2SetLED(uint32_t rgb888) {
   joystick2LedColor = rgb888;
 }
 
+// ── M5Stack Unit Joystick v1.1 (MEGA8A, I2C 0x52 on the Grove bus G5/G4) ──
+// The ORIGINAL M5 joystick unit — not Unit JoyStick2 (STM32G030, 0x63) above. Different
+// address, so the two can share the Grove bus through a hub; in practice one Grove port
+// means one unit, and JoyStick2 / Joystick v1.1 / RFID2 / IR / RF433 are exclusive there.
+// Reuses the same Wire re-pinning and GROVE_POWER_EN (5V) as the other Grove devices.
+//
+// There is no register file: a 3-byte read of the device address returns the whole state.
+//   [0] X 0..255   [1] Y 0..255   [2] button 0/1
+// Two consequences shape the driver, and both differ from JoyStick2:
+//   * the axes are RAW 8-bit ADC. The unit does NOT centre them (JoyStick2's 0x50 does),
+//     so a released stick sits at whatever its mechanical centre reads — never exactly
+//     128. The centre is therefore lazy-captured like the seesaw's; without that a
+//     released stick never mixes to a clean zero and the robot creeps instead of stopping.
+//   * no LED and no calibration register, so there is nothing to write. Every access is
+//     one 3-byte read, which also means the button comes back in the same transaction as
+//     the axes — one bus window per cycle, like the other units.
+#define JOYSTICK1_ADDR 0x52
+// Only a reading inside this band is accepted as the resting centre. A capture taken while
+// the stick is held would bake that deflection in as "centre", and the robot would then
+// creep the OTHER way with the stick released — the exact failure the capture exists to
+// prevent. Out of band leaves the capture armed, with the nominal 128 in use meanwhile.
+#define JOYSTICK1_CENTRE_MIN  80
+#define JOYSTICK1_CENTRE_MAX 176
+// ...and two consecutive reads must agree this closely before one is taken as the centre.
+// The MEGA8A's first samples on a cold rail are not settled: a centre latched from the very
+// first in-band read was observed 7-9 counts off the true rest position, which is ~30 counts
+// on the ±512 scale — past the dead zone, so it becomes a standing deflection the stick can
+// never return from. Costs one extra 100 ms cycle. Same principle as the IMU refusing to
+// zero its attitude while the device is moving: never take a reference from an unsettled input.
+#define JOYSTICK1_CENTRE_STABLE 2
+// Button polarity. NOT the active-low convention the Mini JoyC and JoyStick2 use: this
+// unit reports 0 while RELEASED (measured over 200+ samples at rest and through a full
+// two-axis sweep, 2026-09-02), so a press is 1.
+//
+// Getting this backwards is the worst kind of wrong — a permanently "pressed" button,
+// latched into every frame the robot receives — so the read also arms itself: the button
+// only ever registers once the unit has been seen reporting the RELEASED level (see
+// joystick1BtnArmed). Right polarity and that happens on the first read at rest, so
+// nothing is different; backwards and the button simply never fires instead of sticking
+// on. That guard is what turned the original wrong guess into a no-op rather than a stuck
+// bit on the wire, and it is why this constant is safe to change from the bench.
+#define JOYSTICK1_BTN_PRESSED 1
+static inline void joystick1WireGrove()   { rfid2WireGrove();   }  // Wire → GPIO5/4
+static inline void joystick1WireRestore() { rfid2WireRestore(); }  // Wire → GPIO10/8
+
+// Read X / Y / button in one 3-byte transaction (no register write — the unit has none).
+// Call with Wire already on the Grove bus. False on a short or NAKed read; the caller then
+// leaves the axes centred and the button released rather than trusting a partial frame.
+static bool joystick1Read(uint8_t& x, uint8_t& y, uint8_t& btn) {
+  if (Wire.requestFrom((uint8_t)JOYSTICK1_ADDR, (uint8_t)3) != 3) return false;
+  x = Wire.read(); y = Wire.read(); btn = Wire.read();
+  return true;
+}
+
 // ----------------------------------------------------------------
 // Navigation
 // ----------------------------------------------------------------
@@ -1315,7 +1456,7 @@ unsigned long key1PressedAt = 0,     key2PressedAt = 0;
 // TX LINK, SCR LOCK, TILT STK, TILT RNG, IMU TX, AUX3 TX.
 #define CTRL_SET_FIXED_ROWS 13
 // Then MOUNT (seesaw present) and one role row per connected device (2+ devices).
-#define CTRL_SET_MAX_ROWS   (CTRL_SET_FIXED_ROWS + 1 + CTRL_DEV_COUNT)
+#define CTRL_SET_MAX_ROWS   (CTRL_SET_FIXED_ROWS + 1 + CTRL_ROLE_COUNT)
 // Sensor: ZERO HERE / LEVEL REF / GYRO ZERO / TILT STK / IMU TX.
 #define SENSOR_SET_ITEMS     5
 
@@ -1556,13 +1697,17 @@ void loadSettings() {
   remoteTransportIdx = constrain((int)p.getUChar("txLink", 0), 0, REMOTE_TX_COUNT - 1);
   // Device order. Three-step migration, newest first, so an upgrade never lands on a
   // nonsense order and a downgrade still drives the right stick:
-  //   ctrlOrd (4-byte permutation)  →  ctrlPrim (old scalar)  →  dualPriMJC (older bool)
+  //   ctrlOrd (permutation blob)  →  ctrlPrim (old scalar)  →  dualPriMJC (older bool)
   // A stored blob is only accepted if it is a genuine permutation — the bytes index
-  // devOn[] and CTRL_DEV_LABELS[], so a corrupt one would read out of bounds.
+  // devOn[] and CTRL_DEV_LABELS[], so a corrupt one would read out of bounds. A blob
+  // written before the roster grew is SHORTER than it is now: it is extended rather than
+  // thrown away, so a firmware update never silently resets the user's device order.
   int primDefault = p.getBool("dualPriMJC", true) ? CTRL_DEV_MINIJOYC : CTRL_DEV_SEESAW;
   int primLegacy  = constrain((int)p.getUChar("ctrlPrim", (uint8_t)primDefault), 0, CTRL_DEV_COUNT - 1);
   uint8_t ordBuf[CTRL_DEV_COUNT];
-  if (p.getBytes("ctrlOrd", ordBuf, sizeof(ordBuf)) == sizeof(ordBuf) && ctrlOrderValid(ordBuf))
+  size_t  ordLen = p.getBytes("ctrlOrd", ordBuf, sizeof(ordBuf));
+  if (ordLen >= 1 && ordLen <= CTRL_DEV_COUNT &&
+      ctrlOrderExtend(ordBuf, (int)ordLen) && ctrlOrderValid(ordBuf))
     memcpy(ctrlDevOrder, ordBuf, sizeof(ctrlDevOrder));
   else
     ctrlOrderDefault(ctrlDevOrder, primLegacy);
@@ -1809,24 +1954,49 @@ void setup() {
     splashLog(rfidMsg, COLOR_GRAY);
   }
 
-  // Probe Unit JoyStick2 on the same GROVE bus (SDA=GPIO5, SCL=GPIO4, I2C addr 0x63)
-  // while GROVE power is still on. It's a third controller input alongside the seesaw
-  // and Mini JoyC. (Physically only one device fits the Grove port, so JoyStick2 and
-  // RFID2 are mutually exclusive in practice, but they're probed independently.)
-  joystick2WireGrove();
-  byte joystick2ProbeErr = 0xFF;
-  for (int t = 0; t < 6 && joystick2ProbeErr != 0; t++) {  // STM32G030 can be slow to ACK after power-on
-    Wire.beginTransmission(JOYSTICK2_ADDR);
-    joystick2ProbeErr = Wire.endTransmission();
-    if (joystick2ProbeErr != 0) delay(60);
+  // Probe BOTH Grove joystick units on the same bus (SDA=GPIO5, SCL=GPIO4) while GROVE
+  // power is still on: Unit JoyStick2 at 0x63 and Unit Joystick v1.1 at 0x52. They are
+  // controller inputs alongside the seesaw and Mini JoyC. (One device fits the Grove port,
+  // so these and RFID2 are mutually exclusive in practice — an I2C hub makes combinations
+  // possible, and every unit is probed independently either way.)
+  //
+  // ONE interleaved retry loop, not two in series, and that matters twice over. Both units
+  // are slow to ACK on a cold rail — the STM32G030 needs ~300 ms and the MEGA8A is not
+  // faster — so interleaving means the pair costs ONE settle budget rather than two. It
+  // also removes an ordering trap that was live in the first version of this code: probed
+  // second in series, Joystick v1.1 was only ever detected because an ABSENT JoyStick2
+  // burned 360 ms of its own retries ahead of it; plug a JoyStick2 in and that accidental
+  // padding disappears. A boot-only probe that gives up early marks the unit absent for
+  // the entire session, which is the flakiness this loop exists to prevent. Worst case
+  // (neither present) is 600 ms of boot.
+  joystick2WireGrove();                     // one bus, one power window, both addresses
+  byte joystick2ProbeErr = 0xFF, joystick1ProbeErr = 0xFF;
+  for (int t = 0; t < 12 && (joystick2ProbeErr != 0 || joystick1ProbeErr != 0); t++) {
+    if (joystick2ProbeErr != 0) {
+      Wire.beginTransmission(JOYSTICK2_ADDR);
+      joystick2ProbeErr = Wire.endTransmission();
+    }
+    if (joystick1ProbeErr != 0) {
+      Wire.beginTransmission(JOYSTICK1_ADDR);
+      joystick1ProbeErr = Wire.endTransmission();
+    }
+    if (joystick2ProbeErr != 0 || joystick1ProbeErr != 0) delay(50);
   }
   joystick2WireRestore();
+
   joystick2Available = (joystick2ProbeErr == 0);
   if (joystick2Available) splashLog("> JoyStick2: found", COLOR_GREEN);
   else {
     char j2Msg[48];
     snprintf(j2Msg, sizeof(j2Msg), "> JoyStick2: not found (I2C err %d)", joystick2ProbeErr);
     splashLog(j2Msg, COLOR_GRAY);
+  }
+  joystick1Available = (joystick1ProbeErr == 0);
+  if (joystick1Available) splashLog("> Joystick v1.1: found", COLOR_GREEN);
+  else {
+    char j1Msg[52];
+    snprintf(j1Msg, sizeof(j1Msg), "> Joystick v1.1: not found (I2C err %d)", joystick1ProbeErr);
+    splashLog(j1Msg, COLOR_GRAY);
   }
 
   digitalWrite(GROVE_POWER_EN, LOW);
@@ -3508,16 +3678,16 @@ static void printHelpNav() {
   serialWritelnAll("  ctrl invertx on|off   invert X axis (turn)");
   serialWritelnAll("  ctrl inverty on|off   invert Y axis (forward/back)");
   serialWritelnAll("  ctrl swap on|off      swap X/Y axes");
-  serialWritelnAll("  ctrl dz 0-3           deadzone index (0=8 1=16 2=30 3=50) [Mini JoyC / JoyStick2]");
-  serialWritelnAll("  ctrl calibrate        write joystick center to STM32 flash [Mini JoyC only]");
+  serialWritelnAll("  ctrl dz 0-3           deadzone index (0=8 1=16 2=30 3=50) [shared by every stick]");
+  serialWritelnAll("  ctrl calibrate        re-centre every connected stick (one action, all devices)");
   serialWritelnAll("  ctrl link <type>      remote TX link: udp|ble|tcp|lora");
   serialWritelnAll("  ctrl lock on|off      screen lock: hold orientation on the controller screen (default ON)");
   serialWritelnAll("  ctrl order                  show device order + resolved roles");
-  serialWritelnAll("  ctrl order pad,joyc,joy2,tilt  set the order (any subset, best first)");
-  serialWritelnAll("  ctrl drive|aux1|aux2|aux3 <dev>  put a device in one role (dev: pad|joyc|joy2|tilt)");
+  serialWritelnAll("  ctrl order pad,joyc,joy2,joy1,tilt  set the order (any subset, best first)");
+  serialWritelnAll("  ctrl drive|aux1|aux2|aux3 <dev>  put a device in one role (dev: pad|joyc|joy2|joy1|tilt)");
   serialWritelnAll("  ctrl aux3tx on|off          send the 3rd aux stick (v4 frame; needs NessoLink 1.3.0+)");
   serialWritelnAll("  ctrl prof ...               profiles: show|use|new|save|del|default");
-  serialWritelnAll("  ctrl primary pad|joyc|joy2|tilt  alias for 'ctrl drive'");
+  serialWritelnAll("  ctrl primary pad|joyc|joy2|joy1|tilt  alias for 'ctrl drive'");
   serialWritelnAll("  ctrl ssmount 0-3      seesaw mount: 0=side 1=back (attached) 2=detport 3=detland (detached)");
   serialWritelnAll("  ctrl hid on|off       act as a standard BLE HID gamepad (PC/Android); reboot to apply");
   serialWritelnAll("  ctrl tilt on|off      use the on-board IMU as a tilt stick (joins the stick roster)");
@@ -4786,6 +4956,8 @@ static int ctrlDevFromName(const char* v) {
   if (!strcasecmp(v,"pad")  || !strcasecmp(v,"seesaw"))    return CTRL_DEV_SEESAW;
   if (!strcasecmp(v,"joyc") || !strcasecmp(v,"minijoyc"))  return CTRL_DEV_MINIJOYC;
   if (!strcasecmp(v,"joy2") || !strcasecmp(v,"joystick2")) return CTRL_DEV_JOYSTICK2;
+  if (!strcasecmp(v,"joy1") || !strcasecmp(v,"joystick1") ||
+      !strcasecmp(v,"joystick"))                           return CTRL_DEV_JOYSTICK1;
   if (!strcasecmp(v,"tilt") || !strcasecmp(v,"imu"))       return CTRL_DEV_IMU;
   return -1;
 }
@@ -4796,7 +4968,7 @@ static int ctrlDevFromName(const char* v) {
 static void ctrlPrintOrder() {
   bool devOn[CTRL_DEV_COUNT];
   ctrlDevOnSnapshot(devOn);
-  int roleDev[CTRL_DEV_COUNT], nRole;
+  int roleDev[CTRL_ROLE_COUNT], nRole;
   ctrlOrderResolveRoles(devOn, roleDev, nRole);
 
   char line[160];
@@ -4824,6 +4996,18 @@ static void ctrlPrintOrder() {
     serialWritelnAll(line);
   }
   if (nRole == 0) serialWritelnAll("  (no stick connected)");
+  // The roster is bigger than the number of slots the frame has, so a connected device can
+  // end up holding nothing at all. Say it out loud — a stick that is plugged in, powered
+  // and simply ignored looks exactly like a dead unit otherwise.
+  int nOn = 0;
+  for (int d = 0; d < CTRL_DEV_COUNT; d++) if (devOn[d]) nOn++;
+  if (nOn > nRole) {
+    char msg[120];
+    snprintf(msg, sizeof(msg),
+      "  %d connected device(s) past AUX %d hold no role - the frame has %d slots. "
+      "Reorder with 'ctrl order'.", nOn - nRole, CTRL_ROLE_COUNT - 1, CTRL_ROLE_COUNT);
+    serialWritelnAll(msg);
+  }
 }
 
 static void serialHandleCtrlProfile(const char* arg) {
@@ -4923,6 +5107,17 @@ void serialHandleController(const char* arg) {
           ? "   SPARE - not transmitted ('ctrl aux3tx on')" : "");
       serialWritelnAll(buf);
     }
+    if (joystick1Available) {
+      // Raw bytes as the unit reports them, next to the derived values. This is the whole
+      // bench check for the axis mapping and the button polarity: push AWAY and fwd should
+      // go positive, push RIGHT and turn should go positive, press and btn should read 0.
+      snprintf(buf, sizeof(buf),
+        "  joy1  raw x:%u y:%u btn:%u   centre:%u,%u%s",
+        joystick1RawX, joystick1RawY, joystick1RawBtn,
+        joystick1CentreX, joystick1CentreY,
+        joystick1CentreArmed ? " (not captured yet - nominal)" : "");
+      serialWritelnAll(buf);
+    }
     snprintf(buf, sizeof(buf), "  cycle:%lums (budget 100ms)  frame:v%d",
       (unsigned long)ctrlCycleMs,
       remoteHasAux3 ? 4 : remoteHasImu ? 3 : remoteHasAux2 ? 2 : 1);
@@ -4964,7 +5159,7 @@ void serialHandleController(const char* arg) {
     else { serialWritelnAll("Usage: ctrl lock on|off  (hold screen orientation on the controller screen)"); return; }
     saveSettings(); serialHandleController("");
   } else if (cmdIs(arg,"dz")) {
-    if (!ctrlHasTunableStick()) { serialWritelnAll("Deadzone applies to Mini JoyC / JoyStick2 only."); return; }
+    if (!ctrlHasTunableStick()) { serialWritelnAll("Deadzone applies to a connected stick — none is."); return; }
     int idx = atoi(cmdArg(arg,"dz"));
     if (idx < 0 || idx >= CTRL_DEADZONE_COUNT) {
       char buf[60];
@@ -4976,11 +5171,12 @@ void serialHandleController(const char* arg) {
   } else if (cmdIs(arg,"calibrate")) {
     if (!ctrlHasTunableStick()) { serialWritelnAll("Nothing to calibrate — no stick connected."); return; }
     uint8_t done = ctrlCalibrateAll();
-    char buf[160];
-    snprintf(buf, sizeof(buf), "[CTRL] calibrated:%s%s%s%s",
+    char buf[200];
+    snprintf(buf, sizeof(buf), "[CTRL] calibrated:%s%s%s%s%s",
       (done & (1 << CTRL_DEV_MINIJOYC))  ? "  JOYC(centre->STM32 flash)" : "",
       (done & (1 << CTRL_DEV_SEESAW))    ? "  PAD(centre re-armed)"      : "",
       (done & (1 << CTRL_DEV_JOYSTICK2)) ? "  JOY2(self-centring)"       : "",
+      (done & (1 << CTRL_DEV_JOYSTICK1)) ? "  JOY1(centre re-armed)"     : "",
       (done & (1 << CTRL_DEV_IMU))       ? "  TILT(attitude+gyro zeroed)": "");
     serialWritelnAll(buf);
     // The IMU is the only one that can refuse, and it refuses for a reason worth printing:
@@ -5010,7 +5206,7 @@ void serialHandleController(const char* arg) {
     const char* v = cmdArg(arg, key);
     int dev = ctrlDevFromName(v);
     if (dev < 0) {
-      serialWritelnAll("Usage: ctrl drive|aux1|aux2|aux3 pad|joyc|joy2|tilt");
+      serialWritelnAll("Usage: ctrl drive|aux1|aux2|aux3 pad|joyc|joy2|joy1|tilt");
       return;
     }
     transmitRemoteStop();
@@ -5024,13 +5220,13 @@ void serialHandleController(const char* arg) {
     // relative order after the listed ones. This is the only way to position a device that
     // is NOT currently connected — the settings rows only offer connected ones.
     uint8_t neu[CTRL_DEV_COUNT];
-    bool    used[CTRL_DEV_COUNT] = { false, false, false, false };
+    bool    used[CTRL_DEV_COUNT] = {};
     int     n = 0;
-    char    tmp[64];
+    char    tmp[80];
     strlcpy(tmp, v, sizeof(tmp));
     for (char* tok = strtok(tmp, ", "); tok && n < CTRL_DEV_COUNT; tok = strtok(nullptr, ", ")) {
       int d = ctrlDevFromName(tok);
-      if (d < 0)     { serialWritelnAll("Usage: ctrl order pad,joyc,joy2,tilt  (any subset, best first)"); return; }
+      if (d < 0)     { serialWritelnAll("Usage: ctrl order pad,joyc,joy2,joy1,tilt  (any subset, best first)"); return; }
       if (used[d])   { serialWritelnAll("Each device may appear only once."); return; }
       used[d] = true; neu[n++] = (uint8_t)d;
     }
@@ -5100,7 +5296,7 @@ void serialHandleController(const char* arg) {
     serialWritelnAll("[CTRL] HID gamepad mode saved. Reboot with BT started to (de)activate.");
     serialHandleController("");
   } else {
-    serialWritelnAll("ctrl subcommands: invertx|inverty|swap|lock|tilt|imutx on|off  dz 0-3  tiltrange 0-3  calibrate  link udp|ble|tcp|lora  primary pad|joyc|joy2|tilt  ssmount 0-3  hid on|off");
+    serialWritelnAll("ctrl subcommands: invertx|inverty|swap|lock|tilt|imutx on|off  dz 0-3  tiltrange 0-3  calibrate  link udp|ble|tcp|lora  primary pad|joyc|joy2|joy1|tilt  ssmount 0-3  hid on|off");
   }
 }
 
@@ -5127,19 +5323,30 @@ void serialHandleI2c(const char* arg) {
   Wire.end(); Wire.begin(6, 7, 100000);
   serialI2cScanBus();
 
-  serialWritelnAll("[I2C] GROVE bus (SDA=G5 SCL=G4, power ON, 400ms settle):");
+  // GROVE_POWER_EN is an I2C EXPANDER pin: digitalWrite() on it is a register write sent
+  // over the global Wire, and the expander lives on the MAIN bus. Wire is still pinned to
+  // the HAT bus from the scan above, so this MUST re-point it first — without that the
+  // write goes to GPIO 6/7 where nothing answers, the rail never comes on, and the scan
+  // reports an empty Grove bus for units that are plugged in and working. That is exactly
+  // what it did: a Unit Joystick v1.1 detected at boot and driving the controller screen
+  // showed up here as "(none)", and the only reason the bug stayed hidden is that the scan
+  // DOES find Grove devices whenever something else already had the rail on (the
+  // controller screen holds it for the whole session). A diagnostic that says "not there"
+  // about a device that is there is worse than no diagnostic.
+  serialWritelnAll("[I2C] GROVE bus (SDA=G5 SCL=G4, power ON, 800ms settle):");
+  Wire.end(); Wire.begin(SDA, SCL, 100000);        // expander is on the MAIN bus
   pinMode(GROVE_POWER_EN, OUTPUT);
   digitalWrite(GROVE_POWER_EN, HIGH);
-  delay(400);   // cold STM32G030 (JoyStick2) needs a few hundred ms to ACK
+  delay(800);   // generous: the MEGA8A (Joystick v1.1) is the slowest unit to ACK cold
   Wire.end(); Wire.begin(GROVE_IO_0, GROVE_IO_1, 100000);
   serialI2cScanBus();
 
   // Restore the main bus; drop GROVE power unless something needs it.
   Wire.end(); Wire.begin(SDA, SCL, 100000);
-  if (!(currentFunction == FUNCTION_CONTROLLER && joystick2Available)
+  if (!(currentFunction == FUNCTION_CONTROLLER && (joystick2Available || joystick1Available))
       && !rf433LearnMode && !irLearnMode)
     digitalWrite(GROVE_POWER_EN, LOW);
-  serialWritelnAll("[I2C] expected: MiniJoyC 0x54 (HAT), JoyStick2 0x63 / RFID2 0x28 (GROVE)");
+  serialWritelnAll("[I2C] expected: MiniJoyC 0x54 (HAT), JoyStick2 0x63 / Joystick v1.1 0x52 / RFID2 0x28 (GROVE)");
 }
 
 // ── Dispatcher ────────────────────────────────────────────────────
@@ -5290,9 +5497,12 @@ void renderFunction() {
         joystick2SetLED(0x000000);  // LED off when leaving controller screen
         joystick2WireRestore();
         joystick2LedColor = 0xFFFFFFFF;  // force re-send on next entry
-        // Drop GROVE power (JoyStick2 powered it for this screen) unless IR/RF433 hold it.
-        if (!rf433LearnMode && !irLearnMode) digitalWrite(GROVE_POWER_EN, LOW);
       }
+      // Drop GROVE power (a Grove stick powered it for this screen) unless IR/RF433 hold
+      // it. Outside the JoyStick2 branch on purpose: Joystick v1.1 powers it too, and
+      // leaving 5V on the Grove port after the screen is gone drains the pack for nothing.
+      if ((joystick2Available || joystick1Available) && !rf433LearnMode && !irLearnMode)
+        digitalWrite(GROVE_POWER_EN, LOW);
     }
   }
 
@@ -6177,7 +6387,15 @@ static uint8_t ctrlCalibrateAll() {
     done |= (1 << CTRL_DEV_SEESAW);
   }
   // JoyStick2 self-centres via its offset register (0x50) — nothing to do, but say so.
+  // (Joystick v1.1 does not, hence its own re-arm below.)
   if (joystick2Available) done |= (1 << CTRL_DEV_JOYSTICK2);
+  // Joystick v1.1 hands out raw ADC, so it has a lazy centre of its own to re-arm — the
+  // same treatment as the seesaw, and the reason CALIBRATE has to reach every device
+  // rather than stopping at the first match.
+  if (joystick1Available) {
+    joystick1CentreArmed = true;
+    done |= (1 << CTRL_DEV_JOYSTICK1);
+  }
   if (imuStickActive() && imuCalibrate()) done |= (1 << CTRL_DEV_IMU);
   return done;
 }
@@ -6289,11 +6507,13 @@ static void drawTiltViz(int cx, int cy, int r, int16_t valFwd, int16_t valTurn, 
 // silently, so the overflow shows up as the face-button diamond simply not being there.
 static void renderControllerMulti(int sw, int sh, bool isLandscape, int n) {
   if (n < 2) n = 2;
-  if (n > CTRL_DEV_COUNT) n = CTRL_DEV_COUNT;
-  // Disc i = role i (drive, aux1, aux2, aux3), each labelled with its device name.
-  int16_t     discFwd[CTRL_DEV_COUNT]  = { joyDisplayX, aux2DisplayX, aux3DisplayX, aux4DisplayX };
-  int16_t     discTurn[CTRL_DEV_COUNT] = { joyDisplayY, aux2DisplayY, aux3DisplayY, aux4DisplayY };
-  const char* discLbl[CTRL_DEV_COUNT]  = { ctrlDriveLabel, ctrlAux1Label, ctrlAux2Label, ctrlAux3Label };
+  if (n > CTRL_ROLE_COUNT) n = CTRL_ROLE_COUNT;
+  // Disc i = role i (drive, aux1, aux2, aux3), each labelled with its device name. One disc
+  // per ROLE, not per connected device: a device the order compacts past the last role
+  // holds nothing and is not drawn.
+  int16_t     discFwd[CTRL_ROLE_COUNT]  = { joyDisplayX, aux2DisplayX, aux3DisplayX, aux4DisplayX };
+  int16_t     discTurn[CTRL_ROLE_COUNT] = { joyDisplayY, aux2DisplayY, aux3DisplayY, aux4DisplayY };
+  const char* discLbl[CTRL_ROLE_COUNT]  = { ctrlDriveLabel, ctrlAux1Label, ctrlAux2Label, ctrlAux3Label };
 
   int rows = (!isLandscape && n >= 3) ? 2 : 1;
   int cols = (rows == 2) ? 2 : n;
@@ -6382,6 +6602,7 @@ static void renderControllerMulti(int sw, int sh, bool isLandscape, int n) {
   }
   if (miniJoyCAvailable)  SB_PUSH("JC", miniJoyCBtn);
   if (joystick2Available) SB_PUSH("J2", joystick2Btn);
+  if (joystick1Available) SB_PUSH("J1", joystick1Btn);
   #undef SB_PUSH
 
   int spacing = constrain((sw - 28) / (nb > 0 ? nb : 1), 16, 26);  // shrink to fit the width
@@ -6471,15 +6692,23 @@ void renderController() {
 
   uint16_t connColor = controllerConnected ? COLOR_GREEN : COLOR_RED;
 
-  // Single-stick path: a solo thumbstick unit (Mini JoyC or JoyStick2, no seesaw) shows
-  // its own click button; a seesaw shows the face-button cluster; the IMU has no buttons
-  // at all, so tiltOnly draws none (without this it would fall through to the seesaw
-  // cluster and paint four buttons for a device that isn't connected).
-  bool isJoy2     = joystick2Available && !joystickAvailable && !miniJoyCAvailable;
-  bool isSoloUnit = (miniJoyCAvailable || joystick2Available) && !joystickAvailable;
-  const char* unitName = isJoy2 ? "JOYSTICK2" : "MINIJOYC";
-  bool unitBtn = isJoy2 ? joystick2Btn : miniJoyCBtn;
-  if (tiltOnly) { isSoloUnit = true; unitName = "IMU TILT"; unitBtn = false; }
+  // Single-stick path: a solo thumbstick unit shows its own click button; a seesaw shows
+  // the face-button cluster; the IMU has no buttons at all, so tiltOnly draws none (without
+  // that it would fall through to the seesaw cluster and paint four buttons for a device
+  // that isn't connected). Only one device is connected on this path, so the RESOLVED drive
+  // device says which — the same ctrlDiscDev[] the discs are drawn from, rather than a
+  // second chain of availability flags that has to be extended for every new module.
+  bool isSoloUnit = true;
+  const char* unitName;
+  bool unitBtn;
+  switch (ctrlDiscDev[0]) {
+    case CTRL_DEV_MINIJOYC:  unitName = "MINIJOYC";  unitBtn = miniJoyCBtn;   break;
+    case CTRL_DEV_JOYSTICK2: unitName = "JOYSTICK2"; unitBtn = joystick2Btn;  break;
+    case CTRL_DEV_JOYSTICK1: unitName = "JOYSTICK";  unitBtn = joystick1Btn;  break;
+    case CTRL_DEV_IMU:       unitName = "IMU TILT";  unitBtn = false;         break;
+    default:                 unitName = "MINIJOYC";  unitBtn = false;
+                             isSoloUnit = false;     break;   // seesaw, or nothing yet
+  }
 
   if (isLandscape) {
     // Info panel to the right of the joystick circle
@@ -6590,7 +6819,7 @@ void initGamePad() {
     bool devOn[CTRL_DEV_COUNT];
     ctrlDevOnSnapshot(devOn);
     ctrlOrderResolveRoles(devOn, ctrlRoleDev, ctrlRoleCount);
-    for (int i = 0; i < CTRL_DEV_COUNT; i++) ctrlDiscDev[i] = (i < ctrlRoleCount) ? ctrlRoleDev[i] : -1;
+    for (int i = 0; i < CTRL_ROLE_COUNT; i++) ctrlDiscDev[i] = (i < ctrlRoleCount) ? ctrlRoleDev[i] : -1;
     ctrlDriveLabel = ctrlRoleCount > 0 ? CTRL_DEV_LABELS[ctrlRoleDev[0]] : "-";
     ctrlAux1Label  = ctrlRoleCount > 1 ? CTRL_DEV_LABELS[ctrlRoleDev[1]] : "";
     ctrlAux2Label  = ctrlRoleCount > 2 ? CTRL_DEV_LABELS[ctrlRoleDev[2]] : "";
@@ -6613,12 +6842,17 @@ void initGamePad() {
   // bias is already taken at boot and re-taken by any explicit calibrate.
   if (imuStickActive() && !imuZeroExplicit) imuZeroAttitude(false);
 
-  // Unit JoyStick2 init (Grove bus) — runs whenever present, alongside any other stick.
-  // It needs GROVE 5V power held on for the whole controller session (dropped on exit).
-  if (joystick2Available) {
+  // Grove-bus sticks (Unit JoyStick2 and/or Unit Joystick v1.1) need GROVE 5V held on for
+  // the whole controller session — it is COLD on every entry, and dropped again on exit.
+  // Powered once here so a rig with both does not pay the settle delay twice.
+  if (joystick2Available || joystick1Available) {
     pinMode(GROVE_POWER_EN, OUTPUT);
     digitalWrite(GROVE_POWER_EN, HIGH);
     delay(120);                             // let the STM32G030 start booting after power-on
+  }
+
+  // Unit JoyStick2 init (Grove bus) — runs whenever present, alongside any other stick.
+  if (joystick2Available) {
     joystick2WireGrove();
     bool ok = false;
     for (int t = 0; t < 6 && !ok; t++) {    // cold STM32G030 can need ~300ms to ACK
@@ -6630,6 +6864,31 @@ void initGamePad() {
     joystick2WireRestore();
     joystick2LedColor = ok ? 0x000010 : 0xFFFFFFFF;
     joystick2Btn = false;
+    if (ok) controllerConnected = true;
+  }
+
+  // Unit Joystick v1.1 init (Grove bus). Nothing to configure — no LED, no calibration
+  // register — but the lazy centre capture is re-armed for the session: the unit hands out
+  // raw ADC, and the stick may well have been left leaning since the last one.
+  if (joystick1Available) {
+    joystick1CentreArmed = true;
+    joystick1CentreX = joystick1CentreY = 128;
+    joystick1HavePrev = false;
+    joystick1Btn = false;
+    joystick1BtnArmed = false;
+    joystick1WireGrove();
+    bool ok = false;
+    // The rail is cold on every entry and the MEGA8A takes several hundred ms to ACK, so
+    // one shot would usually miss. Bounded well under the wake time on purpose: this probe
+    // only decides how soon controllerConnected turns green, and the read path self-heals
+    // — readJoystick1Axes() fails safe to "centred, released" and captures the centre on
+    // its first good read, so a still-waking unit costs a few centred frames, not a stop.
+    for (int t = 0; t < 6 && !ok; t++) {
+      Wire.beginTransmission(JOYSTICK1_ADDR);
+      ok = (Wire.endTransmission() == 0);
+      if (!ok) delay(50);
+    }
+    joystick1WireRestore();
     if (ok) controllerConnected = true;
   }
 
@@ -6652,7 +6911,7 @@ void initGamePad() {
       return;
     }
   } else if (!joystickAvailable) {
-    return;  // no seesaw — JoyStick2 (if present) was already inited above
+    return;  // no seesaw — the Grove sticks (if present) were already inited above
   }
 
   // seesaw was already probed successfully at boot; re-init to configure pins
@@ -6681,7 +6940,7 @@ static void readSeesawAxes(int16_t& px, int16_t& py) {
   // ROLLING average, one sample per cycle — NOT a 4-sample block average.
   //
   // This used to take 4 samples with delay(10) between them: ~40 ms of the 100 ms budget
-  // burned in delay() alone, before the Mini JoyC and JoyStick2 bus-switch windows. With
+  // burned in delay() alone, before the Mini JoyC and Grove bus-switch windows. With
   // four devices live that pushed a cycle towards the tick period, and a readGamePad()
   // that overruns its own interval stops being the ~10 Hz stream the receiver failsafe is
   // sized against. One sample per cycle over a 4-deep ring gives the same smoothing with
@@ -6792,6 +7051,79 @@ static void readJoystick2Axes(int16_t& px, int16_t& py) {
   py = (int16_t)constrain(vert  * 515 / 512, -515, 515);
 }
 
+// Read the Unit Joystick v1.1 → px/py on the same ±515 scale as every other stick, ready
+// for the shared rotation table. Axes, button and the LED-less bus window are all one
+// 3-byte read (the unit has no register file).
+//
+// Unlike JoyStick2 the unit does NOT centre its own ADC, so the resting position is
+// lazy-captured here — the same model as the seesaw, and for the same reason: a released
+// stick must mix to EXACTLY zero or the robot creeps instead of stopping. The capture is
+// re-armed on every controller-screen entry and by CALIBRATE.
+//
+// AXIS MAPPING — verified on hardware 2026-09-02, and the only place to change it.
+// px/py are the stick's own frame going into applyStickRotation(); at rotation 0 it passes
+// them straight through and readGamePad() then reads px as FORWARD and py as TURN. So the
+// two lines below say, literally: which raw axis means "drive forward", and which means
+// "rotate clockwise". The Y byte RISES as the stick is pushed away — the opposite of the
+// first guess here, which had forward inverted on the bench. `ctrl` prints the raw bytes
+// alongside the derived values, which is how to re-check it if a future unit differs.
+static void readJoystick1Axes(int16_t& px, int16_t& py) {
+  joystick1WireGrove();
+  uint8_t rx = 128, ry = 128, rb = 1;
+  bool ok = joystick1Read(rx, ry, rb);
+  joystick1WireRestore();
+
+  if (!ok) {                      // fail safe: centred and released, never a partial frame
+    px = 0; py = 0;
+    joystick1Btn = false;
+    return;
+  }
+  joystick1RawX = rx; joystick1RawY = ry; joystick1RawBtn = rb;
+
+  // Capture the resting centre once per session, from a reading that is both plausibly
+  // centred (JOYSTICK1_CENTRE_MIN/MAX) and SETTLED (two consecutive reads agreeing within
+  // JOYSTICK1_CENTRE_STABLE). Either check failing just leaves the capture armed, with the
+  // nominal 128 in use meanwhile.
+  if (joystick1CentreArmed &&
+      rx >= JOYSTICK1_CENTRE_MIN && rx <= JOYSTICK1_CENTRE_MAX &&
+      ry >= JOYSTICK1_CENTRE_MIN && ry <= JOYSTICK1_CENTRE_MAX) {
+    if (joystick1HavePrev &&
+        abs((int)rx - (int)joystick1PrevX) <= JOYSTICK1_CENTRE_STABLE &&
+        abs((int)ry - (int)joystick1PrevY) <= JOYSTICK1_CENTRE_STABLE) {
+      joystick1CentreX = rx;
+      joystick1CentreY = ry;
+      joystick1CentreArmed = false;
+    }
+    joystick1PrevX = rx;
+    joystick1PrevY = ry;
+    joystick1HavePrev = true;
+  }
+
+  // The raw byte is only trusted when it is one of the two values the unit documents;
+  // anything else is bus noise and must not latch a pressed bit into the TX frame. And it
+  // only counts as a press once the released level has actually been observed — an
+  // inverted-polarity unit then reads "never pressed" rather than "always pressed".
+  if (rb <= 1 && rb != JOYSTICK1_BTN_PRESSED) joystick1BtnArmed = true;
+  bool pressed = joystick1BtnArmed && (rb == JOYSTICK1_BTN_PRESSED);
+  if (pressed && !joystick1Btn) {
+    resetActivity();
+    debugln("Joystick v1.1 button pressed");
+    if (WiFi.status() != WL_CONNECTED) connectToWiFi();
+  }
+  joystick1Btn = pressed;
+
+  int fwd  = ((int)ry - (int)joystick1CentreY);    // Y rises pushed AWAY → forward
+  int turn = ((int)rx - (int)joystick1CentreX);    // X rises pushed RIGHT → rotate CW
+  // ±127 → ±512 so the SHARED deadzone constant means the same deflection on every stick.
+  fwd  = fwd  * 512 / 127;
+  turn = turn * 512 / 127;
+  int dz = CTRL_DEADZONE_VALS[ctrlDeadzoneIdx];
+  if (fwd  > -dz && fwd  < dz) fwd  = 0;
+  if (turn > -dz && turn < dz) turn = 0;
+  px = (int16_t)constrain(fwd  * 515 / 512, -515, 515);
+  py = (int16_t)constrain(turn * 515 / 512, -515, 515);
+}
+
 // Apply the shared rotation table so stick axes are screen-relative.
 static void applyStickRotation(int16_t px, int16_t py, int16_t& rx, int16_t& ry) {
   switch (currentRotation) {
@@ -6868,13 +7200,13 @@ static void readImuAxes(int16_t& rx, int16_t& ry) {
 
 void readGamePad() {
   // ── Read each connected stick → screen-relative (rx,ry), indexed by CtrlStickDev ──
-  // Mini JoyC and JoyStick2 are front/independent units that always rotation-adapt.
+  // Mini JoyC, JoyStick2 and Joystick v1.1 are front/independent units: all rotation-adapt.
   // The seesaw applies its mount base transform, then the screen-rotation table only
   // for ATTACHED mounts (side/back); DETACHED mounts keep the stick's own frame.
   bool    devOn[CTRL_DEV_COUNT];
   ctrlDevOnSnapshot(devOn);
-  int16_t devRx[CTRL_DEV_COUNT] = { 0, 0, 0, 0 };
-  int16_t devRy[CTRL_DEV_COUNT] = { 0, 0, 0, 0 };
+  int16_t devRx[CTRL_DEV_COUNT] = {};
+  int16_t devRy[CTRL_DEV_COUNT] = {};
   uint32_t cycleStartMs = millis();
 
   if (devOn[CTRL_DEV_SEESAW]) {
@@ -6894,6 +7226,11 @@ void readGamePad() {
     readJoystick2Axes(jPx, jPy);
     applyStickRotation(jPx, jPy, devRx[CTRL_DEV_JOYSTICK2], devRy[CTRL_DEV_JOYSTICK2]);
   }
+  if (devOn[CTRL_DEV_JOYSTICK1]) {
+    int16_t kPx, kPy;
+    readJoystick1Axes(kPx, kPy);
+    applyStickRotation(kPx, kPy, devRx[CTRL_DEV_JOYSTICK1], devRy[CTRL_DEV_JOYSTICK1]);
+  }
   // The tilt stick is already screen-relative — no applyStickRotation() here on purpose.
   if (devOn[CTRL_DEV_IMU])
     readImuAxes(devRx[CTRL_DEV_IMU], devRy[CTRL_DEV_IMU]);
@@ -6903,7 +7240,7 @@ void readGamePad() {
   int driveDev = ctrlRoleDev[0];
   if (driveDev < 0) {  // no stick at all — nothing will drive the link from here on
     remoteHasAux = false; remoteHasAux2 = false; remoteHasImu = false; remoteHasAux3 = false;
-    for (int i = 0; i < CTRL_DEV_COUNT; i++) ctrlDiscDev[i] = -1;
+    for (int i = 0; i < CTRL_ROLE_COUNT; i++) ctrlDiscDev[i] = -1;
     ctrlDriveLabel = "-"; ctrlAux1Label = ""; ctrlAux2Label = ""; ctrlAux3Label = "";
     ctrlLastDriveDev = -1;
     transmitRemoteStop();   // no-op unless we were mid-drive when the stick vanished
@@ -7061,8 +7398,9 @@ void readGamePadButtons() {
       }
     }
   }
-  // The Mini JoyC stick button + LED are read together with its axes in
-  // readMiniJoyCAxes() (one shared HAT-bus window), so nothing to do here.
+  // The thumbstick click-buttons are each read together with that unit's axes — in
+  // readMiniJoyCAxes() / readJoystick2Axes() / readJoystick1Axes(), one shared bus window
+  // per device per cycle — so there is nothing to do for them here.
 }
 
 // ================================================================
@@ -7197,13 +7535,15 @@ bool ctrlProfApply(const char* path) {
   int newLink = constrain((int)(doc["txlink"] | remoteTransportIdx), 0, REMOTE_TX_COUNT - 1);
   if (remoteTransportIdx == TX_WIFI_TCP && newLink != remoteTransportIdx) tcpClient.stop();
 
+  // A profile written before the roster grew carries a SHORTER array; extend it the same
+  // way loadSettings() extends the NVS blob rather than dropping the mapping on the floor.
   uint8_t ord[CTRL_DEV_COUNT];
   bool haveOrder = false;
   JsonArrayConst oa = doc["order"];
-  if (!oa.isNull() && oa.size() == CTRL_DEV_COUNT) {
+  if (!oa.isNull() && oa.size() >= 1 && oa.size() <= (size_t)CTRL_DEV_COUNT) {
     int i = 0;
     for (JsonVariantConst v : oa) ord[i++] = (uint8_t)(v.as<int>() & 0xFF);
-    haveOrder = ctrlOrderValid(ord);
+    haveOrder = ctrlOrderExtend(ord, i) && ctrlOrderValid(ord);
   }
   if (haveOrder) memcpy(ctrlDevOrder, ord, sizeof(ctrlDevOrder));
   // else: keep the current order rather than booting into an unconfigured mapping.
@@ -7352,7 +7692,7 @@ int ctrlSetBuildRows() {
   // drag-and-drop the two hardware buttons cannot express.
   bool devOn[CTRL_DEV_COUNT];
   ctrlDevOnSnapshot(devOn);
-  int roleDev[CTRL_DEV_COUNT], nRole;
+  int roleDev[CTRL_ROLE_COUNT], nRole;
   ctrlOrderResolveRoles(devOn, roleDev, nRole);
   if (nRole >= 2) {
     for (int r = 0; r < nRole; r++) {
@@ -7509,12 +7849,14 @@ void renderControllerSettings() {
   headerSprite.setTextDatum(TC_DATUM);
   headerSprite.setTextSize(2);
   headerSprite.setTextColor(cyan);
-  const char* title = (nStk >= 4) ? "QUAD STICK SETTINGS"
+  const char* title = (nStk >= 5) ? "5-STICK SETTINGS"
+                    : (nStk == 4) ? "QUAD STICK SETTINGS"
                     : (nStk == 3) ? "TRIPLE STICK SETTINGS"
                     : (nStk == 2) ? "DUAL STICK SETTINGS"
                     : (miniJoyCAvailable  ? "MINIJOYC SETTINGS"
                     : (joystick2Available ? "JOYSTICK2 SETTINGS"
-                    : (joystickAvailable  ? "GAMEPAD SETTINGS" : "TILT SETTINGS")));
+                    : (joystick1Available ? "JOYSTICK SETTINGS"
+                    : (joystickAvailable  ? "GAMEPAD SETTINGS" : "TILT SETTINGS"))));
   headerSprite.drawString(title, sw / 2, isLandscape ? 4 : 6);
   headerSprite.drawFastHLine(8, SPRITE_Y - 1, sw - 16, display.color565(0, 80, 120));
   headerSprite.pushSprite(0, 0);
@@ -8317,12 +8659,13 @@ static uint16_t remoteButtonBits() {
     if (!(gamepadButtons & (1UL << BUTTON_SELECT))) b |= (1 << NESSO_BTN_SELECT);
     if (!(gamepadButtons & (1UL << BUTTON_START)))  b |= (1 << NESSO_BTN_START);
   }
-  // The two thumbstick click-buttons merge in independently — NOT 'else if', so each is
+  // The thumbstick click-buttons merge in independently — NOT 'else if', so each is
   // still sent when other sticks are also present (the screen reads the *Btn flags
   // directly, but the frame must carry them too for the receiver). Mini JoyC → STICK,
-  // Unit JoyStick2 → STICK2.
+  // Unit JoyStick2 → STICK2, Unit Joystick v1.1 → STICK3.
   if (miniJoyCAvailable  && miniJoyCBtn)   b |= (1 << NESSO_BTN_STICK);
   if (joystick2Available && joystick2Btn)  b |= (1 << NESSO_BTN_STICK2);
+  if (joystick1Available && joystick1Btn)  b |= (1 << NESSO_BTN_STICK3);
   return b;
 }
 
