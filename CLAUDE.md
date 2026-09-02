@@ -112,7 +112,7 @@ Rows are 12 px and drawn **only while they fit** (`SENSOR_ROW_H`), so the 113 px
 
 **This screen is the bench check for the axis conventions.** Tip the top up → PITCH positive; drop the right edge → ROLL positive; turn clockwise as you look at the screen → YAW positive. `imu` prints the same values over serial.
 
-Tap = zero to the current hold. KEY1 long-press opens settings (`SENSOR_SET_ITEMS` = 5: ZERO HERE / LEVEL REF / GYRO ZERO / TILT STK / IMU TX). The last two are the *same* flags the controller settings expose — one sensor, two consumers, and a second copy of the state would be a bug waiting to happen. `sensorSettingsHeaderActive` restores the battery/WiFi header when the panel closes, exactly like `ctrlSettingsHeaderActive`.
+Tap = zero to the current hold. KEY1 long-press opens settings (`SENSOR_SET_ITEMS` = 6: ZERO HERE / LEVEL REF / GYRO ZERO / TILT STK / IMU TX / SCR LOCK). The last three are the *same* flags the controller settings expose — one sensor, two consumers, and a second copy of the state would be a bug waiting to happen. This panel dispatches by **index** (unlike the controller's, which dispatches on a row action), so the rows are named in `enum SensorSetRow` and the label table, the value table and the activate switch all use those names: the row set is fixed, which makes index dispatch fine, but a bare `5` in one of the three places and not the others is how a tap silently actions the wrong setting. `sensorSettingsHeaderActive` restores the battery/WiFi header when the panel closes, exactly like `ctrlSettingsHeaderActive`.
 
 ### Battery percentage
 
@@ -332,7 +332,7 @@ Settings: one row per filled role (DRIVE / AUX 1 / AUX 2 / AUX 3), KEY1 cycles w
 
 Named snapshots of "which robot am I driving, and how is my rig mapped to it" — stored on LittleFS as JSON at `/ctrldb/<name>.json`, one NVS pointer key (`ctrlProf`) for the active one. Max 8, names `[A-Za-z0-9_-]` up to 12 chars, **rejected not sanitised** (silently rewriting the name makes the file the user later looks for not the one that exists).
 
-**Profile-scoped:** device order, `ctrlSwapXY/InvertX/InvertY`, deadzone, `seesawMountIdx`, tilt range, `ctrlImuStick`, `ctrlImuFrame`, `ctrlAux3Frame`, `remoteTransportIdx`, and the endpoint (`targetIpAddress`/`udpPort`/`tcpPort`). **Global:** `ctrlScreenLock` (handheld ergonomics, not robot identity), `hidGamepadEnabled` (needs a reboot — a profile field that didn't apply immediately would break the contract), LoRa preset/frequency (owned by the scanner screen).
+**Profile-scoped:** device order, `ctrlSwapXY/InvertX/InvertY`, deadzone, `seesawMountIdx`, tilt range, `ctrlImuStick`, `ctrlImuFrame`, `ctrlAux3Frame`, `remoteTransportIdx`, and the endpoint (`targetIpAddress`/`udpPort`/`tcpPort`). **Global:** `ctrlScreenLock` (handheld ergonomics, not robot identity — and it governs the sensor screen too, which has nothing to do with any robot), `hidGamepadEnabled` (needs a reboot — a profile field that didn't apply immediately would break the contract), LoRa preset/frequency (owned by the scanner screen).
 
 `ctrlProfApply()` is the **only** apply path, and its ordering matters: `transmitRemoteStop()` **first**, before `remoteTransportIdx` changes, or the robot on the old link never hears a stop while the eventual exit-stop goes out on the new one. Then the TCP client drop, then the field assignments, then `imuCalibrate()` if the tilt stick just came on, then `saveSettings()` so NVS mirrors the live state. Writes are **temp-then-rename** — `saveConfig()` writes in place and a truncated JSON still *parses*, which would silently yield a partial axis mapping on the next boot. Fields use the `doc["k"] | default` fallback, so a hand-edited or partial file loads with defaults rather than failing whole.
 
@@ -383,9 +383,18 @@ Non-obvious constraints (the reasons it's gated, not free-running):
 - **No USB HID.** ESP32-C6 has only a fixed-function USB Serial/JTAG controller (no USB-OTG), so a USB gamepad is impossible on this silicon — BLE HID is the only standard-controller path. C6 is also BLE-only (no Classic BT), so consoles won't pair; works on PC (DirectInput — Steam Input maps it) / Android.
 - **Untested on hardware** as written — report-map/axis-sign/bonding details may need iteration with a real host.
 
-### Controller screen lock (`ctrlScreenLock`)
+### Screen lock (`ctrlScreenLock`) — controller *and* sensor
 
-**Default ON** (NVS `ctrlLock`). While `currentFunction == FUNCTION_CONTROLLER`, `updateOrientation()` returns immediately, so the screen holds whatever orientation it was navigated in until you leave. Driving tilts the device constantly, and a rotation mid-drive both redraws the screen and flips `applyStickRotation()` under the user's thumb for every rotation-adapting stick. The guard is keyed on `currentFunction` (not `navState`), so it covers the controller settings panel too, and it sits **after** the `displayOff/displayDimmed` freeze so the sleep behaviour is unchanged. Turning it off resumes normal auto-rotation within one 300 ms tick. Toggled from the "SCR LOCK" settings row (index 6) or serial `ctrl lock on|off`.
+**Default ON** (NVS `ctrlLock`). While `currentFunction` is **`FUNCTION_CONTROLLER` or `FUNCTION_SENSOR`**, `updateOrientation()` returns immediately, so the screen holds whatever orientation it was navigated in until you leave.
+
+Those are precisely the two screens you **tilt the device on deliberately**, which is why they are the two that need it:
+
+- **CONTROLLER** — driving tilts the device constantly, and a rotation mid-drive both redraws the screen and flips `applyStickRotation()` under the user's thumb for every rotation-adapting stick.
+- **SENSOR** — reading pitch/roll means tilting past the landscape threshold, so the screen would rotate *during the very measurement being checked*, re-mapping the axes (`imuUpdateAttitude()` is rotation-adapted) mid-reading. This screen is the bench test the whole IMU section is written against; that test only means something in one fixed frame.
+
+**One flag, not two.** The sensor panel's TILT STK and IMU TX rows already share their state with the controller's for the same reason — one sensor, two consumers — and a second copy of "hold the orientation" would just be another thing to keep in sync. The NVS key keeps its `ctrlLock` name so existing settings migrate untouched, and the variable keeps its `ctrl` prefix rather than churn every call site.
+
+The guard is keyed on `currentFunction` (not `navState`), so it covers both settings panels too, and it sits **after** the `displayOff/displayDimmed` freeze so the sleep behaviour is unchanged. Turning it off resumes normal auto-rotation within one 300 ms tick. Toggled from the "SCR LOCK" row on **either** panel, or serial `ctrl lock on|off` — a lock reachable only from the controller panel is a lock you will not find when the sensor screen refuses to turn.
 
 The Controller **settings screen** is device-aware: `controllerSettingsItemCount()` = `ctrlSetBuildRows()`, a table of `CTRL_SET_FIXED_ROWS` (**13**: PROFILE, PROFILES, CALIBRATE, DEADZONE, SWAP XY, INVERT X, INVERT Y, TX LINK, SCR LOCK, TILT STK, TILT RNG, IMU TX, AUX3 TX) **+ MOUNT** when a seesaw is present **+ one row per filled role** (DRIVE / AUX 1 / AUX 2 / AUX 3) when ≥2 devices are connected.
 

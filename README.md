@@ -627,7 +627,7 @@ Open controller settings with **long-press KEY1**, or use the `ctrl …` serial 
 | **DEADZONE** | Rest-position deadzone applied to **all** sticks: 8 / 16 / 30 / 50 |
 | **SWAP XY / INVERT X / INVERT Y** | drive-stick axis transforms |
 | **TX LINK** | wireless link (table above) |
-| **SCR LOCK** | **ON (default)** — the controller screen holds the orientation you entered it in, so driving tilts never rotate the display or the stick mapping · OFF — normal auto-rotation |
+| **SCR LOCK** | **ON (default)** — the Controller *and* Sensor screens hold the orientation you entered them in, so tilting never rotates the display or the axis mapping mid-drive or mid-reading · OFF — normal auto-rotation. The same row appears on the Sensor settings panel |
 | **MOUNT** (seesaw) | `SIDE` / `BACK` — attached, follows screen rotation · `DET-PORT` / `DET-LAND` — detached, fixed to the stick |
 | **PRIMARY** (2+ sticks) | which stick drives: `PAD` / `JOYC` / `JOY2` (cycles connected sticks) |
 
@@ -675,7 +675,7 @@ Connect at **115200 baud**. Commands work over both USB serial and BLE UART (`ne
 | `ctrl prof default` | Clear the active profile (settings unchanged) |
 | `ctrl primary pad\|joyc\|joy2\|joy1\|tilt` | Alias for `ctrl drive` |
 | `ctrl ssmount 0-3` | Seesaw mount: `side`/`back` (attached) · `detport`/`detland` (detached) |
-| `ctrl lock on\|off` | Screen lock — hold the screen orientation while on the controller screen (default `on`) |
+| `ctrl lock on\|off` | Screen lock — hold the screen orientation while on the Controller or Sensor screen (default `on`) |
 | `ctrl tilt on\|off` | Use the built-in IMU as a tilt stick (default `on`) |
 | `ctrl tiltrange 0-3` | Tilt for full deflection: 15 / 25 / 35 / 45 degrees |
 | `ctrl imutx on\|off` | Send IMU attitude in the frame — promotes it to v3, needs a NessoLink 1.2.0+ receiver (default `off`) |

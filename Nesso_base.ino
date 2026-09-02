@@ -434,10 +434,14 @@ int      ctrlDeadzoneIdx     = 1;      // index into CTRL_DEADZONE_VALS (default
 bool     ctrlSwapXY          = false;  // swap X/Y after rotation remap (drive stick)
 bool     ctrlInvertX         = false;  // invert final X (turn)
 bool     ctrlInvertY         = false;  // invert final Y (forward/back)
-// Screen lock (default ON, NVS "ctrlLock"): while the controller screen is showing,
-// updateOrientation() is suppressed so the display stays in whatever orientation it
-// was navigated in. Driving tilts the device constantly and a mid-drive rotation both
-// redraws the screen and flips the stick's rotation table under the user's thumb.
+// Screen lock (default ON, NVS "ctrlLock"): while the CONTROLLER or SENSOR screen is
+// showing, updateOrientation() is suppressed so the display stays in whatever orientation
+// it was navigated in. Both are screens you tilt the device on deliberately, so both are
+// screens where auto-rotation fights the user — see updateOrientation() for the detail.
+// One flag for both, and one settings row on each panel: the sensor screen's TILT STK and
+// IMU TX rows already share their state with the controller's for the same reason, and a
+// second copy of "hold the orientation" would just be another thing to keep in sync.
+// The NVS key keeps its "ctrlLock" name so existing settings migrate untouched.
 bool     ctrlScreenLock      = true;
 // Seesaw physical mount orientation — a base transform of the raw seesaw axes into the
 // device's native-portrait frame. The shared screen-rotation table (applyStickRotation)
@@ -1457,8 +1461,16 @@ unsigned long key1PressedAt = 0,     key2PressedAt = 0;
 #define CTRL_SET_FIXED_ROWS 13
 // Then MOUNT (seesaw present) and one role row per connected device (2+ devices).
 #define CTRL_SET_MAX_ROWS   (CTRL_SET_FIXED_ROWS + 1 + CTRL_ROLE_COUNT)
-// Sensor: ZERO HERE / LEVEL REF / GYRO ZERO / TILT STK / IMU TX.
-#define SENSOR_SET_ITEMS     5
+// Sensor panel rows. Named rather than bare indices because the label table, the value
+// table and the activate switch all have to agree on the order, and this panel is dispatched
+// by INDEX (unlike the controller's, which dispatches on a row action). The row set here is
+// fixed, so index dispatch is fine — but a magic 5 in one of the three places and not the
+// others is how a tap silently actions the wrong setting.
+enum SensorSetRow {
+  SSR_ZERO = 0, SSR_LEVEL, SSR_GYRO, SSR_TILTSTK, SSR_IMUTX, SSR_SCRLOCK,
+  SSR_COUNT,
+};
+#define SENSOR_SET_ITEMS     ((int)SSR_COUNT)
 
 // The controller settings panel has a sub-level for browsing profiles. It is a level INSIDE
 // NAV_SETTINGS rather than a new navState, deliberately: renderFunction() fires
@@ -2347,11 +2359,19 @@ void updateOrientation() {
   // the (larger) portrait alloc fails — the "empty screen after long sleep" bug.
   // resetActivity() forces an immediate re-check on wake.
   if (displayOff || displayDimmed) return;
-  // Controller screen lock (default ON): hold whatever orientation the screen was
-  // navigated in. Driving tilts the device constantly, and a rotation mid-drive
-  // redraws the screen *and* flips applyStickRotation() under the user's thumb.
-  // Keyed on currentFunction so it covers the controller settings panel too.
-  if (ctrlScreenLock && currentFunction == FUNCTION_CONTROLLER) return;
+  // Screen lock (default ON): hold whatever orientation the screen was navigated in.
+  // It covers the two screens you deliberately TILT THE DEVICE on, which are exactly the
+  // two where auto-rotation fights what you are doing:
+  //   CONTROLLER — driving tilts the device constantly, and a rotation mid-drive redraws
+  //     the screen *and* flips applyStickRotation() under the user's thumb.
+  //   SENSOR     — reading pitch/roll means tilting past the landscape threshold, so the
+  //     screen would rotate during the very measurement being checked, re-mapping the
+  //     axes (imuUpdateAttitude() is rotation-adapted) mid-reading. Checking the axis
+  //     conventions on this screen is the bench test the whole IMU section is written
+  //     against; it has to be done in one fixed frame to mean anything.
+  // Keyed on currentFunction, so it covers both settings panels too.
+  if (ctrlScreenLock &&
+      (currentFunction == FUNCTION_CONTROLLER || currentFunction == FUNCTION_SENSOR)) return;
   // Cached from imuPoll() — see the note there for why this must not read the IMU itself.
   if (!imuHaveSample) return;
   float ax = imuAx, ay = imuAy, az = imuAz;
@@ -3580,7 +3600,7 @@ void onKey1Long() {
       if (ctrlProfDirty) ctrlProfSaveActive();
       ctrlSetLevel = CTRL_SET_LEVEL_ROWS;
     }
-    else if (currentFunction == FUNCTION_SENSOR)     saveSettings();  // TILT STK / IMU TX
+    else if (currentFunction == FUNCTION_SENSOR)     saveSettings();  // TILT STK / IMU TX / SCR LOCK
     // RF433 / RFID2: no persistent settings to apply, just close
     navState = NAV_NORMAL;
     // No lastFunction = -1 here: sprite-based screens redraw every frame already.
@@ -3681,7 +3701,7 @@ static void printHelpNav() {
   serialWritelnAll("  ctrl dz 0-3           deadzone index (0=8 1=16 2=30 3=50) [shared by every stick]");
   serialWritelnAll("  ctrl calibrate        re-centre every connected stick (one action, all devices)");
   serialWritelnAll("  ctrl link <type>      remote TX link: udp|ble|tcp|lora");
-  serialWritelnAll("  ctrl lock on|off      screen lock: hold orientation on the controller screen (default ON)");
+  serialWritelnAll("  ctrl lock on|off      screen lock: hold orientation on the controller + sensor screens (default ON)");
   serialWritelnAll("  ctrl order                  show device order + resolved roles");
   serialWritelnAll("  ctrl order pad,joyc,joy2,joy1,tilt  set the order (any subset, best first)");
   serialWritelnAll("  ctrl drive|aux1|aux2|aux3 <dev>  put a device in one role (dev: pad|joyc|joy2|joy1|tilt)");
@@ -5156,7 +5176,7 @@ void serialHandleController(const char* arg) {
     const char* v = cmdArg(arg,"lock");
     if      (strcasecmp(v,"on") ==0) ctrlScreenLock = true;
     else if (strcasecmp(v,"off")==0) ctrlScreenLock = false;
-    else { serialWritelnAll("Usage: ctrl lock on|off  (hold screen orientation on the controller screen)"); return; }
+    else { serialWritelnAll("Usage: ctrl lock on|off  (hold screen orientation on the controller + sensor screens)"); return; }
     saveSettings(); serialHandleController("");
   } else if (cmdIs(arg,"dz")) {
     if (!ctrlHasTunableStick()) { serialWritelnAll("Deadzone applies to a connected stick — none is."); return; }
@@ -8123,9 +8143,11 @@ void renderSensor() {
 }
 
 // ── Sensor settings ──────────────────────────────────────────────
-// ZERO / LEVEL REF / GYRO ZERO / TILT STK / IMU TX (SENSOR_SET_ITEMS). The last two are
-// the very same flags the controller settings expose: the IMU is one sensor with two
-// consumers, and a second copy of the state would be a bug waiting to happen.
+// ZERO / LEVEL REF / GYRO ZERO / TILT STK / IMU TX / SCR LOCK (SENSOR_SET_ITEMS). The last
+// three are the very same flags the controller settings expose: the IMU is one sensor with
+// two consumers, and a second copy of the state would be a bug waiting to happen. SCR LOCK
+// belongs here because this screen is locked by it too — a lock you can only reach from
+// the controller panel is a lock you will not find when the sensor screen refuses to turn.
 
 void renderSensorSettings() {
   int  sw = statusSprite.width(), sh = statusSprite.height();
@@ -8138,14 +8160,14 @@ void renderSensorSettings() {
   char biasVal[20];
   snprintf(biasVal, sizeof(biasVal), "%+.1f %+.1f", imuGBiasX, imuGBiasY);
 
-  const char* labels[SENSOR_SET_ITEMS] = { "ZERO HERE", "LEVEL REF", "GYRO ZERO", "TILT STK", "IMU TX" };
-  const char* values[SENSOR_SET_ITEMS] = {
-    zeroVal,
-    imuZeroed ? "CUSTOM" : "FLAT",
-    biasVal,
-    ctrlImuStick ? "ON" : "OFF",
-    ctrlImuFrame ? "ON (v3)" : "OFF",
-  };
+  const char* labels[SENSOR_SET_ITEMS] = {};
+  const char* values[SENSOR_SET_ITEMS] = {};
+  labels[SSR_ZERO]    = "ZERO HERE"; values[SSR_ZERO]    = zeroVal;
+  labels[SSR_LEVEL]   = "LEVEL REF"; values[SSR_LEVEL]   = imuZeroed ? "CUSTOM" : "FLAT";
+  labels[SSR_GYRO]    = "GYRO ZERO"; values[SSR_GYRO]    = biasVal;
+  labels[SSR_TILTSTK] = "TILT STK";  values[SSR_TILTSTK] = ctrlImuStick   ? "ON" : "OFF";
+  labels[SSR_IMUTX]   = "IMU TX";    values[SSR_IMUTX]   = ctrlImuFrame   ? "ON (v3)" : "OFF";
+  labels[SSR_SCRLOCK] = "SCR LOCK";  values[SSR_SCRLOCK] = ctrlScreenLock ? "ON" : "OFF";
 
   uint16_t cyan = display.color565(0, 160, 210);
 
@@ -8213,16 +8235,20 @@ void renderSensorSettings() {
 
 // Act on the selected sensor settings row (KEY1 short / tap on the highlighted row).
 void sensorSettingsActivate() {
+  // SCR LOCK first, ahead of the IMU guard: it is a display setting, not an IMU one. It
+  // still greys out with the rest of the panel when the IMU is missing, which is honest —
+  // with no IMU there is no auto-rotation to suppress in the first place.
+  if (settingsCursor == SSR_SCRLOCK) { ctrlScreenLock = !ctrlScreenLock; return; }
   if (!imuAvailable) return;
   switch (settingsCursor) {
-    case 0: imuZeroAttitude(true); break;                   // ZERO HERE
-    case 1: imuResetAttitudeRef(); break;                   // LEVEL REF — back to flat
-    case 2: imuZeroGyro(); break;                           // GYRO ZERO — re-bias at rest
-    case 3:                                                 // TILT STK
+    case SSR_ZERO:  imuZeroAttitude(true);  break;          // zero to the current hold
+    case SSR_LEVEL: imuResetAttitudeRef(); break;           // back to flat
+    case SSR_GYRO:  imuZeroGyro();         break;           // re-bias at rest
+    case SSR_TILTSTK:
       ctrlImuStick = !ctrlImuStick;
       if (ctrlImuStick) imuCalibrate();
       break;
-    case 4: ctrlImuFrame = !ctrlImuFrame; break;            // IMU TX
+    case SSR_IMUTX: ctrlImuFrame = !ctrlImuFrame; break;
   }
 }
 
