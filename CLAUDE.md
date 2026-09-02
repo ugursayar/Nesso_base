@@ -222,8 +222,8 @@ JoyStick2:
   forward inverted; both axes reach the full 0..255 span, so a stick that reads dead on one
   axis is a wiring or unit fault, not a mapping one.
 - *Button.* `JOYSTICK1_BTN_PRESSED` is **1** — this unit is **not** active-low like the Mini
-  JoyC and JoyStick2. Measured over 200+ samples at rest and through a full two-axis sweep, the
-  byte never left 0, so 0 is the released level.
+  JoyC and JoyStick2. The byte never left 0 across 200+ samples at rest and a full two-axis
+  sweep, so 0 is the released level, and a press was then confirmed on hardware.
 
   The read also **arms itself**: `joystick1BtnArmed` is set only once the unit has been seen
   reporting the released level, and until then the button never registers. That is not
