@@ -7,8 +7,11 @@ from PIL import Image, ImageDraw, ImageFont
 
 VERSION = "1.2.0"
 TAGLINE = "tilt & stick robot TX"
-PHOTO   = "assets/20260903_102942.jpg"
-PHOTO_CROP = (640, 1230, 1674, 2330)   # device in hand, screen showing the live TILT disc
+PHOTO   = "assets/20260903_104357.jpg"
+# The device was shot lying on its side while the UI stayed portrait, so the screen reads
+# sideways in the raw frame. Rotate FIRST, then crop -- PHOTO_CROP is in the rotated frame.
+PHOTO_ROTATE = 270                     # degrees counter-clockwise (= 90 clockwise)
+PHOTO_CROP = (752, 1260, 1730, 2300)   # the four-disc controller screen, filling the panel
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 W, H = 840, 600                      # 2x canvas -> saved at 420x300
@@ -35,7 +38,10 @@ font_tag  = try_font(["seguisb.ttf",  "arialbd.ttf"], 24)
 font_tiny = try_font(["segoeui.ttf",  "arial.ttf"],   23)
 
 # ── Photo panel (right) ──
-photo = Image.open(os.path.join(ROOT, PHOTO)).crop(PHOTO_CROP)
+photo = Image.open(os.path.join(ROOT, PHOTO))
+if PHOTO_ROTATE:
+    photo = photo.rotate(PHOTO_ROTATE, expand=True)
+photo = photo.crop(PHOTO_CROP)
 PX, PY, PW, PH = 462, 40, 344, 366
 photo = photo.resize((PW, PH), Image.LANCZOS)
 mask = Image.new("L", (PW, PH), 0)
