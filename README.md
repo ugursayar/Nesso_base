@@ -4,6 +4,8 @@
 
 Arduino firmware for the **Arduino Nesso N1** handheld controller — a WiFi-enabled base station that drives a remote robot platform over a selectable wireless link (WiFi-UDP/TCP, BLE, LoRa). Features a 240×135px TFT display with a multi-mode menu, battery monitoring, up to 4 simultaneous control inputs (Adafruit seesaw gamepad, M5Stack Mini JoyC HAT, an M5Stack Grove joystick unit — JoyStick2 or Joystick v1.1 — and the on-board BMI270 IMU as a tilt stick), IR and 433 MHz RF remote control, RFID card scanning, and a web-based file manager.
 
+Hardware traps, protocol details and the reasoning behind the non-obvious code are in [docs/ENGINEERING.md](docs/ENGINEERING.md).
+
 ## Table of Contents
 
 - [Hardware Requirements](#hardware-requirements)
