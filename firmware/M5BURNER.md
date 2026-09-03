@@ -58,12 +58,15 @@ copy build\Nesso_base.ino.bin            firmware\Nesso_base_0x10000.bin
 
 1. Rebuild the image (above) and commit the refreshed `firmware/*.bin`.
 2. Bump `version` in **both** `m5burner.json` and the table above.
-3. **Copy the description and "What's new" text below into the M5Burner portal** — this file
+3. Regenerate the cover (`python gen_cover.py`) after bumping `VERSION`/`TAGLINE` in that
+   script — it renders the version onto the card, so a stale cover advertises the old build.
+   It is a **separate upload** in the portal from the firmware file.
+4. **Copy the description and "What's new" text below into the M5Burner portal** — this file
    is only the source of truth; editing it changes nothing users see until it is pasted into
    the desktop app.
-4. Flash the merged image at `0x0` on a real device and confirm it boots — the part offsets
+5. Flash the merged image at `0x0` on a real device and confirm it boots — the part offsets
    can be verified statically, but only a flash proves the packaging.
-5. Re-check the NessoLink floor: it tracks what the firmware *can emit*, not what it emits by
+6. Re-check the NessoLink floor: it tracks what the firmware *can emit*, not what it emits by
    default. IMU TX promotes frames to v3 and AUX3 TX to v4, so a build that merely exposes
    those rows raises the floor even though both default OFF.
 

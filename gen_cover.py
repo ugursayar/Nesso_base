@@ -5,8 +5,8 @@
 import os
 from PIL import Image, ImageDraw, ImageFont
 
-VERSION = "1.1.0"
-TAGLINE = "1–3 stick robot TX"
+VERSION = "1.2.0"
+TAGLINE = "up to 4-input robot TX"
 PHOTO   = "assets/20260722_140133.jpg"
 PHOTO_CROP = (40, 380, 700, 1080)   # N1 + stick + antenna region of that shot
 
@@ -63,9 +63,10 @@ tags = [
     ("IR",    (120, 53, 15),  (245, 158, 11), (254, 243, 199)),
     ("RF433", (127, 29, 29),  (239, 68, 68),  (254, 226, 226)),
     ("RFID",  (49, 46, 129),  (99, 102, 241), (224, 231, 255)),
+    ("IMU",   (63, 26, 71),   (192, 84, 205),  (250, 226, 255)),
 ]
 misc = [
-    ("1–3 Sticks", (30, 41, 59), (71, 85, 105), (148, 163, 184)),
+    ("4 Inputs",   (30, 41, 59), (71, 85, 105), (148, 163, 184)),
     ("Speaker",    (30, 41, 59), (71, 85, 105), (148, 163, 184)),
     ("Web FM",     (30, 41, 59), (71, 85, 105), (148, 163, 184)),
     ("Serial CLI", (30, 41, 59), (71, 85, 105), (148, 163, 184)),
@@ -82,6 +83,13 @@ def draw_tags(row, y):
         d.text((x + PAD, y + 8), label, font=font_tag, fill=fg)
         x += tw + PAD * 2 + 14
     return y + TAG_H + 14
+
+def row_width(row):
+    return sum(int(d.textlength(l, font=font_tag)) + PAD * 2 + 14 for l, *_ in row) - 14
+
+for name, row in (("tags", tags), ("misc", misc)):
+    w = row_width(row)
+    print(f"  {name} row: {w}px of {W - 68}px available" + ("  *** OVERFLOW ***" if w > W - 68 else ""))
 
 y = draw_tags(tags, 424)
 draw_tags(misc, y)
