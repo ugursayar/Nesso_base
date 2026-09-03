@@ -1,0 +1,8 @@
+* text=auto eol=lf
+*.jpg -text
+*.png -text
+*.bin -text
+*.zip -text
+*.mp4 -text
+*.xcf -text
+*.db -text
