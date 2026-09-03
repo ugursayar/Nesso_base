@@ -6,9 +6,9 @@ import os
 from PIL import Image, ImageDraw, ImageFont
 
 VERSION = "1.2.0"
-TAGLINE = "up to 4-input robot TX"
-PHOTO   = "assets/20260722_140133.jpg"
-PHOTO_CROP = (40, 380, 700, 1080)   # N1 + stick + antenna region of that shot
+TAGLINE = "tilt & stick robot TX"
+PHOTO   = "assets/20260903_102942.jpg"
+PHOTO_CROP = (640, 1230, 1674, 2330)   # device in hand, screen showing the live TILT disc
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 W, H = 840, 600                      # 2x canvas -> saved at 420x300
@@ -63,10 +63,9 @@ tags = [
     ("IR",    (120, 53, 15),  (245, 158, 11), (254, 243, 199)),
     ("RF433", (127, 29, 29),  (239, 68, 68),  (254, 226, 226)),
     ("RFID",  (49, 46, 129),  (99, 102, 241), (224, 231, 255)),
-    ("IMU",   (63, 26, 71),   (192, 84, 205),  (250, 226, 255)),
 ]
 misc = [
-    ("4 Inputs",   (30, 41, 59), (71, 85, 105), (148, 163, 184)),
+    ("IMU Tilt",   (63, 26, 71), (192, 84, 205), (250, 226, 255)),
     ("Speaker",    (30, 41, 59), (71, 85, 105), (148, 163, 184)),
     ("Web FM",     (30, 41, 59), (71, 85, 105), (148, 163, 184)),
     ("Serial CLI", (30, 41, 59), (71, 85, 105), (148, 163, 184)),
