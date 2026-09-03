@@ -4,6 +4,7 @@ data/config.json
 
 # Claude Code memory (local only)
 .claude/
+CLAUDE.md
 
 # Arduino IDE build artifacts
 build/
