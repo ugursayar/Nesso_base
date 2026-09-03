@@ -8,9 +8,10 @@ from PIL import Image, ImageDraw, ImageFont
 VERSION = "1.2.0"
 TAGLINE = "tilt & stick robot TX"
 PHOTO   = "assets/20260903_104357.jpg"
-# The device was shot lying on its side while the UI stayed portrait, so the screen reads
-# sideways in the raw frame. Rotate FIRST, then crop -- PHOTO_CROP is in the rotated frame.
-PHOTO_ROTATE = 270                     # degrees counter-clockwise (= 90 clockwise)
+# The shot was taken with the device on its side, but assets/20260903_104357.jpg is stored
+# already rotated upright, so no rotation is applied here. Kept as a knob because a future
+# photo may need it; it runs BEFORE the crop, so PHOTO_CROP would then be in the rotated frame.
+PHOTO_ROTATE = 0                       # degrees counter-clockwise
 PHOTO_CROP = (752, 1260, 1730, 2300)   # the four-disc controller screen, filling the panel
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
