@@ -9,7 +9,7 @@ update this file first, then copy from here into the portal.
 | field | value |
 |---|---|
 | category / device | Nesso-N1 / Arduino Nesso N1 |
-| firmware file | `firmware/Nesso_base_v1.2.0.bin` (compact merge — leaves LittleFS intact) |
+| firmware file | `firmware/Nesso_base_v1.2.0.bin` (compact merge — keeps LittleFS, resets NVS; see below) |
 | flash address | `0x0` |
 | baud | `921600` |
 | cover image | `assets/cover.png` (regenerate with `python gen_cover.py`, 420×300) |
@@ -19,9 +19,26 @@ update this file first, then copy from here into the portal.
 ## Rebuilding the image
 
 The published file is a **compact merge** — bootloader + partitions + boot_app0 + app, ending
-after the app so flashing it at `0x0` leaves the LittleFS IR/RF433 database at `0x610000`
-untouched. Do NOT publish arduino-cli's own `Nesso_base.ino.merged.bin`: that one is padded
-to the full 16 MB flash and would erase the database.
+after the app (`0x1EE9D0` for v1.2.0) so flashing it at `0x0` leaves the LittleFS partition at
+`0x610000` untouched. Do NOT publish arduino-cli's own `Nesso_base.ino.merged.bin`: that one is
+padded to the full 16 MB flash and would erase the filesystem.
+
+**What a flash keeps and what it wipes.** Verified on hardware, v1.2.0:
+
+| region | offset | flashing this image |
+|---|---|---|
+| NVS (device settings) | `0x9000`–`0xDFFF` | **ERASED** — it falls in the `0x8C00`–`0xE000` gap between boot_app0 and the partition table, which the merge fills with `0xFF` |
+| LittleFS (`/irdb`, `/rf433db`, `/rfid2db`, `/ctrldb`, `config.json`) | `0x610000`+ | kept |
+
+So an update resets the NVS-backed settings — controller axis flags, deadzone, device order,
+TX link, screen lock, BT/LoRa preferences, and the *pointer* to the active controller profile.
+It does **not** lose data: the profiles themselves are files under `/ctrldb`, and the robot
+endpoint lives in `config.json`, so a user re-selects their profile rather than rebuilding it.
+Say this in the entry text — a silent settings reset reads as a bug.
+
+This is a property of flashing a single image at `0x0`, not something the merge chose: NVS sits
+between the parts, so any contiguous image spanning them overwrites it. Preserving it would
+mean publishing the parts separately, which the M5Burner entry format does not do.
 
 ```powershell
 arduino-cli compile --clean --fqbn "esp32:esp32:arduino_nesso_n1" --build-path "D:/Nesso_base/build" Nesso_base.ino
@@ -44,7 +61,9 @@ copy build\Nesso_base.ino.bin            firmware\Nesso_base_0x10000.bin
 3. **Copy the description and "What's new" text below into the M5Burner portal** — this file
    is only the source of truth; editing it changes nothing users see until it is pasted into
    the desktop app.
-4. Re-check the NessoLink floor: it tracks what the firmware *can emit*, not what it emits by
+4. Flash the merged image at `0x0` on a real device and confirm it boots — the part offsets
+   can be verified statically, but only a flash proves the packaging.
+5. Re-check the NessoLink floor: it tracks what the firmware *can emit*, not what it emits by
    default. IMU TX promotes frames to v3 and AUX3 TX to v4, so a build that merely exposes
    those rows raises the floor even though both default OFF.
 
