@@ -2,7 +2,7 @@
 
 ![Arduino Nesso N1 running the multi-stick controller screen with four inputs — Mini JoyC HAT, seesaw gamepad, Unit Joystick v1.1 and the on-board IMU tilt stick](assets/20260903_104357.jpg)
 
-Arduino firmware for the **Arduino Nesso N1** handheld controller — a WiFi-enabled base station that drives a remote robot platform over a selectable wireless link (WiFi-UDP/TCP, BLE, LoRa). Features a 240×135px TFT display with a multi-mode menu, battery monitoring, 1–3 stick gamepad input (Adafruit seesaw, M5Stack Mini JoyC HAT, and/or an M5Stack Grove joystick unit), IR and 433 MHz RF remote control, RFID card scanning, and a web-based file manager.
+Arduino firmware for the **Arduino Nesso N1** handheld controller — a WiFi-enabled base station that drives a remote robot platform over a selectable wireless link (WiFi-UDP/TCP, BLE, LoRa). Features a 240×135px TFT display with a multi-mode menu, battery monitoring, up to 4 simultaneous control inputs (Adafruit seesaw gamepad, M5Stack Mini JoyC HAT, an M5Stack Grove joystick unit — JoyStick2 or Joystick v1.1 — and the on-board BMI270 IMU as a tilt stick), IR and 433 MHz RF remote control, RFID card scanning, and a web-based file manager.
 
 ## Table of Contents
 
@@ -603,7 +603,7 @@ Sent continuously at ~10 Hz (even when centered) so the receiver can implement a
 
 Two things guarantee the robot stops, so a receiver failsafe is a backstop rather than the primary mechanism:
 
-- **Releasing the stick** mixes to `L=0, R=0`, and frames keep flowing at ~10 Hz — so the stop is transmitted immediately and repeatedly. The rest-position deadzone (all three sticks) is what makes a released stick read as *exactly* zero rather than a small non-zero creep.
+- **Releasing the stick** mixes to `L=0, R=0`, and frames keep flowing at ~10 Hz — so the stop is transmitted immediately and repeatedly. The rest-position deadzone (every input, with a higher floor for the tilt stick since a hand has no mechanical centre) is what makes a released stick read as *exactly* zero rather than a small non-zero creep.
 - **An explicit all-stop** (motors 0, aux centred, buttons cleared) is transmitted whenever the controller stops driving: navigating away from the Controller screen, opening its settings panel, or losing the drive stick. It's re-sent until the transport confirms the frame went out (bounded attempts, so it can't stall a screen change), since a single dropped stop would leave the robot running.
 
 > **Note for autonomous robots:** the all-stop is a *command*, not a disable. A receiver that falls back to autonomous behaviour when the remote link goes quiet will stop on the frame, then resume autonomously once its own remote-timeout expires. That's the receiver's arbitration policy to decide, not something the controller can express in a v1/v2 frame.
