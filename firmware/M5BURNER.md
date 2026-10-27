@@ -1,8 +1,18 @@
 # M5Burner entry — publish notes
 
 Source of truth for the text and settings used on the M5Burner firmware entry.
-Publishing itself happens in the M5Burner desktop app (M5Stack account login);
-update this file first, then copy from here into the portal.
+Update this file first, then copy from here into the portal.
+
+**Publish on the web: <https://burner.m5stack.com>** (M5Stack account login), then
+Developer → Nesso_base → *New version*
+(`/developer/firmware/1897200000000001056/versions/new`). The web site and the
+desktop app run on **separate backends that do not sync**. v1.2.0 was published from
+the desktop app only, and the web kept showing v1.1.0 until it was uploaded there
+too. M5Stack retires the desktop app on 2027-01-01, so the web is the listing that
+counts. The description is *public data* shared by all versions. Edit it separately
+(Developer → Nesso_base → edit), because a new version does not change it. A
+Public version and an edited description both go to M5Stack review before they
+show.
 
 ## Entry settings
 
